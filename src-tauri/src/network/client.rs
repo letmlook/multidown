@@ -22,6 +22,11 @@ fn default_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// 根据 NetworkOptions 构建可复用的 HTTP Client
+pub fn build_client_from_options(options: &NetworkOptions) -> Result<Client, Error> {
+    build_client(options.proxy_url.as_deref(), options.timeout_secs)
+}
+
 fn build_client(proxy_url: Option<&str>, timeout_secs: u64) -> Result<Client, Error> {
     let timeout = if timeout_secs > 0 {
         Duration::from_secs(timeout_secs)
@@ -172,6 +177,16 @@ pub async fn fetch_range_with_options(
     options: &NetworkOptions,
 ) -> Result<bytes::Bytes, Error> {
     let client = build_client(options.proxy_url.as_deref(), options.timeout_secs)?;
+    fetch_range_with_client(&client, url, start, end).await
+}
+
+/// 使用已有 Client 请求一段，实现连接复用
+pub async fn fetch_range_with_client(
+    client: &Client,
+    url: &str,
+    start: u64,
+    end: u64,
+) -> Result<bytes::Bytes, Error> {
     let url = url.parse::<reqwest::Url>().map_err(|e| Error::Url(e.to_string()))?;
     let range_header = format!("bytes={}-{}", start, end);
     let body = client

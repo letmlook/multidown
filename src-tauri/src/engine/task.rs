@@ -1,4 +1,4 @@
-use crate::engine::types::{static_segments, CreateTaskInput, TaskId, TaskStatus};
+use crate::engine::types::{static_segments, CreateTaskInput, TaskId, TaskStatus, MIN_SEGMENT_SIZE};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -72,9 +72,30 @@ impl Task {
         self.downloaded.load(Ordering::Relaxed)
     }
 
+    /// 动态分段：取当前最大未完成段，若可对半切则切分并返回后半段，否则返回整段
     pub fn take_next_segment(&self) -> Option<(u64, u64)> {
         let mut segs = self.pending_segments.try_lock().ok()?;
-        segs.pop_front()
+        if segs.is_empty() {
+            return None;
+        }
+        // 找长度最大的段（若有多个相同长度，取第一个）
+        let mut max_idx = 0;
+        let mut max_len = 0u64;
+        for (i, &(start, end)) in segs.iter().enumerate() {
+            let len = end.saturating_sub(start) + 1;
+            if len > max_len {
+                max_len = len;
+                max_idx = i;
+            }
+        }
+        let (start, end) = segs.remove(max_idx).unwrap();
+        if max_len > MIN_SEGMENT_SIZE {
+            let mid = start + (max_len / 2) - 1;
+            segs.push_back((start, mid));
+            Some((mid + 1, end))
+        } else {
+            Some((start, end))
+        }
     }
 
     pub fn add_downloaded(&self, delta: u64) {

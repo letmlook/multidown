@@ -11,6 +11,9 @@ import { OptionsModal } from "./components/OptionsModal";
 import { ContextMenu } from "./components/ContextMenu";
 import { BatchAdd } from "./components/BatchAdd";
 import { DownloadFileInfo } from "./components/DownloadFileInfo";
+import { PropertiesModal } from "./components/PropertiesModal";
+import { MoveRenameModal } from "./components/MoveRenameModal";
+import { AboutModal } from "./components/AboutModal";
 import type { AppSettings } from "./types/download";
 import "./index.css";
 
@@ -27,6 +30,7 @@ function App() {
   const [downloadFileInfoOpen, setDownloadFileInfoOpen] = useState(false);
   const [downloadFileInfoUrl, setDownloadFileInfoUrl] = useState("");
   const [optionsOpen, setOptionsOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [findVisible, setFindVisible] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -38,6 +42,10 @@ function App() {
     }
   });
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; task: TaskInfo } | null>(null);
+  const [propertiesOpen, setPropertiesOpen] = useState(false);
+  const [moveRenameOpen, setMoveRenameOpen] = useState(false);
+  const [propertiesTask, setPropertiesTask] = useState<TaskInfo | null>(null);
+  const [moveRenameTask, setMoveRenameTask] = useState<TaskInfo | null>(null);
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -142,6 +150,13 @@ function App() {
         e.preventDefault();
         setFindVisible(true);
       }
+      if (e.ctrlKey && e.key === "m") {
+        e.preventDefault();
+        if (selectedTask) {
+          setMoveRenameTask(selectedTask);
+          setMoveRenameOpen(true);
+        }
+      }
       if (e.key === "Escape") {
         setFindVisible(false);
         setContextMenu(null);
@@ -149,7 +164,7 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [selectedTask]);
 
   const handlePauseAll = useCallback(async () => {
     for (const t of tasks) {
@@ -246,44 +261,147 @@ function App() {
     setContextMenu({ x: e.clientX, y: e.clientY, task });
   }, []);
 
-  const contextMenuItems = contextMenu
+  const doRedownload = useCallback(
+    async (t: TaskInfo) => {
+      const path = t.save_path.replace(/\\/g, "/");
+      const parts = path.split("/");
+      const filename = parts.pop() || t.filename || "";
+      const saveDir = parts.length ? parts.join("/") : ".";
+      try {
+        const taskId = await invoke<string>("create_download", {
+          url: t.url,
+          saveDir,
+          filename: filename || undefined,
+        });
+        await invoke("start_download", { taskId });
+        refreshTasks();
+      } catch (e) {
+        console.error(e);
+      }
+    },
+    [refreshTasks]
+  );
+
+  const contextMenuItems: import("./components/ContextMenu").ContextMenuItem[] = contextMenu
     ? [
         {
-          label: "停止下载",
-          onClick: () =>
-            invoke("pause_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
-          disabled: contextMenu.task.status !== "downloading",
+          type: "item",
+          label: "打开",
+          onClick: () => invoke("open_file", { path: contextMenu.task.save_path }).catch(console.error),
+          disabled: contextMenu.task.status !== "completed",
         },
         {
-          label: "移除",
-          onClick: () =>
-            invoke("remove_task", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+          type: "item",
+          label: "打开方式...",
+          onClick: () => invoke("open_with", { path: contextMenu.task.save_path }).catch(console.error),
+          disabled: contextMenu.task.status !== "completed",
         },
         {
-          label: "开始下载",
+          type: "item",
+          label: "打开文件夹",
+          onClick: () => openFolder(contextMenu.task.save_path),
+        },
+        { type: "separator" },
+        {
+          type: "item",
+          label: "移动/重命名 (Ctrl-M)",
+          onClick: () => {
+            setMoveRenameTask(contextMenu.task);
+            setContextMenu(null);
+            setMoveRenameOpen(true);
+          },
+          disabled: contextMenu.task.status !== "completed",
+        },
+        {
+          type: "item",
+          label: "重新下载",
+          onClick: () => doRedownload(contextMenu.task),
+        },
+        { type: "separator" },
+        {
+          type: "item",
+          label: "继续下载",
           onClick: () =>
             invoke("resume_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
           disabled: contextMenu.task.status !== "paused" && contextMenu.task.status !== "pending",
         },
         {
-          label: "重新下载",
-          onClick: async () => {
-            const t = contextMenu.task;
-            const path = t.save_path.replace(/\\/g, "/");
-            const parts = path.split("/");
-            const filename = parts.pop() || t.filename || "";
-            const saveDir = parts.length ? parts.join("/") : ".";
-            try {
-              const taskId = await invoke<string>("create_download", {
-                url: t.url,
-                saveDir,
-                filename: filename || undefined,
-              });
-              await invoke("start_download", { taskId });
-              refreshTasks();
-            } catch (e) {
-              console.error(e);
-            }
+          type: "item",
+          label: "停止下载",
+          onClick: () =>
+            invoke("pause_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+          disabled: contextMenu.task.status !== "downloading",
+        },
+        { type: "separator" },
+        {
+          type: "item",
+          label: "刷新下载地址",
+          onClick: () =>
+            invoke("refresh_download_address", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+        },
+        { type: "separator" },
+        {
+          type: "item",
+          label: "移除",
+          onClick: () =>
+            invoke("remove_task", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+        },
+        { type: "separator" },
+        {
+          type: "submenu",
+          label: "添加到队列",
+          children: [
+            {
+              type: "item",
+              label: "默认队列",
+              onClick: () =>
+                invoke("pause_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+              disabled: contextMenu.task.status !== "downloading",
+            },
+          ],
+        },
+        {
+          type: "item",
+          label: "从队列中删除",
+          onClick: () =>
+            invoke("resume_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+          disabled: contextMenu.task.status !== "paused" && contextMenu.task.status !== "pending",
+        },
+        { type: "separator" },
+        {
+          type: "submenu",
+          label: "双击",
+          children: [
+            {
+              type: "item",
+              label: "打开",
+              onClick: () => invoke("open_file", { path: contextMenu.task.save_path }).catch(console.error),
+              disabled: contextMenu.task.status !== "completed",
+            },
+            {
+              type: "item",
+              label: "打开文件夹",
+              onClick: () => openFolder(contextMenu.task.save_path),
+            },
+            {
+              type: "item",
+              label: "属性",
+              onClick: () => {
+                setPropertiesTask(contextMenu.task);
+                setContextMenu(null);
+                setPropertiesOpen(true);
+              },
+            },
+          ],
+        },
+        { type: "separator" },
+        {
+          type: "item",
+          label: "属性",
+          onClick: () => {
+            setPropertiesTask(contextMenu.task);
+            setContextMenu(null);
+            setPropertiesOpen(true);
           },
         },
       ]
@@ -313,6 +431,7 @@ function App() {
           onRefresh={refreshTasks}
           onOpenOptions={() => setOptionsOpen(true)}
           onOpenSchedule={() => setScheduleOpen(true)}
+          onOpenAbout={() => setAboutOpen(true)}
           onPauseAll={handlePauseAll}
           onStopAll={handleStopAll}
           onDeleteAllCompleted={handleDeleteAllCompleted}
@@ -385,6 +504,30 @@ function App() {
       />
 
       <OptionsModal open={optionsOpen} onClose={() => setOptionsOpen(false)} />
+
+      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.1.0" />
+
+      <PropertiesModal
+        open={propertiesOpen}
+        task={propertiesTask ?? selectedTask}
+        onClose={() => {
+          setPropertiesOpen(false);
+          setPropertiesTask(null);
+        }}
+      />
+
+      <MoveRenameModal
+        open={moveRenameOpen}
+        task={moveRenameTask ?? selectedTask}
+        onClose={() => {
+          setMoveRenameOpen(false);
+          setMoveRenameTask(null);
+        }}
+        onSave={async (taskId, newSavePath) => {
+          await invoke("update_task_save_path", { taskId, newSavePath });
+          refreshTasks();
+        }}
+      />
 
       {scheduleOpen && (
         <div className="modal-overlay" onClick={() => setScheduleOpen(false)}>

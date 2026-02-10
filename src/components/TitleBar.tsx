@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 const TITLEBAR_HEIGHT = 36;
 
@@ -8,7 +9,15 @@ interface TitleBarProps {
 }
 
 function useWindowApi() {
-  const [getCurrentWindow, setGetCurrentWindow] = useState<(() => { isMaximized: () => Promise<boolean>; onResized: (cb: () => void) => Promise<() => void>; minimize: () => Promise<void>; toggleMaximize: () => Promise<void>; close: () => Promise<void> }) | null>(null);
+  const [getCurrentWindow, setGetCurrentWindow] = useState<(() => {
+    isMaximized: () => Promise<boolean>;
+    onResized: (cb: () => void) => Promise<() => void>;
+    minimize: () => Promise<void>;
+    toggleMaximize: () => Promise<void>;
+    close: () => Promise<void>;
+    destroy: () => Promise<void>;
+    startDragging?: () => Promise<void>;
+  }) | null>(null);
   useEffect(() => {
     import("@tauri-apps/api/window")
       .then((m) => {
@@ -66,20 +75,40 @@ export function TitleBar({ darkMode, children }: TitleBarProps) {
   }, [getCurrentWindow, updateMaximized]);
 
   const handleClose = useCallback(() => {
-    try {
-      getCurrentWindow?.().close().catch(() => {});
-    } catch {
-      // ignore
-    }
+    invoke("exit_app").catch(() => {
+      try {
+        getCurrentWindow?.().destroy().catch(() => getCurrentWindow?.().close().catch(() => {}));
+      } catch {
+        // ignore
+      }
+    });
   }, [getCurrentWindow]);
+
+  const handleDragRegionMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      if (e.button !== 0 || !getCurrentWindow) return;
+      try {
+        const w = getCurrentWindow();
+        if (typeof w.startDragging === "function") {
+          w.startDragging().catch(() => {});
+        }
+      } catch {
+        // 依赖 data-tauri-drag-region 作为兜底
+      }
+    },
+    [getCurrentWindow]
+  );
 
   return (
     <header
       className={`titlebar ${darkMode ? "titlebar-dark" : ""}`}
       style={{ height: TITLEBAR_HEIGHT }}
-      data-tauri-drag-region
     >
-      <div className="titlebar-left" data-tauri-drag-region>
+      <div
+        className="titlebar-left"
+        data-tauri-drag-region
+        onMouseDown={handleDragRegionMouseDown}
+      >
         <span className="titlebar-icon" data-tauri-drag-region>
           <svg viewBox="0 0 512 512" width="18" height="18">
             <defs>
@@ -110,14 +139,20 @@ export function TitleBar({ darkMode, children }: TitleBarProps) {
           {children}
         </div>
       )}
+      <div
+        className="titlebar-drag-fill"
+        data-tauri-drag-region
+        onMouseDown={handleDragRegionMouseDown}
+      />
       <div className="titlebar-controls">
         <button
           type="button"
           className="titlebar-btn titlebar-btn-minimize"
           onClick={handleMinimize}
+          title="最小化"
           aria-label="最小化"
         >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+          <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden>
             <path d="M0 5h12v2H0z" />
           </svg>
         </button>
@@ -125,14 +160,15 @@ export function TitleBar({ darkMode, children }: TitleBarProps) {
           type="button"
           className="titlebar-btn titlebar-btn-maximize"
           onClick={handleMaximize}
+          title={isMaximized ? "还原" : "最大化"}
           aria-label={isMaximized ? "还原" : "最大化"}
         >
           {isMaximized ? (
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden>
               <path d="M2 2v2H0V2h2zm8 0h2v2h-2V2zm0 8h2v2h-2v-2zM2 10v2H0v-2h2z" />
             </svg>
           ) : (
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden>
               <path d="M0 0v12h12V0H0zm11 11H1V1h10v10z" />
             </svg>
           )}
@@ -141,9 +177,10 @@ export function TitleBar({ darkMode, children }: TitleBarProps) {
           type="button"
           className="titlebar-btn titlebar-btn-close"
           onClick={handleClose}
+          title="关闭"
           aria-label="关闭"
         >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+          <svg width="10" height="10" viewBox="0 0 12 12" fill="currentColor" aria-hidden>
             <path d="M1.41 0L6 4.59 10.59 0 12 1.41 7.41 6 12 10.59 10.59 12 6 7.41 1.41 12 0 10.59 4.59 6 0 1.41z" />
           </svg>
         </button>

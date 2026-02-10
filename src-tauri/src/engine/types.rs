@@ -37,6 +37,9 @@ pub struct CreateTaskInput {
     pub filename: Option<String>,
 }
 
+/// 最小分段大小（64KB），动态分段时小于此值不再切分
+pub const MIN_SEGMENT_SIZE: u64 = 64 * 1024;
+
 /// 静态分段：将 [0, total) 均分为 n 段（最后一段可能略短）
 pub fn static_segments(total: u64, n: usize) -> Vec<(u64, u64)> {
     if n == 0 || total == 0 {

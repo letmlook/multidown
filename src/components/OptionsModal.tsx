@@ -33,6 +33,7 @@ const defaultSettings: AppSettings = {
   notification_on_complete: true,
   notification_on_fail: true,
   timeout_secs: 30,
+  save_progress_interval_secs: 30,
 };
 
 export function OptionsModal({ open, onClose }: OptionsModalProps) {
@@ -93,7 +94,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
               {tab === "general" && (
                 <div className="options-section">
                   <div className="options-section-title">通用</div>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <label className="form-check-row">
                     <input
                       type="checkbox"
                       checked={settings.run_at_startup}
@@ -101,7 +102,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     />
                     <span>系统启动时运行 Multidown</span>
                   </label>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <label className="form-check-row">
                     <input
                       type="checkbox"
                       checked={settings.clipboard_monitor}
@@ -114,7 +115,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
               {tab === "download" && (
                 <div className="options-section">
                   <div className="options-section-title">默认下载设置</div>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <label className="form-check-row">
                     <input
                       type="checkbox"
                       checked={settings.show_start_dialog}
@@ -122,7 +123,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     />
                     <span>显示开始下载对话框</span>
                   </label>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <label className="form-check-row">
                     <input
                       type="checkbox"
                       checked={settings.show_complete_dialog}
@@ -133,7 +134,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                   <div className="form-group">
                     <label>重复下载链接时</label>
                     <select
-                      style={{ padding: "6px 10px", minWidth: 200, marginTop: 4 }}
+                      style={{ padding: "6px 10px", minWidth: 200, marginTop: 6, display: "block" }}
                       value={settings.duplicate_action}
                       onChange={(e) => update({ duplicate_action: e.target.value })}
                     >
@@ -149,7 +150,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                       type="text"
                       value={settings.user_agent}
                       onChange={(e) => update({ user_agent: e.target.value })}
-                      style={{ marginTop: 4 }}
+                      style={{ marginTop: 6 }}
                     />
                   </div>
                 </div>
@@ -164,10 +165,10 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                       value={settings.default_save_path}
                       onChange={(e) => update({ default_save_path: e.target.value })}
                       placeholder="留空则使用系统下载目录"
-                      style={{ marginTop: 4 }}
+                      style={{ marginTop: 6 }}
                     />
                   </div>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12 }}>
+                  <label className="form-check-row" style={{ marginTop: 4 }}>
                     <input
                       type="checkbox"
                       checked={settings.use_last_save_path}
@@ -183,7 +184,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                   <div className="form-group">
                     <label>默认最大连接数（每任务）</label>
                     <select
-                      style={{ padding: "6px 10px", minWidth: 80, marginTop: 4 }}
+                      style={{ padding: "6px 10px", minWidth: 80, marginTop: 6 }}
                       value={settings.max_connections_per_task}
                       onChange={(e) => update({ max_connections_per_task: Number(e.target.value) })}
                     >
@@ -192,7 +193,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                       ))}
                     </select>
                   </div>
-                  <div className="form-group" style={{ marginTop: 16 }}>
+                  <div className="form-group">
                     <label>请求超时（秒）</label>
                     <input
                       type="number"
@@ -200,8 +201,22 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                       max={300}
                       value={settings.timeout_secs}
                       onChange={(e) => update({ timeout_secs: Number(e.target.value) || 30 })}
-                      style={{ marginTop: 4, width: 100, padding: "6px 10px" }}
+                      style={{ marginTop: 6, width: 100, padding: "6px 10px" }}
                     />
+                  </div>
+                  <div className="form-group">
+                    <label>下载中进度保存间隔（秒）</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        max={300}
+                        value={settings.save_progress_interval_secs ?? 30}
+                        onChange={(e) => update({ save_progress_interval_secs: Number(e.target.value) || 0 })}
+                        style={{ width: 80, padding: "6px 10px" }}
+                      />
+                      <span style={{ color: "#666", fontSize: 12 }}>0 表示不周期保存</span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -211,7 +226,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                   <div className="form-group">
                     <label>代理使用方式</label>
                     <div style={{ marginTop: 8 }}>
-                      <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                      <label className="form-check-row" style={{ marginBottom: 8 }}>
                         <input
                           type="radio"
                           name="proxy"
@@ -220,7 +235,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                         />
                         <span>不使用代理</span>
                       </label>
-                      <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                      <label className="form-check-row" style={{ marginBottom: 8 }}>
                         <input
                           type="radio"
                           name="proxy"
@@ -229,7 +244,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                         />
                         <span>使用系统设置</span>
                       </label>
-                      <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <label className="form-check-row">
                         <input
                           type="radio"
                           name="proxy"
@@ -242,14 +257,14 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                   </div>
                   {settings.proxy_type === "manual" && (
                     <>
-                      <div className="form-group" style={{ marginTop: 12 }}>
+                      <div className="form-group">
                         <label>代理地址</label>
                         <input
                           type="text"
                           value={settings.proxy_host}
                           onChange={(e) => update({ proxy_host: e.target.value })}
                           placeholder="例如 127.0.0.1"
-                          style={{ marginTop: 4 }}
+                          style={{ marginTop: 6 }}
                         />
                       </div>
                       <div className="form-group">
@@ -258,7 +273,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                           type="number"
                           value={settings.proxy_port}
                           onChange={(e) => update({ proxy_port: Number(e.target.value) || 8080 })}
-                          style={{ marginTop: 4, width: 100 }}
+                          style={{ marginTop: 6, width: 100 }}
                         />
                       </div>
                     </>
@@ -268,7 +283,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
               {tab === "sounds" && (
                 <div className="options-section">
                   <div className="options-section-title">通知</div>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <label className="form-check-row">
                     <input
                       type="checkbox"
                       checked={settings.notification_on_complete}
@@ -276,7 +291,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     />
                     <span>下载完成时显示系统通知</span>
                   </label>
-                  <label className="form-group" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <label className="form-check-row">
                     <input
                       type="checkbox"
                       checked={settings.notification_on_fail}

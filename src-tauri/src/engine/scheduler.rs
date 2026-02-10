@@ -4,7 +4,8 @@ use crate::engine::persistence::{save_tasks_to_file, PersistedTask};
 use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskInfo, TaskStatus};
 use crate::engine::writer::{run_file_writer, WriterMessage};
-use crate::network::{fetch_range_with_options, probe, probe_with_options, NetworkOptions, ProbeResult};
+use crate::network::{build_client_from_options, fetch_range_with_client, probe, probe_with_options, NetworkOptions, ProbeResult};
+use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -131,6 +132,27 @@ impl Scheduler {
         let task_id_s = task_id.to_string();
         let url = task.url.clone();
         let net_opts = network_options.unwrap_or_default();
+        let client = match build_client_from_options(&net_opts) {
+            Ok(c) => std::sync::Arc::new(c),
+            Err(e) => {
+                let _ = task_clone.error_message.lock().await.insert(e.to_string());
+                let mut st = task_clone.status.lock().await;
+                *st = TaskStatus::Failed;
+                if let Some(app) = &app_handle {
+                    let _ = app.emit("download-finished", (
+                        task_id_s.clone(),
+                        "failed".to_string(),
+                        task_clone.filename.clone(),
+                    ));
+                }
+                drop(tx);
+                let _ = writer_handle.await;
+                if let Some(s) = scheduler_for_save {
+                    s.save_tasks().await;
+                }
+                return Ok(());
+            }
+        };
 
         tokio::spawn(async move {
             let mut handles = Vec::new();
@@ -140,9 +162,9 @@ impl Scheduler {
                 let tx_w = tx.clone();
                 let ah = app_handle.clone();
                 let tid = task_id_s.clone();
-                let opts = net_opts.clone();
+                let client_ref = client.clone();
                 handles.push(tokio::spawn(async move {
-                    run_worker(task_ref, &url_ref, tx_w, ah, &tid, &opts).await;
+                    run_worker(task_ref, &url_ref, tx_w, ah, &tid, &client_ref).await;
                 }));
             }
             for h in handles {
@@ -270,6 +292,56 @@ impl Scheduler {
         let tasks = self.tasks.lock().await;
         tasks.get(task_id).map(task_to_info)
     }
+
+    /// 刷新下载地址：重新探测 URL，更新为最终重定向地址
+    pub async fn refresh_task_url(
+        &self,
+        task_id: &str,
+        options: &NetworkOptions,
+    ) -> Result<(), String> {
+        let (mut pt, id) = {
+            let tasks = self.tasks.lock().await;
+            let task = tasks.get(task_id).ok_or("任务不存在")?;
+            let pt = PersistedTask::from_task(task);
+            (pt, task_id.to_string())
+        };
+        let probe_result = probe_with_options(&pt.url, options).await.map_err(|e| e.to_string())?;
+        pt.url = probe_result.final_url;
+        let mut tasks = self.tasks.lock().await;
+        tasks.insert(id, Arc::new(Task::from_persisted(pt)));
+        self.save_tasks().await;
+        Ok(())
+    }
+
+    /// 移动/重命名：更新任务保存路径，若文件已存在则移动
+    pub async fn update_task_save_path(&self, task_id: &str, new_save_path: String) -> Result<(), String> {
+        let (old_path, mut pt, id) = {
+            let tasks = self.tasks.lock().await;
+            let task = tasks.get(task_id).ok_or("任务不存在")?;
+            let old_path = task.save_path.clone();
+            let pt = PersistedTask::from_task(task);
+            (old_path, pt, task_id.to_string())
+        };
+        let new_path = std::path::Path::new(&new_save_path);
+        if std::path::Path::new(&old_path).exists() {
+            if let Some(parent) = new_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            tokio::fs::rename(&old_path, &new_save_path)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        pt.save_path = new_save_path.clone();
+        pt.filename = new_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download")
+            .to_string();
+        let mut tasks = self.tasks.lock().await;
+        tasks.insert(id, Arc::new(Task::from_persisted(pt)));
+        self.save_tasks().await;
+        Ok(())
+    }
 }
 
 fn task_to_info(t: &Arc<Task>) -> TaskInfo {
@@ -295,7 +367,7 @@ async fn run_worker(
     tx: mpsc::Sender<WriterMessage>,
     app_handle: Option<tauri::AppHandle>,
     _task_id: &str,
-    options: &NetworkOptions,
+    client: &Client,
 ) {
     loop {
         let status = *task.status.lock().await;
@@ -306,7 +378,7 @@ async fn run_worker(
             break;
         };
         let len = end - start + 1;
-        match fetch_range_with_options(url, start, end, options).await {
+        match fetch_range_with_client(client, url, start, end).await {
             Ok(data) => {
                 if data.len() as u64 != len {
                     // 可能服务器返回不完整，仍写入

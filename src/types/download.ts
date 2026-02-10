@@ -43,4 +43,5 @@ export interface AppSettings {
   notification_on_complete: boolean;
   notification_on_fail: boolean;
   timeout_secs: number;
+  save_progress_interval_secs?: number;
 }

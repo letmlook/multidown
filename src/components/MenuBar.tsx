@@ -21,6 +21,7 @@ interface MenuBarProps {
   onRemoveTask: () => void;
   onStartDownload: () => void;
   onRedownload: () => void;
+  onOpenAbout?: () => void;
 }
 
 export function MenuBar({
@@ -43,6 +44,7 @@ export function MenuBar({
   onRemoveTask,
   onStartDownload,
   onRedownload,
+  onOpenAbout,
 }: MenuBarProps) {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -195,17 +197,13 @@ export function MenuBar({
       <div className="menu-trigger-wrap">
         <span
           className="menu-trigger"
-          onClick={() => toggle("about")}
-          aria-expanded={activeMenu === "about"}
+          onClick={() => {
+            onOpenAbout?.();
+            close();
+          }}
         >
-          关于 Multidown
+          关于
         </span>
-        {activeMenu === "about" && (
-          <div className="menu-dropdown">
-            <div className="menu-item menu-item-disabled">Multidown — 多线程下载管理器</div>
-            <div className="menu-item menu-item-disabled">版本 0.1.0</div>
-          </div>
-        )}
       </div>
     </header>
   );

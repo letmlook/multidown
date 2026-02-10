@@ -10,6 +10,7 @@ mod settings;
 use engine::scheduler::Scheduler;
 use network::{NetworkOptions, ProbeResult};
 use settings::{load_settings, save_settings, settings_path, AppSettings};
+use engine::TaskStatus;
 use std::sync::Arc;
 use tauri::{Manager, State};
 use arboard::Clipboard;
@@ -169,6 +170,44 @@ async fn get_download_progress(
     Ok(state.get_task(&task_id).await)
 }
 
+/// 使用默认程序打开文件
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&path);
+    if !path.exists() {
+        return Err("文件不存在".to_string());
+    }
+    opener::open(path).map_err(|e| e.to_string())
+}
+
+/// 打开「打开方式」对话框
+#[tauri::command]
+fn open_with(path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&path);
+    if !path.exists() {
+        return Err("文件不存在".to_string());
+    }
+    let path_str = path.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("rundll32.exe")
+        .args(["shell32.dll,OpenAs_RunDLL", &path_str])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "windows"))]
+    opener::open(path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 在默认浏览器中打开 URL
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("仅支持 http/https 链接".to_string());
+    }
+    opener::open(url).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn open_folder(path: String) -> Result<(), String> {
     let path = std::path::Path::new(&path);
@@ -211,7 +250,14 @@ fn get_default_download_dir(app: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.destroy();
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        app.exit(0);
+    });
 }
 
 /// 从系统剪贴板读取文本（不依赖 WebView 权限，窗口获焦时可用）
@@ -226,6 +272,25 @@ fn read_clipboard_text() -> Result<String, String> {
 fn clear_clipboard_text() -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
     clipboard.set_text("").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refresh_download_address(
+    task_id: String,
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    let opts = network_options_from_app(&app).await;
+    state.refresh_task_url(&task_id, &opts).await
+}
+
+#[tauri::command]
+async fn update_task_save_path(
+    task_id: String,
+    new_save_path: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.update_task_save_path(&task_id, new_save_path).await
 }
 
 #[tauri::command]
@@ -263,7 +328,30 @@ pub fn run() {
                 .map_err(|e| e.to_string())?
                 .join("multidown_tasks.json");
             let scheduler = Scheduler::load_from(&path).unwrap_or_else(|_| Scheduler::new(Some(path)));
-            app.manage(Arc::new(scheduler));
+            let scheduler = Arc::new(scheduler);
+            let sched_clone = scheduler.clone();
+            let app_handle = app.handle().clone();
+            app.manage(scheduler);
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let interval = app_handle.path()
+                        .app_data_dir()
+                        .ok()
+                        .map(|d| settings_path(&d))
+                        .and_then(|p| load_settings(&p).ok())
+                        .map(|s| s.save_progress_interval_secs)
+                        .unwrap_or(30);
+                    tokio::time::sleep(std::time::Duration::from_secs(interval.max(5))).await;
+                    if interval == 0 {
+                        continue;
+                    }
+                    let list = sched_clone.list_downloads().await;
+                    let has_downloading = list.iter().any(|t| t.status == TaskStatus::Downloading);
+                    if has_downloading {
+                        sched_clone.save_tasks().await;
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -282,6 +370,11 @@ pub fn run() {
             get_download_progress,
             get_default_download_dir,
             open_folder,
+            open_url,
+            open_file,
+            open_with,
+            refresh_download_address,
+            update_task_save_path,
             create_batch_download,
             exit_app,
             read_clipboard_text,

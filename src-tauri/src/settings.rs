@@ -40,6 +40,8 @@ pub struct AppSettings {
     pub notification_on_fail: bool,
     /// 请求超时秒数
     pub timeout_secs: u64,
+    /// 下载中周期保存进度间隔（秒），0 表示不周期保存
+    pub save_progress_interval_secs: u64,
 }
 
 impl Default for AppSettings {
@@ -61,6 +63,7 @@ impl Default for AppSettings {
             notification_on_complete: true,
             notification_on_fail: true,
             timeout_secs: 30,
+            save_progress_interval_secs: 30,
         }
     }
 }
