@@ -1,0 +1,12 @@
+[package]
+name = "multidown-native-host"
+version = "0.1.0"
+edition = "2021"
+description = "Chrome Native Messaging Host for Multidown"
+
+[[bin]]
+name = "multidown-native-host"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

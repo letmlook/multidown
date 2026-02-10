@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Multidown 下载助手",
+  "version": "0.1.0",
+  "description": "使用 Multidown 下载链接与文件",
+  "permissions": ["contextMenus", "nativeMessaging"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

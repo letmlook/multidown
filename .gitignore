@@ -9,6 +9,10 @@ dist-ssr/
 src-tauri/target/
 src-tauri/WixTools/
 
+integration/native-host/target/
+integration/extension/node_modules/
+integration/extension/dist/
+
 # IDE
 .idea/
 .vscode/

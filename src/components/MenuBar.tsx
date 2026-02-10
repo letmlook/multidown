@@ -7,14 +7,18 @@ interface MenuBarProps {
   darkMode: boolean;
   onNewTask: () => void;
   onBatchAdd: () => void;
+  onBatchAddFromClipboard?: () => void;
   onOpenFromClipboard: () => void;
   onRefresh: () => void;
   onOpenOptions: () => void;
   onOpenSchedule: () => void;
   onPauseAll: () => void;
   onStopAll: () => void;
+  onStartQueue?: () => void;
+  onStopQueue?: () => void;
   onDeleteAllCompleted: () => void;
   onFind: () => void;
+  onFindNext?: () => void;
   onToggleDarkMode: () => void;
   onExit: () => void;
   onOpenFolder: () => void;
@@ -22,6 +26,9 @@ interface MenuBarProps {
   onStartDownload: () => void;
   onRedownload: () => void;
   onOpenAbout?: () => void;
+  onInstallExtension?: () => void;
+  onExport?: () => void;
+  onImport?: () => void;
 }
 
 export function MenuBar({
@@ -30,14 +37,18 @@ export function MenuBar({
   darkMode,
   onNewTask,
   onBatchAdd,
+  onBatchAddFromClipboard,
   onOpenFromClipboard,
   onRefresh: _onRefresh,
   onOpenOptions,
   onOpenSchedule,
   onPauseAll,
   onStopAll,
+  onStartQueue,
+  onStopQueue,
   onDeleteAllCompleted,
   onFind,
+  onFindNext,
   onToggleDarkMode,
   onExit,
   onOpenFolder,
@@ -45,12 +56,18 @@ export function MenuBar({
   onStartDownload,
   onRedownload,
   onOpenAbout,
+  onInstallExtension,
+  onExport,
+  onImport,
 }: MenuBarProps) {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const hasDownloading = tasks.some((t) => t.status === "downloading");
   const hasCompleted = tasks.some((t) => t.status === "completed");
+  const hasPausedOrPending = tasks.some(
+    (t) => t.status === "paused" || t.status === "pending"
+  );
 
   useEffect(() => {
     const close = (e: MouseEvent) => {
@@ -105,13 +122,17 @@ export function MenuBar({
             {menuItem("添加任务 (N)", onNewTask)}
             {menuItem("添加批量任务", onBatchAdd)}
             {menuItem("从剪贴板添加 (C)", onOpenFromClipboard)}
-            {menuItem("从剪贴板中添加批量下载", undefined, true, true)}
+            {menuItem(
+              "从剪贴板中添加批量下载",
+              onBatchAddFromClipboard,
+              !onBatchAddFromClipboard
+            )}
             {menuItem("运行站点抓取", undefined, true)}
             {sep()}
             {menuItem("显示悬浮窗", undefined, true)}
             {sep()}
-            {menuItem("导出", undefined, true, true)}
-            {menuItem("导入", undefined, true, true)}
+            {menuItem("导出", onExport, !onExport)}
+            {menuItem("导入", onImport, !onImport)}
             {sep()}
             {menuItem("退出 (E)", onExit)}
           </div>
@@ -152,12 +173,14 @@ export function MenuBar({
             {menuItem("删除全部已完成的任务", onDeleteAllCompleted, !hasCompleted)}
             {sep()}
             {menuItem("查找 (Ctrl+F)", onFind)}
-            {menuItem("查找下一个 (F3)", undefined, true)}
+            {menuItem("查找下一个 (F3)", onFindNext, !onFindNext)}
             {sep()}
             {menuItem("计划任务", onOpenSchedule)}
-            {menuItem("开始队列", undefined, true, true)}
-            {menuItem("停止队列", undefined, true, true)}
+            {menuItem("开始队列", onStartQueue, !hasPausedOrPending || !onStartQueue)}
+            {menuItem("停止队列", onStopQueue, !hasDownloading || !onStopQueue)}
             {menuItem("速度限制", undefined, true, true)}
+            {sep()}
+            {menuItem("安装浏览器扩展", onInstallExtension)}
             {menuItem("选项", onOpenOptions)}
           </div>
         )}

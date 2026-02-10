@@ -194,6 +194,21 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     </select>
                   </div>
                   <div className="form-group">
+                    <label>全局最大并发任务数</label>
+                    <select
+                      style={{ padding: "6px 10px", minWidth: 80, marginTop: 6 }}
+                      value={settings.max_concurrent_tasks}
+                      onChange={(e) => update({ max_concurrent_tasks: Number(e.target.value) })}
+                    >
+                      {[1, 2, 4, 6, 8, 10].map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                    <span style={{ color: "#666", fontSize: 12, marginLeft: 8 }}>
+                      同时进行中的下载任务数上限
+                    </span>
+                  </div>
+                  <div className="form-group">
                     <label>请求超时（秒）</label>
                     <input
                       type="number"

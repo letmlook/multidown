@@ -9,13 +9,27 @@ interface ToolbarProps {
   onNewTask: () => void;
   onOpenOptions?: () => void;
   onOpenSchedule?: () => void;
+  onStartQueue?: () => void;
+  onStopQueue?: () => void;
 }
 
-export function Toolbar({ tasks, selectedId, onRefresh, onNewTask, onOpenOptions, onOpenSchedule }: ToolbarProps) {
+export function Toolbar({
+  tasks,
+  selectedId,
+  onRefresh,
+  onNewTask,
+  onOpenOptions,
+  onOpenSchedule,
+  onStartQueue,
+  onStopQueue,
+}: ToolbarProps) {
   const selected = tasks.find((t) => t.id === selectedId);
   const canResume = selected && (selected.status === "paused" || selected.status === "pending");
   const canPause = selected && selected.status === "downloading";
   const hasDownloading = tasks.some((t) => t.status === "downloading");
+  const hasPausedOrPending = tasks.some(
+    (t) => t.status === "paused" || t.status === "pending"
+  );
 
   const handleResume = useCallback(async () => {
     if (!selectedId) return;
@@ -174,13 +188,25 @@ export function Toolbar({ tasks, selectedId, onRefresh, onNewTask, onOpenOptions
 
       <span className="toolbar-sep" />
 
-      <button type="button" className="toolbar-btn" title="开始队列" disabled>
+      <button
+        type="button"
+        className="toolbar-btn"
+        title="开始队列"
+        disabled={!hasPausedOrPending || !onStartQueue}
+        onClick={onStartQueue}
+      >
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M8 5v14l11-7z" />
         </svg>
         <span>开始队列</span>
       </button>
-      <button type="button" className="toolbar-btn" title="停止队列" disabled>
+      <button
+        type="button"
+        className="toolbar-btn"
+        title="停止队列"
+        disabled={!hasDownloading || !onStopQueue}
+        onClick={onStopQueue}
+      >
         <svg viewBox="0 0 24 24" fill="currentColor">
           <path d="M6 6h12v12H6z" />
         </svg>

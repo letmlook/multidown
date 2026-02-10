@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { TaskInfo } from "./types/download";
 import { TaskList } from "./components/TaskList";
@@ -14,6 +19,7 @@ import { DownloadFileInfo } from "./components/DownloadFileInfo";
 import { PropertiesModal } from "./components/PropertiesModal";
 import { MoveRenameModal } from "./components/MoveRenameModal";
 import { AboutModal } from "./components/AboutModal";
+import { InstallExtensionModal } from "./components/InstallExtensionModal";
 import type { AppSettings } from "./types/download";
 import "./index.css";
 
@@ -31,6 +37,7 @@ function App() {
   const [downloadFileInfoUrl, setDownloadFileInfoUrl] = useState("");
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [installExtensionOpen, setInstallExtensionOpen] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [findVisible, setFindVisible] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -46,6 +53,7 @@ function App() {
   const [moveRenameOpen, setMoveRenameOpen] = useState(false);
   const [propertiesTask, setPropertiesTask] = useState<TaskInfo | null>(null);
   const [moveRenameTask, setMoveRenameTask] = useState<TaskInfo | null>(null);
+  const [batchAddInitialUrls, setBatchAddInitialUrls] = useState("");
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -75,18 +83,17 @@ function App() {
         const show =
           (status === "completed" && s.notification_on_complete) ||
           (status === "failed" && s.notification_on_fail);
-        if (show && typeof Notification !== "undefined" && Notification.permission === "granted") {
-          new Notification(status === "completed" ? "下载完成" : "下载失败", {
-            body: filename || (status === "completed" ? "任务已完成" : "任务失败"),
-          });
-        } else if (show && typeof Notification !== "undefined" && Notification.permission === "default") {
-          Notification.requestPermission().then((p) => {
-            if (p === "granted") {
-              new Notification(status === "completed" ? "下载完成" : "下载失败", {
-                body: filename || (status === "completed" ? "任务已完成" : "任务失败"),
-              });
-            }
-          });
+        if (!show) return;
+        const title = status === "completed" ? "下载完成" : "下载失败";
+        const body =
+          filename || (status === "completed" ? "任务已完成" : "任务失败");
+        let granted = await isPermissionGranted();
+        if (!granted) {
+          const perm = await requestPermission();
+          granted = perm === "granted";
+        }
+        if (granted) {
+          sendNotification({ title, body });
         }
       } catch (_) {}
     });
@@ -144,11 +151,39 @@ function App() {
     );
   }, [tasks, findQuery]);
 
+  const handleFindNext = useCallback(() => {
+    if (!findQuery.trim() || displayTasks.length === 0) return;
+    const q = findQuery.trim().toLowerCase();
+    const currentIndex = selectedId
+      ? displayTasks.findIndex((t) => t.id === selectedId)
+      : -1;
+    for (let i = 1; i <= displayTasks.length; i++) {
+      const idx = (currentIndex + i) % displayTasks.length;
+      const t = displayTasks[idx];
+      const match =
+        (t.filename || "").toLowerCase().includes(q) ||
+        (t.url || "").toLowerCase().includes(q);
+      if (match) {
+        setSelectedId(t.id);
+        return;
+      }
+    }
+  }, [findQuery, displayTasks, selectedId]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "f") {
         e.preventDefault();
         setFindVisible(true);
+      }
+      if (e.ctrlKey && e.key === "n") {
+        e.preventDefault();
+        setAddTaskOpen(true);
+      }
+      if (e.key === "F3") {
+        e.preventDefault();
+        if (findVisible) handleFindNext();
+        else setFindVisible(true);
       }
       if (e.ctrlKey && e.key === "m") {
         e.preventDefault();
@@ -164,7 +199,7 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedTask]);
+  }, [selectedTask, findVisible, handleFindNext]);
 
   const handlePauseAll = useCallback(async () => {
     for (const t of tasks) {
@@ -184,6 +219,19 @@ function App() {
       if (t.status === "downloading") {
         try {
           await invoke("pause_download", { taskId: t.id });
+        } catch (e) {
+          console.error(e);
+        }
+      }
+    }
+    refreshTasks();
+  }, [tasks, refreshTasks]);
+
+  const handleStartQueue = useCallback(async () => {
+    for (const t of tasks) {
+      if (t.status === "paused" || t.status === "pending") {
+        try {
+          await invoke("resume_download", { taskId: t.id });
         } catch (e) {
           console.error(e);
         }
@@ -256,6 +304,34 @@ function App() {
   const handleExit = useCallback(() => {
     invoke("exit_app").catch(console.error);
   }, []);
+
+  const handleExport = useCallback(async () => {
+    try {
+      const json = await invoke<string>("export_tasks");
+      await invoke("write_clipboard_text", { text: json });
+      // 简单反馈：可用 alert 或后续加 toast
+      alert("任务列表已复制到剪贴板");
+    } catch (e) {
+      console.error(e);
+      alert("导出失败");
+    }
+  }, []);
+
+  const handleImport = useCallback(async () => {
+    try {
+      const text = await invoke<string>("read_clipboard_text");
+      if (!text.trim()) {
+        alert("剪贴板为空，请先复制任务列表或 URL 列表");
+        return;
+      }
+      const count = await invoke<number>("import_tasks", { text });
+      refreshTasks();
+      alert(`已导入 ${count} 个任务`);
+    } catch (e) {
+      console.error(e);
+      alert("导入失败");
+    }
+  }, [refreshTasks]);
 
   const handleTaskContextMenu = useCallback((e: React.MouseEvent, task: TaskInfo) => {
     setContextMenu({ x: e.clientX, y: e.clientY, task });
@@ -415,7 +491,31 @@ function App() {
           selectedId={selectedId}
           darkMode={darkMode}
           onNewTask={() => setAddTaskOpen(true)}
-          onBatchAdd={() => setBatchAddOpen(true)}
+          onBatchAdd={() => {
+            setBatchAddInitialUrls("");
+            setBatchAddOpen(true);
+          }}
+          onBatchAddFromClipboard={async () => {
+            try {
+              const text = await invoke<string>("read_clipboard_text");
+              const lines = text
+                .split(/\n/)
+                .map((s) => s.trim())
+                .filter(
+                  (s) =>
+                    s.length > 0 &&
+                    (s.startsWith("http://") || s.startsWith("https://"))
+                );
+              if (lines.length > 0) {
+                setBatchAddInitialUrls(lines.join("\n"));
+                setBatchAddOpen(true);
+              } else {
+                alert("剪贴板中没有找到有效的 HTTP(S) 链接");
+              }
+            } catch (_) {
+              alert("无法读取剪贴板");
+            }
+          }}
           onOpenFromClipboard={async () => {
             try {
               const text = await invoke<string>("read_clipboard_text");
@@ -425,23 +525,29 @@ function App() {
                 setDownloadFileInfoOpen(true);
               }
             } catch (_) {
-              console.warn("无法读取剪贴板");
+              alert("无法读取剪贴板");
             }
           }}
           onRefresh={refreshTasks}
           onOpenOptions={() => setOptionsOpen(true)}
           onOpenSchedule={() => setScheduleOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
+          onInstallExtension={() => setInstallExtensionOpen(true)}
           onPauseAll={handlePauseAll}
           onStopAll={handleStopAll}
           onDeleteAllCompleted={handleDeleteAllCompleted}
           onFind={() => setFindVisible(true)}
+          onFindNext={handleFindNext}
+          onStartQueue={handleStartQueue}
+          onStopQueue={handleStopAll}
           onToggleDarkMode={() => setDarkMode((v) => !v)}
           onExit={handleExit}
           onOpenFolder={handleOpenFolder}
           onRemoveTask={handleRemoveTask}
           onStartDownload={handleStartDownload}
           onRedownload={handleRedownload}
+          onExport={handleExport}
+          onImport={handleImport}
         />
       </TitleBar>
 
@@ -452,6 +558,8 @@ function App() {
         onNewTask={() => setAddTaskOpen(true)}
         onOpenOptions={() => setOptionsOpen(true)}
         onOpenSchedule={() => setScheduleOpen(true)}
+        onStartQueue={handleStartQueue}
+        onStopQueue={handleStopAll}
       />
 
       {findVisible && (
@@ -488,7 +596,11 @@ function App() {
 
       <BatchAdd
         open={batchAddOpen}
-        onClose={() => setBatchAddOpen(false)}
+        initialUrls={batchAddInitialUrls}
+        onClose={() => {
+          setBatchAddOpen(false);
+          setBatchAddInitialUrls("");
+        }}
         onAdded={refreshTasks}
       />
 
@@ -506,6 +618,11 @@ function App() {
       <OptionsModal open={optionsOpen} onClose={() => setOptionsOpen(false)} />
 
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.1.0" />
+
+      <InstallExtensionModal
+        open={installExtensionOpen}
+        onClose={() => setInstallExtensionOpen(false)}
+      />
 
       <PropertiesModal
         open={propertiesOpen}

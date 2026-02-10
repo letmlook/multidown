@@ -3,11 +3,12 @@ import { useState, useEffect } from "react";
 
 interface BatchAddProps {
   open: boolean;
+  initialUrls?: string;
   onClose: () => void;
   onAdded: () => void;
 }
 
-export function BatchAdd({ open, onClose, onAdded }: BatchAddProps) {
+export function BatchAdd({ open, initialUrls = "", onClose, onAdded }: BatchAddProps) {
   const [urlsText, setUrlsText] = useState("");
   const [saveDir, setSaveDir] = useState("");
   const [loading, setLoading] = useState(false);
@@ -15,11 +16,13 @@ export function BatchAdd({ open, onClose, onAdded }: BatchAddProps) {
 
   useEffect(() => {
     if (open) {
+      if (initialUrls.trim()) setUrlsText(initialUrls.trim());
+      else setUrlsText("");
       invoke<string>("get_default_download_dir")
         .then(setSaveDir)
         .catch(() => {});
     }
-  }, [open]);
+  }, [open, initialUrls]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
