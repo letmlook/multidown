@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multidown 图标与 Logo 预览</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; padding: 2rem; background: #f1f5f9; }
+    h1 { color: #0f172a; margin-bottom: 0.5rem; }
+    p { color: #475569; margin-bottom: 2rem; }
+    .preview { display: flex; flex-wrap: wrap; gap: 2rem; align-items: flex-start; }
+    .card { background: #fff; padding: 1.5rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .card h2 { font-size: 1rem; color: #64748b; margin: 0 0 1rem 0; }
+    .card .icon-wrap { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+    .card .icon-wrap img { display: block; }
+    .size-32 { width: 32px; height: 32px; }
+    .size-64 { width: 64px; height: 64px; }
+    .size-128 { width: 128px; height: 128px; }
+    .size-256 { width: 256px; height: 256px; }
+    .dark { background: #0f172a; padding: 2rem; border-radius: 12px; margin-top: 1rem; }
+    .dark .card { background: #1e293b; }
+    .dark h2 { color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <h1>Multidown 图标与 Logo 预览</h1>
+  <p>用于检查各尺寸下的显示效果。将 <code>icon.svg</code> 导出为 PNG 后替换下方路径即可用于 Tauri。</p>
+
+  <div class="preview">
+    <div class="card">
+      <h2>应用图标 (icon.svg)</h2>
+      <div class="icon-wrap">
+        <img src="icon.svg" alt="icon 32" class="size-32" />
+        <img src="icon.svg" alt="icon 64" class="size-64" />
+        <img src="icon.svg" alt="icon 128" class="size-128" />
+        <img src="icon.svg" alt="icon 256" class="size-256" />
+      </div>
+    </div>
+    <div class="card">
+      <h2>品牌 Logo (logo.svg)</h2>
+      <div class="icon-wrap">
+        <img src="logo.svg" alt="logo" style="height: 48px; width: auto;" />
+        <img src="logo.svg" alt="logo large" style="height: 64px; width: auto;" />
+      </div>
+    </div>
+  </div>
+
+  <div class="dark preview">
+    <div class="card">
+      <h2>深色背景下的图标</h2>
+      <div class="icon-wrap">
+        <img src="icon.svg" alt="icon 64 dark" class="size-64" />
+        <img src="icon.svg" alt="icon 128 dark" class="size-128" />
+      </div>
+    </div>
+  </div>
+</body>
+</html>

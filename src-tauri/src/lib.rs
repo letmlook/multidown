@@ -12,6 +12,7 @@ use network::{NetworkOptions, ProbeResult};
 use settings::{load_settings, save_settings, settings_path, AppSettings};
 use std::sync::Arc;
 use tauri::{Manager, State};
+use arboard::Clipboard;
 
 fn app_settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     app.path()
@@ -146,6 +147,11 @@ async fn cancel_download(task_id: String, state: State<'_, Arc<Scheduler>>) -> R
 }
 
 #[tauri::command]
+async fn remove_task(task_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.remove_task(&task_id).await
+}
+
+#[tauri::command]
 async fn list_downloads(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::TaskInfo>, String> {
     Ok(state.list_downloads().await)
 }
@@ -208,6 +214,20 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// 从系统剪贴板读取文本（不依赖 WebView 权限，窗口获焦时可用）
+#[tauri::command]
+fn read_clipboard_text() -> Result<String, String> {
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+    Ok(clipboard.get_text().unwrap_or_default())
+}
+
+/// 清空系统剪贴板文本，避免同一 URL 再次触发弹窗
+#[tauri::command]
+fn clear_clipboard_text() -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text("").map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn create_batch_download(
     urls: Vec<String>,
@@ -256,6 +276,7 @@ pub fn run() {
             pause_download,
             resume_download,
             cancel_download,
+            remove_task,
             list_downloads,
             clear_completed_tasks,
             get_download_progress,
@@ -263,6 +284,8 @@ pub fn run() {
             open_folder,
             create_batch_download,
             exit_app,
+            read_clipboard_text,
+            clear_clipboard_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

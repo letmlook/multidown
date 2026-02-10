@@ -216,6 +216,22 @@ impl Scheduler {
         Ok(())
     }
 
+    /// 删除任务：先取消再从列表移除并持久化，任务记录从文件中删除
+    pub async fn remove_task(&self, task_id: &str) -> Result<(), String> {
+        {
+            let tasks = self.tasks.lock().await;
+            let task = tasks.get(task_id).ok_or_else(|| "任务不存在".to_string())?;
+            let mut st = task.status.lock().await;
+            *st = TaskStatus::Cancelled;
+        }
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.remove(task_id);
+        }
+        self.save_tasks().await;
+        Ok(())
+    }
+
     pub async fn list_downloads(&self) -> Vec<TaskInfo> {
         let tasks = self.tasks.lock().await;
         tasks

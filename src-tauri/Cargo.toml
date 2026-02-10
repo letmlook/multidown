@@ -24,6 +24,7 @@ thiserror = "1"
 bytes = "1"
 urlencoding = "2"
 futures-util = "0.3"
+arboard = "3"
 
 [features]
 default = ["custom-protocol"]

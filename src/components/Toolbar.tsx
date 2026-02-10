@@ -52,7 +52,7 @@ export function Toolbar({ tasks, selectedId, onRefresh, onNewTask, onOpenOptions
   const handleDelete = useCallback(async () => {
     if (!selectedId) return;
     try {
-      await invoke("cancel_download", { taskId: selectedId });
+      await invoke("remove_task", { taskId: selectedId });
       onRefresh();
     } catch (e) {
       console.error(e);
@@ -61,12 +61,10 @@ export function Toolbar({ tasks, selectedId, onRefresh, onNewTask, onOpenOptions
 
   const handleDeleteAll = useCallback(async () => {
     for (const t of tasks) {
-      if (t.status === "downloading" || t.status === "paused" || t.status === "pending") {
-        try {
-          await invoke("cancel_download", { taskId: t.id });
-        } catch (e) {
-          console.error(e);
-        }
+      try {
+        await invoke("remove_task", { taskId: t.id });
+      } catch (e) {
+        console.error(e);
       }
     }
     onRefresh();

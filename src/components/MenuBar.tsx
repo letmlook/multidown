@@ -30,7 +30,7 @@ export function MenuBar({
   onNewTask,
   onBatchAdd,
   onOpenFromClipboard,
-  onRefresh,
+  onRefresh: _onRefresh,
   onOpenOptions,
   onOpenSchedule,
   onPauseAll,

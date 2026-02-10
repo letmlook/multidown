@@ -41,7 +41,8 @@ function formatRemaining(total: number, downloaded: number, speedBps: number | n
 }
 
 function formatDate(ts: number): string {
-  const d = new Date(ts);
+  // 后端 created_at 为 Unix 秒，Date 需要毫秒
+  const d = new Date(ts * 1000);
   const now = new Date();
   const sameYear = d.getFullYear() === now.getFullYear();
   if (sameYear) return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
@@ -56,43 +57,7 @@ interface TaskListProps {
   onContextMenu?: (e: React.MouseEvent, task: TaskInfo) => void;
 }
 
-export function TaskList({ tasks, selectedId, onSelect, onRefresh, onContextMenu }: TaskListProps) {
-  const handlePause = useCallback(
-    async (id: string) => {
-      try {
-        await invoke("pause_download", { taskId: id });
-        onRefresh();
-      } catch (e) {
-        console.error(e);
-      }
-    },
-    [onRefresh]
-  );
-
-  const handleResume = useCallback(
-    async (id: string) => {
-      try {
-        await invoke("resume_download", { taskId: id });
-        onRefresh();
-      } catch (e) {
-        console.error(e);
-      }
-    },
-    [onRefresh]
-  );
-
-  const handleCancel = useCallback(
-    async (id: string) => {
-      try {
-        await invoke("cancel_download", { taskId: id });
-        onRefresh();
-      } catch (e) {
-        console.error(e);
-      }
-    },
-    [onRefresh]
-  );
-
+export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, onContextMenu }: TaskListProps) {
   const handleRowDblClick = useCallback(
     (t: TaskInfo) => {
       if (t.status === "completed" && t.save_path) openFolder(t.save_path);

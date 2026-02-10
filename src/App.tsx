@@ -100,12 +100,16 @@ function App() {
         try {
           const settings = await invoke<AppSettings>("get_settings");
           if (!settings.clipboard_monitor) return;
-          const text = await navigator.clipboard.readText();
+          const text = await invoke<string>("read_clipboard_text");
           const url = text.trim();
-          if (isHttpUrl(url) && url !== lastClipboardUrlRef.current) {
-            lastClipboardUrlRef.current = url;
+          if (!isHttpUrl(url)) return;
+          // 先更新 ref 再判断，避免多次 focus 或同一 URL 重复弹窗
+          const prev = lastClipboardUrlRef.current;
+          lastClipboardUrlRef.current = url;
+          if (prev !== url) {
             setDownloadFileInfoUrl(url);
             setDownloadFileInfoOpen(true);
+            void invoke("clear_clipboard_text"); // 清空剪贴板，防止再次切回时重复弹窗
           }
         } catch (_) {
           // 无剪贴板权限或读取失败时静默忽略
@@ -196,7 +200,7 @@ function App() {
   const handleRemoveTask = useCallback(async () => {
     if (!selectedId) return;
     try {
-      await invoke("cancel_download", { taskId: selectedId });
+      await invoke("remove_task", { taskId: selectedId });
       refreshTasks();
     } catch (e) {
       console.error(e);
@@ -252,7 +256,7 @@ function App() {
         {
           label: "移除",
           onClick: () =>
-            invoke("cancel_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+            invoke("remove_task", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
         },
         {
           label: "开始下载",
@@ -294,7 +298,7 @@ function App() {
         onBatchAdd={() => setBatchAddOpen(true)}
         onOpenFromClipboard={async () => {
           try {
-            const text = await navigator.clipboard.readText();
+            const text = await invoke<string>("read_clipboard_text");
             const url = text.trim();
             if (isHttpUrl(url)) {
               setDownloadFileInfoUrl(url);
