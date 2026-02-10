@@ -1,0 +1,11 @@
+{
+  "identifier": "main-capability",
+  "description": "主窗口能力：默认核心权限与自定义命令",
+  "windows": ["main"],
+  "permissions": [
+    "core:path:default",
+    "core:event:default",
+    "core:window:default",
+    "core:app:default"
+  ]
+}
