@@ -51,7 +51,7 @@ impl Default for AppSettings {
             max_connections_per_task: 8,
             max_concurrent_tasks: 4,
             run_at_startup: false,
-            clipboard_monitor: false,
+            clipboard_monitor: true,
             show_start_dialog: true,
             show_complete_dialog: true,
             duplicate_action: "ask".to_string(),

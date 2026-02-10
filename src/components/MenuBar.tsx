@@ -131,8 +131,8 @@ export function MenuBar({
             {sep()}
             {menuItem("显示悬浮窗", undefined, true)}
             {sep()}
-            {menuItem("导出", onExport, !onExport)}
-            {menuItem("导入", onImport, !onImport)}
+            {menuItem("导出文件", onExport, !onExport)}
+            {menuItem("导入文件", onImport, !onImport)}
             {sep()}
             {menuItem("退出 (E)", onExit)}
           </div>

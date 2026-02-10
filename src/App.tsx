@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save, open } from "@tauri-apps/plugin-dialog";
+import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import {
   isPermissionGranted,
   requestPermission,
@@ -19,7 +21,7 @@ import { DownloadFileInfo } from "./components/DownloadFileInfo";
 import { PropertiesModal } from "./components/PropertiesModal";
 import { MoveRenameModal } from "./components/MoveRenameModal";
 import { AboutModal } from "./components/AboutModal";
-import { InstallExtensionModal } from "./components/InstallExtensionModal";
+import { Toast, useToast } from "./components/Toast";
 import type { AppSettings } from "./types/download";
 import "./index.css";
 
@@ -37,7 +39,7 @@ function App() {
   const [downloadFileInfoUrl, setDownloadFileInfoUrl] = useState("");
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
-  const [installExtensionOpen, setInstallExtensionOpen] = useState(false);
+
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [findVisible, setFindVisible] = useState(false);
   const [findQuery, setFindQuery] = useState("");
@@ -54,6 +56,7 @@ function App() {
   const [propertiesTask, setPropertiesTask] = useState<TaskInfo | null>(null);
   const [moveRenameTask, setMoveRenameTask] = useState<TaskInfo | null>(null);
   const [batchAddInitialUrls, setBatchAddInitialUrls] = useState("");
+  const { toast, showToast, hideToast } = useToast();
 
   const refreshTasks = useCallback(async () => {
     try {
@@ -308,30 +311,55 @@ function App() {
   const handleExport = useCallback(async () => {
     try {
       const json = await invoke<string>("export_tasks");
-      await invoke("write_clipboard_text", { text: json });
-      // 简单反馈：可用 alert 或后续加 toast
-      alert("任务列表已复制到剪贴板");
+      const filePath = await save({
+        defaultPath: "multidown-tasks.json",
+        filters: [
+          {
+            name: "JSON文件",
+            extensions: ["json"]
+          }
+        ]
+      });
+      if (filePath) {
+        await writeTextFile(filePath, json);
+        showToast("任务列表已导出到文件");
+      }
     } catch (e) {
       console.error(e);
-      alert("导出失败");
+      showToast("导出失败");
     }
-  }, []);
+  }, [showToast]);
 
   const handleImport = useCallback(async () => {
     try {
-      const text = await invoke<string>("read_clipboard_text");
-      if (!text.trim()) {
-        alert("剪贴板为空，请先复制任务列表或 URL 列表");
-        return;
+      const filePath = await open({
+        filters: [
+          {
+            name: "JSON文件",
+            extensions: ["json"]
+          },
+          {
+            name: "文本文件",
+            extensions: ["txt"]
+          }
+        ],
+        multiple: false
+      });
+      if (filePath) {
+        const text = await readTextFile(filePath as string);
+        if (!text.trim()) {
+          showToast("文件为空，请选择包含任务列表或 URL 列表的文件");
+          return;
+        }
+        const count = await invoke<number>("import_tasks", { text });
+        refreshTasks();
+        showToast(`已导入 ${count} 个任务`);
       }
-      const count = await invoke<number>("import_tasks", { text });
-      refreshTasks();
-      alert(`已导入 ${count} 个任务`);
     } catch (e) {
       console.error(e);
-      alert("导入失败");
+      showToast("导入失败");
     }
-  }, [refreshTasks]);
+  }, [refreshTasks, showToast]);
 
   const handleTaskContextMenu = useCallback((e: React.MouseEvent, task: TaskInfo) => {
     setContextMenu({ x: e.clientX, y: e.clientY, task });
@@ -532,7 +560,14 @@ function App() {
           onOpenOptions={() => setOptionsOpen(true)}
           onOpenSchedule={() => setScheduleOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
-          onInstallExtension={() => setInstallExtensionOpen(true)}
+          onInstallExtension={async () => {
+            try {
+              await invoke("install_browser_extension");
+            } catch (e) {
+              console.error("安装浏览器扩展失败:", e);
+              alert(`安装浏览器扩展失败: ${e}`);
+            }
+          }}
           onPauseAll={handlePauseAll}
           onStopAll={handleStopAll}
           onDeleteAllCompleted={handleDeleteAllCompleted}
@@ -619,10 +654,12 @@ function App() {
 
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.1.0" />
 
-      <InstallExtensionModal
-        open={installExtensionOpen}
-        onClose={() => setInstallExtensionOpen(false)}
-      />
+      {toast && (
+        <Toast
+          message={toast.message}
+          onClose={hideToast}
+        />
+      )}
 
       <PropertiesModal
         open={propertiesOpen}

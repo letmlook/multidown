@@ -29,6 +29,25 @@ export function InstallExtensionModal({ open, onClose }: InstallExtensionModalPr
     }
   };
 
+  const installExtension = async (): Promise<void> => {
+    setError(null);
+    try {
+      await invoke("install_browser_extension");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const packageExtension = async (): Promise<void> => {
+    setError(null);
+    try {
+      const zipPath = await invoke<string>("package_browser_extension");
+      await invoke("open_folder", { path: zipPath });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   if (!open) return null;
 
   return (
@@ -56,6 +75,20 @@ export function InstallExtensionModal({ open, onClose }: InstallExtensionModalPr
           <button
             type="button"
             className="btn btn-primary"
+            onClick={installExtension}
+          >
+            自动安装扩展
+          </button>
+          <button
+            type="button"
+            className="btn"
+            onClick={packageExtension}
+          >
+            打包扩展
+          </button>
+          <button
+            type="button"
+            className="btn"
             onClick={() => doWithPath("open")}
           >
             打开扩展文件夹

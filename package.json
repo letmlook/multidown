@@ -6,14 +6,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:extension": "node scripts/build-extension.mjs",
+    "build:all": "npm run build && npm run build:extension",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
+    "tauri:build": "npm run build:all && tauri build",
     "icons": "node scripts/icons-from-svg.mjs && tauri icon src-tauri/icons/icon-1024.png"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
+    "@tauri-apps/plugin-fs": "^2.4.5",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

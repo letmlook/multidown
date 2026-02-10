@@ -1368,3 +1368,68 @@ body {
   border-color: #0a7ea4;
   color: #fff;
 }
+
+/* Toast 提示框 */
+.toast-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+
+.toast {
+  background: #fff;
+  border-radius: 6px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+  min-width: 300px;
+  max-width: 400px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.toast-message {
+  font-size: 13px;
+  line-height: 1.4;
+  color: #333;
+  text-align: center;
+}
+
+.toast-close {
+  align-self: center;
+  padding: 6px 14px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  min-width: 80px;
+}
+
+.toast-close:hover {
+  background: #f5f5f5;
+}
+
+/* 深色模式 Toast */
+.app-layout.dark .toast {
+  background: #2d2d2d;
+  border-color: #404040;
+}
+
+.app-layout.dark .toast-message {
+  color: #e0e0e0;
+}
+
+.app-layout.dark .toast-close {
+  background: #3a3a3a;
+  border-color: #505050;
+  color: #e0e0e0;
+}
+
+.app-layout.dark .toast-close:hover {
+  background: #454545;
+}

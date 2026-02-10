@@ -16,6 +16,8 @@ function useWindowApi() {
     toggleMaximize: () => Promise<void>;
     close: () => Promise<void>;
     destroy: () => Promise<void>;
+    hide: () => Promise<void>;
+    show: () => Promise<void>;
     startDragging?: () => Promise<void>;
   }) | null>(null);
   useEffect(() => {
@@ -75,13 +77,30 @@ export function TitleBar({ darkMode, children }: TitleBarProps) {
   }, [getCurrentWindow, updateMaximized]);
 
   const handleClose = useCallback(() => {
-    invoke("exit_app").catch(() => {
-      try {
-        getCurrentWindow?.().destroy().catch(() => getCurrentWindow?.().close().catch(() => {}));
-      } catch {
-        // ignore
-      }
-    });
+    try {
+      console.log('handleClose called');
+      // 调用新的 hide_app 命令来隐藏主窗口
+      invoke("hide_app").then(() => {
+        console.log('hide_app successful');
+      }).catch((error) => {
+        console.log('hide_app failed:', error);
+        // 如果 hide_app 失败，尝试使用窗口 API
+        const window = getCurrentWindow?.();
+        if (window) {
+          if (typeof window.hide === 'function') {
+            window.hide().catch(() => {
+              if (typeof window.close === 'function') {
+                window.close().catch(() => {});
+              }
+            });
+          } else if (typeof window.close === 'function') {
+            window.close().catch(() => {});
+          }
+        }
+      });
+    } catch (error) {
+      console.log('handleClose error:', error);
+    }
   }, [getCurrentWindow]);
 
   const handleDragRegionMouseDown = useCallback(

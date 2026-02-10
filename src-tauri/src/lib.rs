@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tauri::{Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
+use tauri::image::Image;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -282,6 +283,13 @@ fn exit_app(app: tauri::AppHandle) {
     });
 }
 
+#[tauri::command]
+fn hide_app(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
 /// 从系统剪贴板读取文本（不依赖 WebView 权限，窗口获焦时可用）
 #[tauri::command]
 fn read_clipboard_text() -> Result<String, String> {
@@ -324,19 +332,434 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 #[tauri::command]
 fn get_browser_extension_path(app: tauri::AppHandle) -> Result<String, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let ext_dest = app_data.join("extension");
-    if ext_dest.join("manifest.json").exists() {
-        return Ok(ext_dest.to_string_lossy().to_string());
+    let crx_dest = app_data.join("extension").join("multidown-extension.crx");
+    if crx_dest.exists() {
+        return Ok(crx_dest.to_string_lossy().to_string());
     }
     if let Ok(res_dir) = app.path().resource_dir() {
-        let ext_src = res_dir.join("extension");
-        if ext_src.join("manifest.json").exists() {
-            std::fs::create_dir_all(&ext_dest).map_err(|e| e.to_string())?;
-            copy_dir_all(&ext_src, &ext_dest).map_err(|e| e.to_string())?;
-            return Ok(ext_dest.to_string_lossy().to_string());
+        let crx_src = res_dir.join("extension").join("multidown-extension.crx");
+        if crx_src.exists() {
+            let ext_dest_dir = app_data.join("extension");
+            std::fs::create_dir_all(&ext_dest_dir).map_err(|e| e.to_string())?;
+            std::fs::copy(&crx_src, &crx_dest).map_err(|e| e.to_string())?;
+            return Ok(crx_dest.to_string_lossy().to_string());
         }
     }
     Err("扩展未随应用打包，请从项目 integration/extension 目录获取。".to_string())
+}
+
+#[tauri::command]
+async fn install_browser_extension(app: tauri::AppHandle) -> Result<(), String> {
+    // 尝试注册 Native Host
+    register_native_host(app.clone())?;
+    
+    // 首先尝试使用解压后的扩展目录安装（更可靠）
+    let ext_dir_result = get_extension_directory(app.clone());
+    if let Ok(ext_dir) = ext_dir_result {
+        // 尝试安装到 Chrome/Edge
+        let chrome_result = install_to_chrome(&ext_dir);
+        
+        // 尝试安装到 Firefox
+        let firefox_result = install_to_firefox(&ext_dir);
+        
+        // 如果至少有一个浏览器安装成功，则返回成功
+        if chrome_result.is_ok() || firefox_result.is_ok() {
+            return Ok(());
+        }
+    }
+    
+    // 所有安装方法都失败
+    Err("无法安装扩展到浏览器，请手动安装。\n提示：请在浏览器扩展管理页面启用开发者模式，然后加载解压后的扩展目录。".to_string())
+}
+
+/// 获取扩展目录（解压后的扩展文件）
+fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let ext_dir = app_data.join("extension");
+    
+    // 检查扩展目录是否存在
+    if ext_dir.join("manifest.json").exists() {
+        return Ok(ext_dir.to_string_lossy().to_string());
+    }
+    
+    // 检查资源目录中的扩展文件
+    if let Ok(res_dir) = app.path().resource_dir() {
+        let crx_path = res_dir.join("extension").join("multidown-extension.crx");
+        if crx_path.exists() {
+            // 创建扩展目录
+            std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
+            
+            // 解压crx文件（实际上是zip文件）
+            let crx_content = std::fs::read(&crx_path).map_err(|e| e.to_string())?;
+            
+            // 使用zip库解压
+            let mut cursor = std::io::Cursor::new(crx_content);
+            let mut archive = zip::ZipArchive::new(&mut cursor).map_err(|e| e.to_string())?;
+            
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                let outpath = ext_dir.join(file.name());
+                
+                if file.name().ends_with('/') {
+                    std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        if !p.exists() {
+                            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+                }
+            }
+            
+            return Ok(ext_dir.to_string_lossy().to_string());
+        }
+    }
+    
+    Err("扩展文件不存在".to_string())
+}
+
+
+
+#[tauri::command]
+async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, String> {
+    use std::fs::File;
+    use std::io::Write;
+    use zip::write::FileOptions;
+    
+    // 获取扩展路径
+    let ext_path = get_browser_extension_path(app.clone())?;
+    let ext_dir = std::path::Path::new(&ext_path);
+    
+    // 创建输出目录
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let output_dir = app_data.join("extension");
+    std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
+    
+    // 生成zip文件路径
+    let zip_path = output_dir.join("multidown-extension.zip");
+    
+    // 创建zip文件
+    let file = File::create(&zip_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    
+    // 遍历扩展目录中的所有文件
+    let walk_dir = walkdir::WalkDir::new(ext_dir).into_iter();
+    for entry in walk_dir.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() {
+            // 计算相对路径
+            let relative_path = path.strip_prefix(ext_dir).map_err(|e| e.to_string())?;
+            let relative_path_str = relative_path.to_string_lossy().to_string();
+            
+            // 写入文件到zip
+            zip.start_file(relative_path_str, FileOptions::default())
+                .map_err(|e| e.to_string())?;
+            let mut file = File::open(path).map_err(|e| e.to_string())?;
+            let mut buffer = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut buffer).map_err(|e| e.to_string())?;
+            zip.write_all(&buffer).map_err(|e| e.to_string())?;
+        }
+    }
+    
+    // 完成zip写入
+    zip.finish().map_err(|e| e.to_string())?;
+    
+    Ok(zip_path.to_string_lossy().to_string())
+}
+
+/// 注册 Native Host
+fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "windows")]{
+        use std::fs::File;
+        use std::io::Write;
+        use winreg::enums::*;
+        use winreg::RegKey;
+        
+        // 获取应用数据目录
+        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let native_host_dir = app_data.join("native-host");
+        std::fs::create_dir_all(&native_host_dir).map_err(|e| e.to_string())?;
+        
+        // 复制 native host 可执行文件（如果存在）
+        if let Ok(res_dir) = app.path().resource_dir() {
+            let native_host_src = res_dir.join("native-host");
+            if native_host_src.exists() {
+                copy_dir_all(&native_host_src, &native_host_dir).map_err(|e| e.to_string())?;
+            }
+        }
+        
+        // 注册 Chrome/Edge Native Host
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let path = r"Software\Google\Chrome\NativeMessagingHosts\com.multidown.app";
+        let (key, _) = hkcu.create_subkey(path).map_err(|e| e.to_string())?;
+        let manifest_path = app_data.join(r"native-host\com.multidown.app.json");
+        key.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
+        
+        // 注册 Edge Native Host
+        let path_edge = r"Software\Microsoft\Edge\NativeMessagingHosts\com.multidown.app";
+        let (key_edge, _) = hkcu.create_subkey(path_edge).map_err(|e| e.to_string())?;
+        key_edge.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
+        
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]{
+        // macOS 实现
+        let home_dir = dirs::home_dir().ok_or("无法获取用户主目录".to_string())?;
+        let chrome_dir = home_dir.join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
+        let edge_dir = home_dir.join("Library/Application Support/Microsoft Edge/NativeMessagingHosts");
+        
+        std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
+        
+        // 创建 manifest 文件
+        let manifest = serde_json::json!({
+            "name": "com.multidown.app",
+            "description": "Multidown Native Host",
+            "path": app.path().current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string(),
+            "type": "stdio",
+            "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
+        });
+        
+        let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        
+        std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
+        std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
+        
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]{
+        // Linux 实现
+        let home_dir = dirs::home_dir().ok_or("无法获取用户主目录".to_string())?;
+        let chrome_dir = home_dir.join(".config/google-chrome/NativeMessagingHosts");
+        let edge_dir = home_dir.join(".config/microsoft-edge/NativeMessagingHosts");
+        
+        std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
+        
+        // 创建 manifest 文件
+        let manifest = serde_json::json!({
+            "name": "com.multidown.app",
+            "description": "Multidown Native Host",
+            "path": app.path().current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string(),
+            "type": "stdio",
+            "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
+        });
+        
+        let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        
+        std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
+        std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
+        
+        Ok(())
+    }
+}
+
+/// 安装扩展到 Chrome/Edge
+fn install_to_chrome(ext_path: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]{
+        // 尝试查找 Chrome
+        let chrome_paths = [
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+        ];
+        
+        for chrome_path in &chrome_paths {
+            if std::path::Path::new(chrome_path).exists() {
+                // 检查扩展目录是否存在
+                if !std::path::Path::new(ext_path).exists() {
+                    return Err(format!("扩展目录不存在: {}", ext_path));
+                }
+                
+                // 检查扩展目录是否包含manifest.json
+                if !std::path::Path::new(ext_path).join("manifest.json").exists() {
+                    return Err(format!("扩展目录缺少manifest.json文件: {}", ext_path));
+                }
+                
+                // // 尝试关闭所有正在运行的浏览器实例
+                // let _ = std::process::Command::new("taskkill")
+                //     .arg("/F")
+                //     .arg("/IM")
+                //     .arg("chrome.exe")
+                //     .spawn();
+                // let _ = std::process::Command::new("taskkill")
+                //     .arg("/F")
+                //     .arg("/IM")
+                //     .arg("msedge.exe")
+                //     .spawn();
+                
+                // 等待浏览器关闭
+                // std::thread::sleep(std::time::Duration::from_millis(1000));
+                
+                // 启动 Chrome 并加载扩展，添加开发者模式相关参数
+                // 调整参数顺序，确保--load-extension在其他参数之前
+                let result = std::process::Command::new(chrome_path)
+                    .arg(format!("--load-extension={}", ext_path))
+                    .arg("--enable-extensions")
+                    .arg("--enable-dev-tools")
+                    .arg("--no-sandbox")
+                    .arg("--disable-background-timer-throttling")
+                    .arg("--disable-backgrounding-occluded-windows")
+                    .arg("--disable-renderer-backgrounding")
+                    .arg("chrome://extensions/")
+                    .spawn();
+                
+                if result.is_ok() {
+                    return Ok(());
+                } else {
+                    return Err(format!("无法启动浏览器: {}", result.unwrap_err()));
+                }
+            }
+        }
+        Err("未找到 Chrome 或 Edge 浏览器".to_string())
+    }
+    #[cfg(target_os = "macos")]{
+        // 尝试查找 Chrome
+        let chrome_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+        ];
+        
+        for chrome_path in &chrome_paths {
+            if std::path::Path::new(chrome_path).exists() {
+                // 检查扩展目录是否存在
+                if !std::path::Path::new(ext_path).exists() {
+                    return Err(format!("扩展目录不存在: {}", ext_path));
+                }
+                
+                // 检查扩展目录是否包含manifest.json
+                if !std::path::Path::new(ext_path).join("manifest.json").exists() {
+                    return Err(format!("扩展目录缺少manifest.json文件: {}", ext_path));
+                }
+                
+                // 尝试关闭所有正在运行的浏览器实例
+                let _ = std::process::Command::new("pkill")
+                    .arg("-f")
+                    .arg("Google Chrome")
+                    .spawn();
+                let _ = std::process::Command::new("pkill")
+                    .arg("-f")
+                    .arg("Microsoft Edge")
+                    .spawn();
+                
+                // 等待浏览器关闭
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                
+                // 启动 Chrome 并加载扩展
+                let result = std::process::Command::new(chrome_path)
+                    .arg(format!("--load-extension={}", ext_path))
+                    .arg("--enable-extensions")
+                    .arg("--enable-dev-tools")
+                    .arg("chrome://extensions/")
+                    .spawn();
+                
+                if result.is_ok() {
+                    return Ok(());
+                } else {
+                    return Err(format!("无法启动浏览器: {}", result.unwrap_err()));
+                }
+            }
+        }
+        Err("未找到 Chrome 或 Edge 浏览器".to_string())
+    }
+    #[cfg(target_os = "linux")]{
+        // 尝试查找 Chrome
+        let chrome_commands = ["google-chrome", "chromium", "microsoft-edge"];
+        
+        for cmd in &chrome_commands {
+            if let Ok(output) = std::process::Command::new("which").arg(cmd).output() {
+                if output.status.success() {
+                    // 检查扩展目录是否存在
+                    if !std::path::Path::new(ext_path).exists() {
+                        return Err(format!("扩展目录不存在: {}", ext_path));
+                    }
+                    
+                    // 检查扩展目录是否包含manifest.json
+                    if !std::path::Path::new(ext_path).join("manifest.json").exists() {
+                        return Err(format!("扩展目录缺少manifest.json文件: {}", ext_path));
+                    }
+                    
+                    // 尝试关闭所有正在运行的浏览器实例
+                    let _ = std::process::Command::new("pkill")
+                        .arg("-f")
+                        .arg(cmd)
+                        .spawn();
+                    
+                    // 等待浏览器关闭
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    
+                    // 启动 Chrome 并加载扩展
+                    let result = std::process::Command::new(cmd)
+                        .arg(format!("--load-extension={}", ext_path))
+                        .arg("--enable-extensions")
+                        .arg("--enable-dev-tools")
+                        .arg("chrome://extensions/")
+                        .spawn();
+                    
+                    if result.is_ok() {
+                        return Ok(());
+                    } else {
+                        return Err(format!("无法启动浏览器: {}", result.unwrap_err()));
+                    }
+                }
+            }
+        }
+        Err("未找到 Chrome 或 Edge 浏览器".to_string())
+    }
+}
+
+/// 安装扩展到 Firefox
+fn install_to_firefox(ext_path: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]{
+        // 尝试查找 Firefox
+        let firefox_paths = [
+            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+            "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe"
+        ];
+        
+        for firefox_path in &firefox_paths {
+            if std::path::Path::new(firefox_path).exists() {
+                // 启动 Firefox 并打开调试页面
+                std::process::Command::new(firefox_path)
+                    .arg("about:debugging#/runtime/this-firefox")
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+        Err("未找到 Firefox 浏览器".to_string())
+    }
+    #[cfg(target_os = "macos")]{
+        // 尝试查找 Firefox
+        let firefox_path = "/Applications/Firefox.app/Contents/MacOS/firefox";
+        
+        if std::path::Path::new(firefox_path).exists() {
+            // 启动 Firefox 并打开调试页面
+            std::process::Command::new(firefox_path)
+                .arg("about:debugging#/runtime/this-firefox")
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        Err("未找到 Firefox 浏览器".to_string())
+    }
+    #[cfg(target_os = "linux")]{
+        // 尝试查找 Firefox
+        if let Ok(output) = std::process::Command::new("which").arg("firefox").output() {
+            if output.status.success() {
+                // 启动 Firefox 并打开调试页面
+                std::process::Command::new("firefox")
+                    .arg("about:debugging#/runtime/this-firefox")
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+        Err("未找到 Firefox 浏览器".to_string())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -505,6 +928,8 @@ async fn create_batch_download(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let path = app
                 .path()
@@ -516,15 +941,31 @@ pub fn run() {
             let sched_clone = scheduler.clone();
             let app_handle = app.handle().clone();
             app.manage(scheduler);
+            
+            // 检查是否首次运行，如果是则自动安装扩展
+            let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            let first_run_flag = app_data.join("first_run");
+            if !first_run_flag.exists() {
+                // 创建首次运行标志
+                std::fs::write(&first_run_flag, "").ok();
+                
+                // 自动安装扩展
+                let app_handle_clone = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = install_browser_extension(app_handle_clone).await;
+                });
+            }
 
             // 系统托盘：图标 + 菜单（显示主窗口 / 退出）
             let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
-            let _tray = TrayIconBuilder::new()
+            
+            // 尝试加载应用程序图标作为托盘图标
+            let mut tray_builder = TrayIconBuilder::new()
                 .tooltip("Multidown")
                 .menu(&menu)
-                .show_menu_on_left_click(true)
+                .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| {
                     match event.id.as_ref() {
                         "show" => {
@@ -546,8 +987,15 @@ pub fn run() {
                         }
                         _ => {}
                     }
-                })
-                .build(app)?;
+                });
+            
+            // 尝试使用应用程序图标作为托盘图标
+            if let Some(icon) = app.default_window_icon() {
+                // 直接使用默认窗口图标
+                tray_builder = tray_builder.icon(icon.to_owned());
+            }
+            
+            let _tray = tray_builder.build(app)?;
 
             // 浏览器扩展 Native Host：TCP 服务，接收扩展发来的 URL 并返回添加结果
             type UrlWithResponder = (String, oneshot::Sender<Result<(), String>>);
@@ -703,10 +1151,13 @@ pub fn run() {
             update_task_save_path,
             create_batch_download,
             exit_app,
+            hide_app,
             read_clipboard_text,
             clear_clipboard_text,
             write_clipboard_text,
             get_browser_extension_path,
+            install_browser_extension,
+            package_browser_extension,
             export_tasks,
             import_tasks,
         ])

@@ -1,11 +1,11 @@
 {
-  "productName": "multidown",
+  "productName": "MultiDown",
   "version": "0.1.0",
   "identifier": "com.multidown.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build:all",
     "frontendDist": "../dist"
   },
   "app": {
@@ -28,7 +28,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../integration/extension/": "extension/"
+      "../dist-extension/multidown-extension.crx": "extension/multidown-extension.crx"
     },
     "icon": [
       "icons/32x32.png",
