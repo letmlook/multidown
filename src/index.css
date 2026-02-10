@@ -33,6 +33,150 @@ body {
   background: #fff;
 }
 
+/* 自定义标题栏（无边框窗口，含内嵌菜单） */
+.titlebar {
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  min-height: 36px;
+  background: linear-gradient(180deg, #f8f9fa 0%, #eceef0 100%);
+  border-bottom: 1px solid #dee1e5;
+  user-select: none;
+  -webkit-app-region: drag;
+  app-region: drag;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px 0 14px;
+  min-width: 0;
+}
+
+.titlebar-icon {
+  display: flex;
+  flex-shrink: 0;
+  border-radius: 5px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.titlebar-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1a1d21;
+  letter-spacing: 0.02em;
+}
+
+/* 标题栏内的菜单区域（不可拖拽，保证菜单可点） */
+.titlebar-menu {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.titlebar-menu .menu-bar {
+  flex: 1;
+  height: 100%;
+  min-height: 36px;
+  padding: 0 6px 0 4px;
+  background: transparent;
+  border: none;
+  gap: 0;
+}
+
+.titlebar-menu .menu-bar .menu-trigger {
+  padding: 0 12px;
+  height: 36px;
+  line-height: 36px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: #374151;
+}
+
+.titlebar-menu .menu-bar .menu-trigger:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.titlebar-controls {
+  display: flex;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.titlebar-btn {
+  width: 46px;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #374151;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.titlebar-btn:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
+.titlebar-btn:active {
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.titlebar-btn-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+.titlebar-btn-close:active {
+  background: #c50f1f;
+}
+
+/* 深色模式标题栏 */
+.titlebar-dark {
+  background: linear-gradient(180deg, #2b2d30 0%, #222428 100%);
+  border-bottom-color: #3d4046;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.2);
+}
+
+.titlebar-dark .titlebar-title {
+  color: #e8eaed;
+}
+
+.titlebar-dark .titlebar-menu .menu-bar .menu-trigger {
+  color: #b8bcc4;
+}
+
+.titlebar-dark .titlebar-menu .menu-bar .menu-trigger:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #e8eaed;
+}
+
+.titlebar-dark .titlebar-btn {
+  color: #b8bcc4;
+}
+
+.titlebar-dark .titlebar-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.titlebar-dark .titlebar-btn:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.titlebar-dark .titlebar-btn-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
 /* 菜单栏 */
 .menu-bar {
   display: flex;

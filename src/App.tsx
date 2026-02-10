@@ -6,6 +6,7 @@ import { TaskList } from "./components/TaskList";
 import { AddTask } from "./components/AddTask";
 import { Toolbar } from "./components/Toolbar";
 import { MenuBar } from "./components/MenuBar";
+import { TitleBar } from "./components/TitleBar";
 import { OptionsModal } from "./components/OptionsModal";
 import { ContextMenu } from "./components/ContextMenu";
 import { BatchAdd } from "./components/BatchAdd";
@@ -290,38 +291,40 @@ function App() {
 
   return (
     <div className={`app-layout ${darkMode ? "dark" : ""}`}>
-      <MenuBar
-        tasks={tasks}
-        selectedId={selectedId}
-        darkMode={darkMode}
-        onNewTask={() => setAddTaskOpen(true)}
-        onBatchAdd={() => setBatchAddOpen(true)}
-        onOpenFromClipboard={async () => {
-          try {
-            const text = await invoke<string>("read_clipboard_text");
-            const url = text.trim();
-            if (isHttpUrl(url)) {
-              setDownloadFileInfoUrl(url);
-              setDownloadFileInfoOpen(true);
+      <TitleBar darkMode={darkMode}>
+        <MenuBar
+          tasks={tasks}
+          selectedId={selectedId}
+          darkMode={darkMode}
+          onNewTask={() => setAddTaskOpen(true)}
+          onBatchAdd={() => setBatchAddOpen(true)}
+          onOpenFromClipboard={async () => {
+            try {
+              const text = await invoke<string>("read_clipboard_text");
+              const url = text.trim();
+              if (isHttpUrl(url)) {
+                setDownloadFileInfoUrl(url);
+                setDownloadFileInfoOpen(true);
+              }
+            } catch (_) {
+              console.warn("无法读取剪贴板");
             }
-          } catch (_) {
-            console.warn("无法读取剪贴板");
-          }
-        }}
-        onRefresh={refreshTasks}
-        onOpenOptions={() => setOptionsOpen(true)}
-        onOpenSchedule={() => setScheduleOpen(true)}
-        onPauseAll={handlePauseAll}
-        onStopAll={handleStopAll}
-        onDeleteAllCompleted={handleDeleteAllCompleted}
-        onFind={() => setFindVisible(true)}
-        onToggleDarkMode={() => setDarkMode((v) => !v)}
-        onExit={handleExit}
-        onOpenFolder={handleOpenFolder}
-        onRemoveTask={handleRemoveTask}
-        onStartDownload={handleStartDownload}
-        onRedownload={handleRedownload}
-      />
+          }}
+          onRefresh={refreshTasks}
+          onOpenOptions={() => setOptionsOpen(true)}
+          onOpenSchedule={() => setScheduleOpen(true)}
+          onPauseAll={handlePauseAll}
+          onStopAll={handleStopAll}
+          onDeleteAllCompleted={handleDeleteAllCompleted}
+          onFind={() => setFindVisible(true)}
+          onToggleDarkMode={() => setDarkMode((v) => !v)}
+          onExit={handleExit}
+          onOpenFolder={handleOpenFolder}
+          onRemoveTask={handleRemoveTask}
+          onStartDownload={handleStartDownload}
+          onRedownload={handleRedownload}
+        />
+      </TitleBar>
 
       <Toolbar
         tasks={tasks}
