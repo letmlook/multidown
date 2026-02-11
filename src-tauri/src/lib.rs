@@ -20,6 +20,85 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use arboard::Clipboard;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use chrono::Local;
+
+// 全局变量，用于存储TCP服务器的停止标志
+use std::sync::AtomicBool;
+use std::sync::Mutex;
+static TCP_SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+static TCP_SHUTDOWN_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+
+// 调试日志函数
+fn debug_log(app: &tauri::AppHandle, message: &str, data: Option<&str>) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let log_message = match data {
+        Some(d) => format!("[{}] [Multidown Main] {}: {}", timestamp, message, d),
+        None => format!("[{}] [Multidown Main] {}", timestamp, message),
+    };
+    
+    // 输出到标准错误
+    eprintln!("{}", log_message);
+    
+    // 写入日志文件
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let log_path = app_data.join("multidown.log");
+        
+        // 确保日志目录存在
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let mut writer = BufWriter::new(file);
+            let _ = writeln!(writer, "{}", log_message);
+        } else {
+            // 日志文件打开失败时，输出错误信息
+            eprintln!("无法打开日志文件: {:?}", log_path);
+        }
+    } else {
+        // 无法获取应用数据目录时，输出错误信息
+        eprintln!("无法获取应用数据目录，无法写入日志文件");
+    }
+}
+
+// 详细日志函数（用于更详细的调试信息）
+fn debug_log_detailed(app: &tauri::AppHandle, message: &str, details: &str) {
+    debug_log(app, message, Some(details));
+}
+
+// 错误日志函数
+fn error_log(app: &tauri::AppHandle, message: &str, error: &str) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    let log_message = format!("[{}] [Multidown Main] [ERROR] {}: {}", timestamp, message, error);
+    
+    // 输出到标准错误
+    eprintln!("{}", log_message);
+    
+    // 写入日志文件
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let log_path = app_data.join("multidown.log");
+        
+        // 确保日志目录存在
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let mut writer = BufWriter::new(file);
+            let _ = writeln!(writer, "{}", log_message);
+        }
+    }
+}
 
 fn app_settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     app.path()
@@ -276,6 +355,15 @@ fn exit_app(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.destroy();
     }
+    
+    // 设置TCP服务器关闭标志
+    TCP_SHUTDOWN_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+    
+    // 发送停止信号给TCP服务器
+    if let Some(tx) = TCP_SHUTDOWN_TX.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+    
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(350));
@@ -384,6 +472,60 @@ fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
     
     // 检查资源目录中的扩展文件
     if let Ok(res_dir) = app.path().resource_dir() {
+        // 首先检查解压后的扩展目录
+        let unpacked_ext_dir = res_dir.join("extension").join("unpacked");
+        if unpacked_ext_dir.join("manifest.json").exists() {
+            // 复制到应用数据目录
+            std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
+            
+            // 复制所有文件
+            let files = std::fs::read_dir(&unpacked_ext_dir).map_err(|e| e.to_string())?;
+            for file in files {
+                let file = file.map_err(|e| e.to_string())?;
+                let src_path = file.path();
+                let dest_path = ext_dir.join(file.file_name());
+                if src_path.is_file() {
+                    std::fs::copy(&src_path, &dest_path).map_err(|e| e.to_string())?;
+                }
+            }
+            
+            return Ok(ext_dir.to_string_lossy().to_string());
+        }
+        
+        // 尝试使用ZIP文件
+        let zip_path = res_dir.join("extension").join("multidown-extension.zip");
+        if zip_path.exists() {
+            // 创建扩展目录
+            std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
+            
+            // 解压zip文件
+            let zip_content = std::fs::read(&zip_path).map_err(|e| e.to_string())?;
+            
+            // 使用zip库解压
+            let mut cursor = std::io::Cursor::new(zip_content);
+            let mut archive = zip::ZipArchive::new(&mut cursor).map_err(|e| e.to_string())?;
+            
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                let outpath = ext_dir.join(file.name());
+                
+                if file.name().ends_with('/') {
+                    std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        if !p.exists() {
+                            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                        }
+                    }
+                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
+                    std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+                }
+            }
+            
+            return Ok(ext_dir.to_string_lossy().to_string());
+        }
+        
+        // 最后尝试CRX文件
         let crx_path = res_dir.join("extension").join("multidown-extension.crx");
         if crx_path.exists() {
             // 创建扩展目录
@@ -472,29 +614,54 @@ async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, Stri
 /// 注册 Native Host
 fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]{
-        use std::fs::File;
-        use std::io::Write;
         use winreg::enums::*;
         use winreg::RegKey;
         
-        // 获取应用数据目录
+        // 获取资源目录
+        let res_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+        let native_host_src = res_dir.join("native-host");
+        
+        if !native_host_src.exists() {
+            return Err("Native host directory not found in resources".to_string());
+        }
+        
+        // 复制到应用数据目录以确保权限
         let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let native_host_dir = app_data.join("native-host");
         std::fs::create_dir_all(&native_host_dir).map_err(|e| e.to_string())?;
         
-        // 复制 native host 可执行文件（如果存在）
-        if let Ok(res_dir) = app.path().resource_dir() {
-            let native_host_src = res_dir.join("native-host");
-            if native_host_src.exists() {
-                copy_dir_all(&native_host_src, &native_host_dir).map_err(|e| e.to_string())?;
+        // 复制 native host 文件
+        let files = std::fs::read_dir(&native_host_src).map_err(|e| e.to_string())?;
+        for file in files {
+            let file = file.map_err(|e| e.to_string())?;
+            let src_path = file.path();
+            let dest_path = native_host_dir.join(file.file_name());
+            if src_path.is_file() {
+                std::fs::copy(&src_path, &dest_path).map_err(|e| e.to_string())?;
             }
         }
         
-        // 注册 Chrome/Edge Native Host
+        // 更新配置文件中的路径和扩展ID
+        let manifest_path = native_host_dir.join("com.multidown.app.json");
+        if manifest_path.exists() {
+            let mut manifest_content = std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+            let native_host_exe_path = native_host_dir.join("multidown-native-host.exe");
+            manifest_content = manifest_content.replace(
+                "MULTIDOWN_NATIVE_HOST_PATH",
+                &native_host_exe_path.to_string_lossy().to_string()
+            );
+            // 使用通配符支持所有扩展ID，更加灵活
+            manifest_content = manifest_content.replace(
+                "EXTENSION_ID_PLACEHOLDER",
+                "*"
+            );
+            std::fs::write(&manifest_path, manifest_content).map_err(|e| e.to_string())?;
+        }
+        
+        // 注册 Chrome Native Host
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let path = r"Software\Google\Chrome\NativeMessagingHosts\com.multidown.app";
         let (key, _) = hkcu.create_subkey(path).map_err(|e| e.to_string())?;
-        let manifest_path = app_data.join(r"native-host\com.multidown.app.json");
         key.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
         
         // 注册 Edge Native Host
@@ -513,11 +680,15 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
         
+        // 获取资源目录
+        let res_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+        let native_host_path = res_dir.join("native-host").join("multidown-native-host");
+        
         // 创建 manifest 文件
         let manifest = serde_json::json!({
             "name": "com.multidown.app",
-            "description": "Multidown Native Host",
-            "path": app.path().current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string(),
+            "description": "Multidown Native Messaging Host",
+            "path": native_host_path.to_string_lossy().to_string(),
             "type": "stdio",
             "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
         });
@@ -538,11 +709,15 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
         
+        // 获取资源目录
+        let res_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+        let native_host_path = res_dir.join("native-host").join("multidown-native-host");
+        
         // 创建 manifest 文件
         let manifest = serde_json::json!({
             "name": "com.multidown.app",
-            "description": "Multidown Native Host",
-            "path": app.path().current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string(),
+            "description": "Multidown Native Messaging Host",
+            "path": native_host_path.to_string_lossy().to_string(),
             "type": "stdio",
             "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
         });
@@ -979,6 +1154,15 @@ pub fn run() {
                             if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.destroy();
                             }
+                            
+                            // 设置TCP服务器关闭标志
+                            TCP_SHUTDOWN_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+                            
+                            // 发送停止信号给TCP服务器
+                            if let Some(tx) = TCP_SHUTDOWN_TX.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            
                             let app = app.clone();
                             std::thread::spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -997,104 +1181,374 @@ pub fn run() {
             
             let _tray = tray_builder.build(app)?;
 
-            // 浏览器扩展 Native Host：TCP 服务，接收扩展发来的 URL 并返回添加结果
-            type UrlWithResponder = (String, oneshot::Sender<Result<(), String>>);
-            let (url_tx, mut url_rx) = tokio::sync::mpsc::unbounded_channel::<UrlWithResponder>();
+            // 浏览器扩展 Native Host：TCP 服务，接收扩展发来的消息并返回结果
+            #[derive(Debug)]
+            struct DownloadTask {
+                url: String,
+                filename: Option<String>,
+                referer: Option<String>,
+                user_agent: Option<String>,
+                cookie: Option<String>,
+                post_data: Option<String>,
+                save_path: Option<String>,
+                open_window: bool,
+                responder: oneshot::Sender<Result<(), String>>,
+            }
+            
+            #[derive(Debug)]
+            struct OpenWindowTask {
+                url: String,
+                responder: oneshot::Sender<Result<(), String>>,
+            }
+            
+            enum TaskMessage {
+                Download(DownloadTask),
+                OpenWindow(OpenWindowTask),
+            }
+            
+            let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel::<TaskMessage>();
             let app_data = match app.path().app_data_dir() {
                 Ok(d) => d,
                 Err(_) => std::path::PathBuf::new(),
             };
             let port_file = app_data.join("native_host_port.txt");
+            let app_handle_clone = app_handle.clone();
+            
+            debug_log(&app_handle, "启动TCP服务器", None);
+            
+            // 创建关闭信号通道
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            *TCP_SHUTDOWN_TX.lock().unwrap() = Some(shutdown_tx);
+            
             tauri::async_runtime::spawn(async move {
                 let listener = match TcpListener::bind("127.0.0.1:0").await {
                     Ok(l) => l,
-                    Err(_) => return,
+                    Err(e) => {
+                        debug_log(&app_handle_clone, "绑定TCP端口失败", Some(&e.to_string()));
+                        return;
+                    }
                 };
+                // 设置accept超时，以便定期检查关闭标志
+                let listener = listener.set_accept_timeout(Some(std::time::Duration::from_millis(100)));
                 let port = match listener.local_addr() {
-                    Ok(addr) => addr.port(),
-                    Err(_) => return,
+                    Ok(addr) => {
+                        let port = addr.port();
+                        debug_log(&app_handle_clone, "TCP服务器启动成功", Some(&format!("端口: {}", port)));
+                        port
+                    }
+                    Err(e) => {
+                        debug_log(&app_handle_clone, "获取本地地址失败", Some(&e.to_string()));
+                        return;
+                    }
                 };
                 if !app_data.as_os_str().is_empty() {
                     let _ = std::fs::create_dir_all(&app_data);
-                    let _ = std::fs::write(&port_file, port.to_string());
+                    if let Err(e) = std::fs::write(&port_file, port.to_string()) {
+                        debug_log(&app_handle_clone, "写入端口文件失败", Some(&e.to_string()));
+                    } else {
+                        debug_log(&app_handle_clone, "写入端口文件成功", Some(&port_file.to_string_lossy()));
+                    }
                 }
                 loop {
-                    let (stream, _) = match listener.accept().await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
+                    tokio::select! {
+                        accept_result = listener.accept() => {
+                            let (stream, addr) = match accept_result {
+                                Ok((s, a)) => (s, a),
+                                Err(e) => {
+                                    debug_log(&app_handle_clone, "接受连接失败", Some(&e.to_string()));
+                                    continue;
+                                }
+                            };
+                    
+                    debug_log(&app_handle_clone, "接受到新连接", Some(&addr.to_string()));
+                    
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
                     let mut line = String::new();
                     if reader.read_line(&mut line).await.is_err() {
+                        debug_log(&app_handle_clone, "读取消息失败", None);
                         continue;
                     }
                     let line = line.trim().to_string();
                     if line.is_empty() {
+                        debug_log(&app_handle_clone, "接收到空消息", None);
                         continue;
                     }
-                    let url: Option<String> = serde_json::from_str(&line)
-                        .ok()
-                        .and_then(|v: serde_json::Value| v.get("url").and_then(|u| u.as_str()).map(String::from));
-                    let url = url.or_else(|| Some(line).filter(|s| s.starts_with("http")));
-                    let Some(u) = url else {
-                        let _ = writer
-                            .write_all(b"{\"ok\":false,\"error\":\"missing or invalid url\"}\n")
-                            .await;
-                        let _ = writer.shutdown().await;
-                        continue;
+                    
+                    debug_log(&app_handle_clone, "接收到消息", Some(&line));
+                    
+                    // 解析消息
+                    let msg: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&line) {
+                        Ok(m) => {
+                            debug_log(&app_handle_clone, "消息解析成功", Some(&m.to_string()));
+                            m
+                        }
+                        Err(e) => {
+                            // 尝试作为简单URL处理
+                            if line.starts_with("http://") || line.starts_with("https://") {
+                                debug_log(&app_handle_clone, "消息解析失败，作为简单URL处理", Some(&e.to_string()));
+                                serde_json::json!({
+                                    "action": "download",
+                                    "url": line
+                                })
+                            } else {
+                                debug_log(&app_handle_clone, "消息格式无效", Some(&e.to_string()));
+                                let _ = writer
+                                    .write_all(b"{\"ok\":false,\"error\":\"invalid message format\"}\n")
+                                    .await;
+                                let _ = writer.shutdown().await;
+                                continue;
+                            }
+                        }
                     };
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    if url_tx.send((u, resp_tx)).is_err() {
-                        let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
-                        let _ = writer.shutdown().await;
-                        continue;
-                    }
-                    let response = match resp_rx.await {
-                        Ok(Ok(())) => b"{\"ok\":true}\n".to_vec(),
-                        Ok(Err(e)) => format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::to_string(&e).unwrap_or_else(|_| "\"unknown\"".to_string())).into_bytes(),
-                        Err(_) => b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec(),
-                    };
-                    let _ = writer.write_all(&response).await;
-                    let _ = writer.shutdown().await;
-                }
-            });
-            let app_worker = app_handle.clone();
-            let sched_worker = sched_clone.clone();
-            tauri::async_runtime::spawn(async move {
-                while let Some((url, resp_tx)) = url_rx.recv().await {
-                    let save_dir = default_save_dir_for_browser(&app_worker);
-                    let result = match sched_worker.create_task(url.clone(), save_dir, None, None).await {
-                        Ok(id) => {
-                            let path = match app_settings_path(&app_worker) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    let _ = resp_tx.send(Err(e));
+                    
+                    let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("download");
+                    debug_log(&app_handle_clone, "处理动作", Some(action));
+                    
+                    match action {
+                        "download" => {
+                            let url = msg
+                                .get("url")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
+                            
+                            let url = match url {
+                                Some(u) => {
+                                    debug_log(&app_handle_clone, "获取到下载URL", Some(u));
+                                    u.to_string()
+                                }
+                                None => {
+                                    debug_log(&app_handle_clone, "缺少或无效的URL", None);
+                                    let _ = writer
+                                        .write_all(b"{\"ok\":false,\"error\":\"missing or invalid url\"}\n")
+                                        .await;
+                                    let _ = writer.shutdown().await;
                                     continue;
                                 }
                             };
-                            let settings = load_settings(&path).unwrap_or_default();
-                            let net_opts = NetworkOptions {
-                                proxy_url: settings.proxy_url(),
-                                timeout_secs: settings.timeout_secs,
+                            
+                            let filename = msg.get("filename").and_then(|v| v.as_str()).map(String::from);
+                            let referer = msg.get("referer").and_then(|v| v.as_str()).map(String::from);
+                            let user_agent = msg.get("user_agent").and_then(|v| v.as_str()).map(String::from);
+                            let cookie = msg.get("cookie").and_then(|v| v.as_str()).map(String::from);
+                            let post_data = msg.get("post_data").and_then(|v| v.as_str()).map(String::from);
+                            let save_path = msg.get("save_path").and_then(|v| v.as_str()).map(String::from);
+                            let open_window = msg.get("open_window").and_then(|v| v.as_bool()).unwrap_or(true);
+                            
+                            debug_log(&app_handle_clone, "下载参数", Some(&format!("filename: {:?}, referer: {:?}, open_window: {:?}", filename, referer, open_window)));
+                            
+                            let (resp_tx, resp_rx) = oneshot::channel();
+                            let download_task = DownloadTask {
+                                url,
+                                filename,
+                                referer,
+                                user_agent,
+                                cookie,
+                                post_data,
+                                save_path,
+                                open_window,
+                                responder: resp_tx,
                             };
-                            match sched_worker
-                                .start_download(
-                                    &id,
-                                    Some(app_worker.clone()),
-                                    Some(sched_worker.clone()),
-                                    Some(settings.max_connections_per_task as usize),
-                                    Some(net_opts),
-                                )
-                                .await
-                            {
-                                Ok(()) => Ok(()),
+                            
+                            if task_tx.send(TaskMessage::Download(download_task)).is_err() {
+                                debug_log(&app_handle_clone, "发送任务失败", None);
+                                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
+                                let _ = writer.shutdown().await;
+                                continue;
+                            }
+                            
+                            debug_log(&app_handle_clone, "任务发送成功，等待响应", None);
+                            
+                            let response = match resp_rx.await {
+                                Ok(Ok(())) => {
+                                    debug_log(&app_handle_clone, "任务处理成功", None);
+                                    b"{\"ok\":true}\n".to_vec()
+                                }
+                                Ok(Err(e)) => {
+                                    debug_log(&app_handle_clone, "任务处理失败", Some(&e));
+                                    format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::to_string(&e).unwrap_or_else(|_| "\"unknown\"".to_string())).into_bytes()
+                                }
+                                Err(e) => {
+                                    debug_log(&app_handle_clone, "任务处理超时", Some(&e.to_string()));
+                                    b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec()
+                                }
+                            };
+                            
+                            debug_log(&app_handle_clone, "发送响应", Some(&String::from_utf8_lossy(&response)));
+                            let _ = writer.write_all(&response).await;
+                            let _ = writer.shutdown().await;
+                        }
+                        
+                        "open_window" => {
+                            let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            debug_log(&app_handle_clone, "处理打开窗口请求", Some(url));
+                            
+                            let (resp_tx, resp_rx) = oneshot::channel();
+                            let open_window_task = OpenWindowTask {
+                                url: url.to_string(),
+                                responder: resp_tx,
+                            };
+                            
+                            if task_tx.send(TaskMessage::OpenWindow(open_window_task)).is_err() {
+                                debug_log(&app_handle_clone, "发送打开窗口任务失败", None);
+                                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
+                                let _ = writer.shutdown().await;
+                                continue;
+                            }
+                            
+                            let response = match resp_rx.await {
+                                Ok(Ok(())) => {
+                                    debug_log(&app_handle_clone, "打开窗口成功", None);
+                                    b"{\"ok\":true}\n".to_vec()
+                                }
+                                Ok(Err(e)) => {
+                                    debug_log(&app_handle_clone, "打开窗口失败", Some(&e));
+                                    format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::to_string(&e).unwrap_or_else(|_| "\"unknown\"".to_string())).into_bytes()
+                                }
+                                Err(e) => {
+                                    debug_log(&app_handle_clone, "打开窗口超时", Some(&e.to_string()));
+                                    b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec()
+                                }
+                            };
+                            
+                            let _ = writer.write_all(&response).await;
+                            let _ = writer.shutdown().await;
+                        }
+                        
+                        _ => {
+                            debug_log(&app_handle_clone, "未知动作", Some(action));
+                            let _ = writer
+                                .write_all(b"{\"ok\":false,\"error\":\"unknown action\"}\n")
+                                .await;
+                            let _ = writer.shutdown().await;
+                        }
+                    }
+                        },
+                        
+                        _ = shutdown_rx => {
+                            debug_log(&app_handle_clone, "接收到停止信号，关闭TCP服务器", None);
+                            // 尝试删除端口文件
+                            if !app_data.as_os_str().is_empty() {
+                                let _ = std::fs::remove_file(&port_file);
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+            
+            let app_worker = app_handle.clone();
+            let sched_worker = sched_clone.clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(task_msg) = task_rx.recv().await {
+                    match task_msg {
+                        TaskMessage::Download(task) => {
+                            let DownloadTask {
+                                url,
+                                filename,
+                                referer,
+                                user_agent,
+                                cookie,
+                                post_data,
+                                save_path,
+                                open_window,
+                                responder,
+                            } = task;
+                            
+                            let save_dir = save_path.unwrap_or_else(|| default_save_dir_for_browser(&app_worker));
+                            let result = match sched_worker.create_task(url.clone(), save_dir, filename, None).await {
+                                Ok(id) => {
+                                    let path = match app_settings_path(&app_worker) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            let _ = responder.send(Err(e));
+                                            continue;
+                                        }
+                                    };
+                                    let settings = load_settings(&path).unwrap_or_default();
+                                    let net_opts = NetworkOptions {
+                                        proxy_url: settings.proxy_url(),
+                                        timeout_secs: settings.timeout_secs,
+                                    };
+                                    match sched_worker
+                                        .start_download(
+                                            &id,
+                                            Some(app_worker.clone()),
+                                            Some(sched_worker.clone()),
+                                            Some(settings.max_connections_per_task as usize),
+                                            Some(net_opts),
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            // 如果需要打开窗口，显示主窗口
+                                            if open_window {
+                                                if let Some(window) = app_worker.get_webview_window("main") {
+                                                    let _ = window.show();
+                                                    let _ = window.unminimize();
+                                                    let _ = window.set_focus();
+                                                }
+                                            }
+                                            Ok(())
+                                        },
+                                        Err(e) => Err(e),
+                                    }
+                                }
                                 Err(e) => Err(e),
+                            };
+                            let _ = responder.send(result);
+                        }
+                        
+                        TaskMessage::OpenWindow(task) => {
+                            let OpenWindowTask { url, responder } = task;
+                            
+                            // 显示主窗口
+                            if let Some(window) = app_worker.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                            
+                            // 如果提供了URL，自动添加到下载
+                            if !url.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) {
+                                let save_dir = default_save_dir_for_browser(&app_worker);
+                                let result = match sched_worker.create_task(url, save_dir, None, None).await {
+                                    Ok(id) => {
+                                        let path = match app_settings_path(&app_worker) {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                let _ = responder.send(Err(e));
+                                                continue;
+                                            }
+                                        };
+                                        let settings = load_settings(&path).unwrap_or_default();
+                                        let net_opts = NetworkOptions {
+                                            proxy_url: settings.proxy_url(),
+                                            timeout_secs: settings.timeout_secs,
+                                        };
+                                        match sched_worker
+                                            .start_download(
+                                                &id,
+                                                Some(app_worker.clone()),
+                                                Some(sched_worker.clone()),
+                                                Some(settings.max_connections_per_task as usize),
+                                                Some(net_opts),
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => Ok(()),
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                    Err(e) => Err(e),
+                                };
+                                let _ = responder.send(result);
+                            } else {
+                                // 只是打开窗口，不添加下载
+                                let _ = responder.send(Ok(()));
                             }
                         }
-                        Err(e) => Err(e),
-                    };
-                    let _ = resp_tx.send(result);
+                    }
                 }
             });
 

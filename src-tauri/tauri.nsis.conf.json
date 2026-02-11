@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "nsis": {
+      "script": "scripts/nsis/installer.nsi"
+    }
+  }
+}

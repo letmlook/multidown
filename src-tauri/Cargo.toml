@@ -33,6 +33,7 @@ winreg = "0.52"  # 用于Windows注册表操作
 dirs = "5"       # 用于获取用户主目录
 zip = "0.6"      # 用于打包扩展为zip文件
 walkdir = "2"    # 用于遍历目录
+chrono = "0.4"   # 用于日志时间戳
 
 [features]
 default = ["custom-protocol"]

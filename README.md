@@ -77,6 +77,42 @@ npm run tauri icon path/to/your/icon.png
 - **持久化**：任务列表保存到应用数据目录，重启后恢复，暂停/完成后自动保存
 - **UI**：任务列表、新建任务（URL + 探测 + 默认下载目录）、暂停/继续/取消、进度与速度、打开所在目录
 - **命令**：`probe_download`、`create_download`、`start_download`、`pause_download`、`resume_download`、`cancel_download`、`list_downloads`、`get_download_progress`、`get_default_download_dir`、`open_folder`
+- **浏览器扩展**：支持 Chrome/Edge 浏览器集成，与 IDM 对齐的通信机制
+
+## 浏览器扩展安装
+
+### 方法一：开发者模式安装（推荐）
+
+1. **构建扩展**：
+   ```bash
+   npm run build:extension
+   ```
+
+2. **打开浏览器扩展管理页面**：
+   - Chrome: `chrome://extensions/`
+   - Edge: `edge://extensions/`
+
+3. **启用开发者模式**：
+   - 点击页面右上角的"开发者模式"开关
+
+4. **加载已解压的扩展**：
+   - 点击"加载已解压的扩展程序"
+   - 选择目录：`dist-extension/unpacked`
+
+### 方法二：CRX 文件安装（需要签名）
+
+> ⚠️ **注意**：未签名的 CRX 文件会显示 "CRX_HEADER_INVALID" 错误
+
+- 构建过程会生成 `dist-extension/multidown-extension.zip`
+- 如需使用 CRX 文件，请使用 Chrome 开发者工具进行签名
+- 或使用方法一的开发者模式安装
+
+### 功能说明
+
+- **右键菜单**：支持链接、页面、视频、音频的右键下载
+- **通信机制**：与 IDM 对齐的消息格式和参数结构
+- **下载信息窗口**：点击下载后自动显示主窗口的下载信息
+- **跨浏览器支持**：兼容 Chrome、Edge 等基于 Chromium 的浏览器
 
 ## 开发路线（规划）
 

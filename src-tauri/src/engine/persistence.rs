@@ -67,14 +67,16 @@ impl Task {
 }
 
 impl PersistedTask {
-    pub fn from_task(task: &Task) -> PersistedTask {
+    pub async fn from_task(task: &Task) -> PersistedTask {
         use std::sync::atomic::Ordering;
-        let status = task.status.try_lock().map(|g| *g).unwrap_or(TaskStatus::Pending);
+        let status = *task.status.lock().await;
         let pending: Vec<(u64, u64)> = task
             .pending_segments
-            .try_lock()
-            .map(|g| g.iter().copied().collect())
-            .unwrap_or_default();
+            .lock()
+            .await
+            .iter()
+            .copied()
+            .collect();
         PersistedTask {
             id: task.id.clone(),
             url: task.url.clone(),

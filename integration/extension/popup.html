@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multidown 下载助手</title>
+  <style>
+    body {
+      width: 300px;
+      padding: 20px;
+      font-family: Arial, sans-serif;
+      background-color: #f5f5f5;
+    }
+    h1 {
+      font-size: 18px;
+      margin-bottom: 20px;
+      color: #333;
+      text-align: center;
+    }
+    .status {
+      margin-bottom: 20px;
+      padding: 10px;
+      border-radius: 4px;
+      background-color: #e8f5e8;
+      color: #2e7d32;
+      text-align: center;
+    }
+    .button {
+      display: block;
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 10px;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    .button-primary {
+      background-color: #2196f3;
+      color: white;
+    }
+    .button-primary:hover {
+      background-color: #1976d2;
+    }
+    .button-secondary {
+      background-color: #9e9e9e;
+      color: white;
+    }
+    .button-secondary:hover {
+      background-color: #757575;
+    }
+    .info {
+      margin-top: 20px;
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>Multidown 下载助手</h1>
+  <div class="status" id="status">
+    就绪状态: <span id="readyStatus">检查中...</span>
+  </div>
+  <button class="button button-primary" id="testConnection">测试连接</button>
+  <button class="button button-secondary" id="exportLogs">导出日志</button>
+  <div class="info">
+    版本: 0.1.0
+    <br>
+    用于与 Multidown 主程序通信
+  </div>
+  <script>
+    // 检查扩展状态
+    function checkStatus() {
+      chrome.storage.local.get('extension_status', function(result) {
+        const status = result.extension_status || 'ready';
+        document.getElementById('readyStatus').textContent = status === 'ready' ? '就绪' : '未就绪';
+      });
+    }
+
+    // 测试与本地主机的连接
+    document.getElementById('testConnection').addEventListener('click', function() {
+      chrome.runtime.sendMessage({ action: 'test_connection' }, function(response) {
+        if (response && response.success) {
+          document.getElementById('status').textContent = '连接成功: ' + response.message;
+        } else {
+          document.getElementById('status').textContent = '连接失败: ' + (response?.message || '未知错误');
+        }
+      });
+    });
+
+    // 导出日志
+    document.getElementById('exportLogs').addEventListener('click', function() {
+      chrome.runtime.sendMessage({ action: 'export_logs' }, function(response) {
+        if (response && response.success) {
+          document.getElementById('status').textContent = '日志已导出';
+        } else {
+          document.getElementById('status').textContent = '导出失败';
+        }
+      });
+    });
+
+    // 初始化
+    checkStatus();
+  </script>
+</body>
+</html>

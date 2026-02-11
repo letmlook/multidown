@@ -44,10 +44,11 @@ impl Scheduler {
             Some(p) => p.clone(),
             None => return,
         };
-        let snapshots: Vec<PersistedTask> = {
-            let tasks = self.tasks.lock().await;
-            tasks.values().map(|t| PersistedTask::from_task(t)).collect()
-        };
+        let tasks = self.tasks.lock().await;
+        let mut snapshots: Vec<PersistedTask> = Vec::new();
+        for t in tasks.values() {
+            snapshots.push(PersistedTask::from_task(t).await);
+        }
         let _ = save_tasks_to_file(&path, &snapshots).await;
     }
 
@@ -256,25 +257,24 @@ impl Scheduler {
 
     pub async fn list_downloads(&self) -> Vec<TaskInfo> {
         let tasks = self.tasks.lock().await;
-        tasks
-            .values()
-            .map(|t| task_to_info(t))
-            .collect::<Vec<_>>()
+        let mut infos = Vec::new();
+        for t in tasks.values() {
+            infos.push(task_to_info(t).await);
+        }
+        infos
     }
 
     /// 从列表中移除所有已完成的任务，并持久化
     pub async fn clear_completed_tasks(&self) -> Result<usize, String> {
-        let to_remove: Vec<TaskId> = {
-            let tasks = self.tasks.lock().await;
-            tasks
-                .iter()
-                .filter(|(_, t)| {
-                    let st = t.status.try_lock().ok().map(|g| *g).unwrap_or(TaskStatus::Pending);
-                    st == TaskStatus::Completed
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
+        let tasks = self.tasks.lock().await;
+        let mut to_remove: Vec<TaskId> = Vec::new();
+        for (id, t) in tasks.iter() {
+            let st = *t.status.lock().await;
+            if st == TaskStatus::Completed {
+                to_remove.push(id.clone());
+            }
+        }
+        drop(tasks);
         if to_remove.is_empty() {
             return Ok(0);
         }
@@ -290,7 +290,11 @@ impl Scheduler {
 
     pub async fn get_task(&self, task_id: &str) -> Option<TaskInfo> {
         let tasks = self.tasks.lock().await;
-        tasks.get(task_id).map(task_to_info)
+        if let Some(t) = tasks.get(task_id) {
+            Some(task_to_info(t).await)
+        } else {
+            None
+        }
     }
 
     /// 刷新下载地址：重新探测 URL，更新为最终重定向地址
@@ -299,12 +303,11 @@ impl Scheduler {
         task_id: &str,
         options: &NetworkOptions,
     ) -> Result<(), String> {
-        let (mut pt, id) = {
-            let tasks = self.tasks.lock().await;
-            let task = tasks.get(task_id).ok_or("任务不存在")?;
-            let pt = PersistedTask::from_task(task);
-            (pt, task_id.to_string())
-        };
+        let tasks = self.tasks.lock().await;
+        let task = tasks.get(task_id).ok_or("任务不存在")?;
+        let mut pt = PersistedTask::from_task(task).await;
+        let id = task_id.to_string();
+        drop(tasks);
         let probe_result = probe_with_options(&pt.url, options).await.map_err(|e| e.to_string())?;
         pt.url = probe_result.final_url;
         let mut tasks = self.tasks.lock().await;
@@ -315,13 +318,12 @@ impl Scheduler {
 
     /// 移动/重命名：更新任务保存路径，若文件已存在则移动
     pub async fn update_task_save_path(&self, task_id: &str, new_save_path: String) -> Result<(), String> {
-        let (old_path, mut pt, id) = {
-            let tasks = self.tasks.lock().await;
-            let task = tasks.get(task_id).ok_or("任务不存在")?;
-            let old_path = task.save_path.clone();
-            let pt = PersistedTask::from_task(task);
-            (old_path, pt, task_id.to_string())
-        };
+        let tasks = self.tasks.lock().await;
+        let task = tasks.get(task_id).ok_or("任务不存在")?;
+        let old_path = task.save_path.clone();
+        let mut pt = PersistedTask::from_task(task).await;
+        let id = task_id.to_string();
+        drop(tasks);
         let new_path = std::path::Path::new(&new_save_path);
         if std::path::Path::new(&old_path).exists() {
             if let Some(parent) = new_path.parent() {
@@ -344,9 +346,9 @@ impl Scheduler {
     }
 }
 
-fn task_to_info(t: &Arc<Task>) -> TaskInfo {
-    let status = t.status.try_lock().map(|g| *g).unwrap_or(TaskStatus::Pending);
-    let err = t.error_message.try_lock().ok().and_then(|g| g.clone());
+async fn task_to_info(t: &Arc<Task>) -> TaskInfo {
+    let status = *t.status.lock().await;
+    let err = t.error_message.lock().await.clone();
     TaskInfo {
         id: t.id.clone(),
         url: t.url.clone(),

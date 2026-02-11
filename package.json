@@ -7,11 +7,13 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "build:extension": "node scripts/build-extension.mjs",
-    "build:all": "npm run build && npm run build:extension",
+    "sign:crx": "node scripts/sign-crx.mjs",
+    "build:all": "npm run build && npm run build:extension && npm run sign:crx",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run build:all && tauri build",
+    "tauri:build": "npm run build:all && tauri build:nsis",
+    "build:nsis": "node scripts/build-nsis.mjs",
     "icons": "node scripts/icons-from-svg.mjs && tauri icon src-tauri/icons/icon-1024.png"
   },
   "dependencies": {
