@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../integration/native-host/target/release/multidown-native-host": "native-host/multidown-native-host"
+    }
+  }
+}

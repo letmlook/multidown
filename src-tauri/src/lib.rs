@@ -25,7 +25,7 @@ use std::io::{BufWriter, Write};
 use chrono::Local;
 
 // 全局变量，用于存储TCP服务器的停止标志
-use std::sync::AtomicBool;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 static TCP_SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 static TCP_SHUTDOWN_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
@@ -1228,8 +1228,6 @@ pub fn run() {
                         return;
                     }
                 };
-                // 设置accept超时，以便定期检查关闭标志
-                let listener = listener.set_accept_timeout(Some(std::time::Duration::from_millis(100)));
                 let port = match listener.local_addr() {
                     Ok(addr) => {
                         let port = addr.port();
@@ -1249,6 +1247,7 @@ pub fn run() {
                         debug_log(&app_handle_clone, "写入端口文件成功", Some(&port_file.to_string_lossy()));
                     }
                 }
+                let mut shutdown_rx = std::pin::pin!(shutdown_rx);
                 loop {
                     tokio::select! {
                         accept_result = listener.accept() => {
@@ -1425,7 +1424,7 @@ pub fn run() {
                     }
                         },
                         
-                        _ = shutdown_rx => {
+                        _ = &mut *shutdown_rx => {
                             debug_log(&app_handle_clone, "接收到停止信号，关闭TCP服务器", None);
                             // 尝试删除端口文件
                             if !app_data.as_os_str().is_empty() {
