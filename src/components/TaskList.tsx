@@ -41,7 +41,6 @@ function formatRemaining(total: number, downloaded: number, speedBps: number | n
 }
 
 function formatDate(ts: number): string {
-  // 后端 created_at 为 Unix 秒，Date 需要毫秒
   const d = new Date(ts * 1000);
   const now = new Date();
   const sameYear = d.getFullYear() === now.getFullYear();
@@ -58,7 +57,7 @@ interface TaskListProps {
 }
 
 export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, onContextMenu }: TaskListProps) {
-  const handleRowDblClick = useCallback(
+  const handleCardDblClick = useCallback(
     (t: TaskInfo) => {
       if (t.status === "completed" && t.save_path) openFolder(t.save_path);
     },
@@ -67,72 +66,113 @@ export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, o
 
   if (tasks.length === 0) {
     return (
-      <div className="empty-table-hint">
-        暂无任务，点击工具栏「新建任务」添加下载。
+      <div className="empty-state">
+        <svg className="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+        <div className="empty-state-text">暂无下载任务</div>
+        <div className="empty-state-hint">点击「新建任务」开始下载</div>
       </div>
     );
   }
 
   return (
-    <div className="task-table-wrap">
-      <table className="task-table">
-        <thead>
-          <tr>
-            <th className="col-filename">文件名</th>
-            <th className="col-size">大小</th>
-            <th className="col-status">状态</th>
-            <th className="col-remaining">剩余时间</th>
-            <th className="col-speed">传输速度</th>
-            <th className="col-date">最后连...</th>
-            <th className="col-desc">描述</th>
-          </tr>
-        </thead>
-        <tbody>
-          {tasks.map((t) => {
-            const total = t.total_bytes ?? 0;
-            const pct = total > 0 ? Math.min(100, (t.downloaded_bytes / total) * 100) : 0;
-            const statusDisplay =
-              t.status === "downloading" && total > 0
-                ? `${pct.toFixed(2)}%`
-                : statusText[t.status] ?? t.status;
-            const remaining =
-              t.status === "downloading" && total > 0 && t.speed_bps != null
-                ? formatRemaining(total, t.downloaded_bytes, t.speed_bps)
-                : "—";
-            const speedDisplay =
-              t.status === "downloading" && t.speed_bps != null
-                ? formatSpeed(t.speed_bps)
-                : "—";
+    <div className="task-list-container">
+      {tasks.map((t, index) => {
+        const total = t.total_bytes ?? 0;
+        const pct = total > 0 ? Math.min(100, (t.downloaded_bytes / total) * 100) : 0;
+        const statusDisplay =
+          t.status === "downloading" && total > 0
+            ? `${pct.toFixed(1)}%`
+            : statusText[t.status] ?? t.status;
+        const remaining =
+          t.status === "downloading" && total > 0 && t.speed_bps != null
+            ? formatRemaining(total, t.downloaded_bytes, t.speed_bps)
+            : "—";
+        const speedDisplay =
+          t.status === "downloading" && t.speed_bps != null
+            ? formatSpeed(t.speed_bps)
+            : "—";
 
-            return (
-              <tr
-                key={t.id}
-                className={selectedId === t.id ? "selected" : ""}
-                onClick={() => onSelect(t.id)}
-                onDoubleClick={() => handleRowDblClick(t)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  onContextMenu?.(e, t);
-                }}
-              >
-                <td className="col-filename" title={t.filename || t.url}>
+        const isSelected = selectedId === t.id;
+        const progressClass = t.status;
+
+        return (
+          <div
+            key={t.id}
+            className={`task-card ${isSelected ? "selected" : ""}`}
+            data-status={t.status}
+            onClick={() => onSelect(t.id)}
+            onDoubleClick={() => handleCardDblClick(t)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              onContextMenu?.(e, t);
+            }}
+            style={{ animationDelay: `${index * 0.05}s` }}
+          >
+            <div className="task-card-header">
+              <div className="task-file-icon">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                </svg>
+              </div>
+              <div className="task-info">
+                <div className="task-filename" title={t.filename || t.url}>
                   {t.filename || "未命名"}
-                </td>
-                <td className="col-size">
+                </div>
+                <div className="task-url" title={t.url}>
+                  {t.url}
+                </div>
+              </div>
+              <div className={`task-status-badge ${t.status}`}>
+                {statusDisplay}
+              </div>
+            </div>
+
+            {t.status === "downloading" && total > 0 && (
+              <div className="task-progress-section">
+                <div className="task-progress-bar-bg">
+                  <div
+                    className={`task-progress-bar-fill ${progressClass}`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="task-stats">
+              <div className="task-stat">
+                <span className="task-stat-label">大小:</span>
+                <span className="task-stat-value">
                   {total > 0 ? formatBytes(total) : "—"}
-                </td>
-                <td className="col-status">{statusDisplay}</td>
-                <td className="col-remaining">{remaining}</td>
-                <td className="col-speed">{speedDisplay}</td>
-                <td className="col-date">{formatDate(t.created_at)}</td>
-                <td className="col-desc" title={t.error_message ?? ""}>
-                  {t.error_message ? t.error_message : "—"}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+                </span>
+              </div>
+              <div className="task-stat">
+                <span className="task-stat-label">速度:</span>
+                <span className={`task-stat-value ${t.status === "downloading" ? "speed" : ""}`}>
+                  {speedDisplay}
+                </span>
+              </div>
+              <div className="task-stat">
+                <span className="task-stat-label">剩余:</span>
+                <span className="task-stat-value">{remaining}</span>
+              </div>
+              <div className="task-stat">
+                <span className="task-stat-label">日期:</span>
+                <span className="task-stat-value">{formatDate(t.created_at)}</span>
+              </div>
+            </div>
+
+            {t.error_message && (
+              <div className="task-actions">
+                <span style={{ color: '#ff3366', fontSize: '12px' }}>
+                  错误: {t.error_message}
+                </span>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
