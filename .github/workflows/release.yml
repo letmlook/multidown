@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ''
+            target: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            args: ''
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}-${{ matrix.target }}
+
+      - name: Install dependencies (Ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build browser extension
+        run: npm run build:extension
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'MultiDown v__VERSION__'
+          releaseBody: |
+            ## 下载安装包
+
+            ### Windows
+            - `MultiDown___VERSION___x64-setup.exe` - Windows 安装程序
+            - `MultiDown___VERSION___x64.msi` - Windows MSI 安装包
+            - `MultiDown___VERSION___x64_en-US.msi.zip` - 便携版
+
+            ### macOS
+            - `MultiDown___VERSION___aarch64.dmg` - Apple Silicon (M1/M2/M3)
+            - `MultiDown___VERSION___x64.dmg` - Intel Mac
+            - `MultiDown___VERSION___universal.dmg` - 通用版 (推荐)
+
+            ### Linux
+            - `MultiDown___VERSION___amd64.deb` - Debian/Ubuntu
+            - `MultiDown___VERSION___x86_64.rpm` - Fedora/RHEL
+            - `multi-down___VERSION___amd64.AppImage` - AppImage 通用版
+
+            ## 更新内容
+            查看 [CHANGELOG.md](../../CHANGELOG.md) 了解详细更新内容。
+
+            ## 校验文件
+            每个安装包都有对应的 `.sig` 签名文件，可用于验证软件包完整性。
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
