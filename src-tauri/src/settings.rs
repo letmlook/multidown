@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod proxy;
+
 const SETTINGS_FILENAME: &str = "multidown_settings.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

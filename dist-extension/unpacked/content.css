@@ -1,0 +1,12 @@
+/* content.css - Multidown Extension Content Script Styles */
+.multidown-download-fab {
+  position: absolute;
+  z-index: 2147483647;
+  pointer-events: auto;
+}
+.multidown-media-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+}

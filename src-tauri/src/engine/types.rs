@@ -41,6 +41,7 @@ pub struct CreateTaskInput {
 pub const MIN_SEGMENT_SIZE: u64 = 64 * 1024;
 
 /// 静态分段：将 [0, total) 均分为 n 段（最后一段可能略短）
+#[allow(dead_code)]
 pub fn static_segments(total: u64, n: usize) -> Vec<(u64, u64)> {
     if n == 0 || total == 0 {
         return vec![];
@@ -64,4 +65,51 @@ pub fn static_segments(total: u64, n: usize) -> Vec<(u64, u64)> {
 
 pub fn new_task_id() -> TaskId {
     Uuid::new_v4().to_string()
+}
+
+// ── Category Rule summary (for frontend list) ──────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleSummary {
+    pub id: String,
+    pub pattern: String,
+    pub category: String,
+    pub save_dir: String,
+    pub auto_start: bool,
+    pub enabled: bool,
+    pub priority: usize,
+}
+
+// ── Rule match result (from test_rules) ───────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MatchResult {
+    pub rule_id: String,
+    pub category: String,
+    pub save_dir: String,
+    pub matched_pattern: String,
+}
+
+// ── Schedule task summary ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleTaskSummary {
+    pub id: String,
+    pub name: String,
+    pub cron_expr: String,
+    pub action_type: String,
+    pub action_config: String,
+    pub enabled: bool,
+    pub last_run: Option<i64>,
+    pub next_run: Option<i64>,
+}
+
+// ── Batch summary ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchSummary {
+    pub id: String,
+    pub name: String,
+    pub task_count: usize,
+    pub queue_id: Option<String>,
 }

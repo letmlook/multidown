@@ -1,9 +1,10 @@
-use crate::engine::types::{static_segments, CreateTaskInput, TaskId, TaskStatus, MIN_SEGMENT_SIZE};
+use crate::engine::types::{CreateTaskInput, TaskId, TaskStatus, MIN_SEGMENT_SIZE};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[allow(dead_code)]
 const DEFAULT_CONNECTIONS: usize = 8;
 
 /// 单个下载任务状态（引擎内部）
@@ -21,6 +22,7 @@ pub struct Task {
     pub supports_range: bool,
     pub created_at: i64,
     /// 用于估算速度：最近一次更新的下载量
+    #[allow(dead_code)]
     pub last_downloaded: Arc<AtomicU64>,
     pub last_speed_time: Arc<Mutex<Option<(u64, std::time::Instant)>>>,
 }
@@ -34,10 +36,11 @@ impl Task {
         let save_path = std::path::Path::new(&input.save_dir).join(&filename);
         let save_path = save_path.to_string_lossy().to_string();
 
-        let pending_segments = if supports_range {
+        let pending_segments: VecDeque<(u64, u64)> = if supports_range {
+            // 动态分段：初始单个大段，由 worker 完成时自动对半切分
             let total = total_bytes.unwrap_or(0);
             if total > 0 {
-                VecDeque::from_iter(static_segments(total, DEFAULT_CONNECTIONS))
+                VecDeque::from_iter(std::iter::once((0, total.saturating_sub(1))))
             } else {
                 VecDeque::new()
             }

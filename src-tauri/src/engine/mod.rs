@@ -5,9 +5,14 @@ mod task;
 pub mod scheduler;
 mod writer;
 mod persistence;
+pub mod schedule;
+pub mod rules;
+pub mod rules_persistence;
 
-pub use persistence::{load_tasks_from_file, save_tasks_to_file, PersistedTask};
+pub mod batch;
+
+pub mod queue;
+
+pub use persistence::load_tasks_from_file;
 pub use types::*;
-pub use task::*;
-pub use scheduler::*;
-pub use writer::*;
+pub use types::MatchResult;

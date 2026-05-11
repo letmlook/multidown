@@ -9,13 +9,16 @@ mod settings;
 
 use engine::scheduler::Scheduler;
 use network::{NetworkOptions, ProbeResult};
+use settings::proxy::{
+    load_proxy_store, save_proxy_store, ProxyConfig, ProxyMatchType,
+    ProxyRule, ProxyTestResult, ProxyType,
+};
 use settings::{load_settings, save_settings, settings_path, AppSettings};
 use engine::TaskStatus;
 use std::sync::Arc;
 use tauri::{Manager, State};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::image::Image;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -29,6 +32,524 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 static TCP_SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 static TCP_SHUTDOWN_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+
+// ═══════════════════════════════════════════════════════════════════════
+// Queue Commands
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 列出所有下载队列
+#[tauri::command]
+async fn list_queues(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::queue::QueueSummary>, String> {
+    Ok(state.list_queues().await)
+}
+
+/// 创建新队列
+/// - `name`: 队列名称
+/// - `max_concurrent`: 最大并发下载数
+/// - `priority`: 优先级（数值越小越高）
+#[tauri::command]
+async fn create_queue(
+    name: String,
+    max_concurrent: u32,
+    priority: Option<u32>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<String, String> {
+    state.create_queue(name, max_concurrent).await
+}
+
+/// 更新队列配置
+/// - `queue_id`: 队列 ID
+/// - `name`: 新名称（可选）
+/// - `enabled`: 是否启用（对应暂停/恢复）
+/// - `max_concurrent`: 最大并发数（可选）
+#[tauri::command]
+async fn update_queue(
+    queue_id: String,
+    name: Option<String>,
+    enabled: Option<bool>,
+    max_concurrent: Option<u32>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.update_queue(&queue_id, name, enabled, max_concurrent, None).await
+}
+
+/// 删除队列（软删除，默认队列不可删除）
+#[tauri::command]
+async fn delete_queue(queue_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.delete_queue(&queue_id).await
+}
+
+/// 重新排序队列（拖拽排序）
+/// - `queue_ids`: 按新顺序排列的队列 ID 列表
+#[tauri::command]
+async fn reorder_queues(
+    queue_ids: Vec<String>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.reorder_queues(queue_ids).await
+}
+
+/// 暂停队列（队列内的任务不会自动开始）
+#[tauri::command]
+async fn pause_queue(queue_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.pause_queue(&queue_id).await
+}
+
+/// 恢复队列（允许队列内任务开始下载）
+#[tauri::command]
+async fn resume_queue(queue_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.resume_queue(&queue_id).await
+}
+
+/// 将任务分配到指定队列
+#[tauri::command]
+async fn assign_task_to_queue(
+    task_id: String,
+    queue_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.assign_task_to_queue(&task_id, &queue_id).await
+}
+
+/// 获取任务所在的队列 ID
+#[tauri::command]
+async fn get_task_queue(
+    task_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<Option<String>, String> {
+    Ok(state.get_task_queue(&task_id).await)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Batch Commands
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 列出所有批量任务
+#[tauri::command]
+async fn list_batches(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::batch::BatchJobInfo>, String> {
+    Ok(state.list_batches().await)
+}
+
+/// 创建批量任务
+/// - `name`: 批量任务名称
+/// - `queue_id`: 目标队列 ID（可选，默认进入默认队列）
+/// - `urls`: URL 列表（每行一个，或 JSON 数组）
+/// - `template`: 文件名模板，如 "video_{n}.mp4"
+#[tauri::command]
+async fn create_batch(
+    name: String,
+    urls: Vec<String>,
+    template: Option<String>,
+    start_index: Option<usize>,
+    queue_id: Option<String>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<String, String> {
+    state.create_batch(name, urls, template, start_index, queue_id).await
+}
+
+/// 向批量任务添加任务
+#[tauri::command]
+async fn add_task_to_batch(
+    batch_id: String,
+    task_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.add_task_to_batch(&batch_id, &task_id).await
+}
+
+/// 从批量任务移除任务
+#[tauri::command]
+async fn remove_task_from_batch(
+    batch_id: String,
+    task_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.remove_task_from_batch(&batch_id, &task_id).await
+}
+
+/// 删除批量任务（不删除已创建的下载任务）
+#[tauri::command]
+async fn delete_batch(batch_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.delete_batch(&batch_id).await
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Rules Commands (Category Rules)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 列出所有分类规则
+#[tauri::command]
+async fn list_rules(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::rules::CategoryRule>, String> {
+    Ok(state.list_rules().await)
+}
+
+/// 创建分类规则
+/// - `name`: 规则名称
+/// - `match_type`: 匹配类型 ("extension"|"domain"|"mime_type"|"url_contains")
+/// - `patterns`: 匹配模式列表
+/// - `save_path`: 目标保存路径（支持 {category}、{filename}、{date} 变量）
+/// - `enabled`: 是否启用
+/// - `priority`: 优先级（越小越优先）
+#[tauri::command]
+async fn create_rule(
+    name: String,
+    match_type: engine::rules::MatchType,
+    patterns: Vec<String>,
+    save_path: String,
+    enabled: Option<bool>,
+    priority: Option<usize>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<engine::rules::CategoryRule, String> {
+    use uuid::Uuid;
+    let rule = engine::rules::CategoryRule {
+        id: Uuid::new_v4().to_string(),
+        name,
+        match_type,
+        patterns,
+        save_path,
+        enabled: enabled.unwrap_or(true),
+        priority: priority.unwrap_or(0),
+    };
+    state.create_rule(rule).await
+}
+
+/// 更新分类规则
+#[tauri::command]
+async fn update_rule(
+    rule_id: String,
+    updates: engine::rules::CategoryRule,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<engine::rules::CategoryRule, String> {
+    // Ignore rule_id param, use the id from updates
+    state.update_rule(updates).await
+}
+
+/// 删除分类规则
+#[tauri::command]
+async fn delete_rule(rule_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.delete_rule(&rule_id).await
+}
+
+/// 重新排序规则（拖拽排序）
+#[tauri::command]
+async fn reorder_rules(rule_ids: Vec<String>, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.reorder_rules(rule_ids).await
+}
+
+/// 测试 URL 会匹配哪条规则
+/// - `url`: 待测试的下载 URL
+/// - 返回匹配到的规则的保存路径，若无匹配返回 None
+#[tauri::command]
+async fn test_rules(url: String, state: State<'_, Arc<Scheduler>>) -> Result<Option<engine::MatchResult>, String> {
+    Ok(state.test_rules_info(&url).await)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Schedule Commands
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 调度全局开关状态
+#[derive(serde::Serialize)]
+struct ScheduleState {
+    enabled: bool,
+    next_run_time: Option<String>,
+}
+
+/// 获取全局调度开关状态
+#[tauri::command]
+async fn get_schedule_state(state: State<'_, Arc<Scheduler>>) -> Result<ScheduleState, String> {
+    let enabled = state.get_schedule_state().await;
+    Ok(ScheduleState {
+        enabled,
+        next_run_time: None, // frontend can compute from tasks if needed
+    })
+}
+
+/// 设置全局调度开关
+#[tauri::command]
+async fn set_schedule_enabled(enabled: bool, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.set_schedule_enabled(enabled).await;
+    Ok(())
+}
+
+/// 列出所有计划任务
+#[tauri::command]
+async fn get_schedule_tasks(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::schedule::ScheduleRule>, String> {
+    Ok(state.get_schedule_tasks().await)
+}
+
+/// 创建计划任务
+/// - `name`: 任务名称
+/// - `schedule_type`: 类型 ("start_download"|"pause_all"|"resume_all"|"speed_limit")
+/// - `recurrence`: 重复方式 ("once"|"daily"|"weekdays"|"weekends")
+/// - `start_time`: 开始时间 "HH:MM"
+/// - `end_time`: 结束时间（限速时段用，可选）
+/// - `speed_limit_kbps`: 限速值 KB/s（限速类型用）
+#[tauri::command]
+async fn create_schedule_task(
+    name: String,
+    schedule_type: engine::schedule::ScheduleType,
+    recurrence: engine::schedule::Recurrence,
+    start_time: String,
+    end_time: Option<String>,
+    speed_limit_kbps: Option<u32>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<engine::schedule::ScheduleRule, String> {
+    let mut rule = engine::schedule::ScheduleRule::new(name, schedule_type, recurrence, start_time);
+    rule.end_time = end_time;
+    rule.speed_limit_kbps = speed_limit_kbps;
+    state.create_schedule_task(rule).await
+}
+
+/// 更新计划任务
+#[tauri::command]
+async fn update_schedule_task(
+    id: String,
+    updates: engine::schedule::ScheduleRule,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<engine::schedule::ScheduleRule, String> {
+    // Use id from updates, ignore path param
+    state.update_schedule_task(updates).await
+}
+
+/// 删除计划任务
+#[tauri::command]
+async fn delete_schedule_task(id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+    state.delete_schedule_task(&id).await
+}
+
+/// 手动触发一个计划任务（立即执行）
+#[tauri::command]
+async fn trigger_schedule_task(id: String, state: State<'_, Arc<Scheduler>>, app_handle: tauri::AppHandle) -> Result<(), String> {
+    state.trigger_schedule_task(&id, Some(app_handle)).await
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Proxy Commands
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 列出所有代理配置
+#[tauri::command]
+async fn list_proxies(app: tauri::AppHandle) -> Result<Vec<ProxyConfig>, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let store = load_proxy_store(&app_data);
+    Ok(store.proxies)
+}
+
+/// 添加代理配置
+/// - `name`: 代理名称
+/// - `proxy_type`: 类型 ("http"|"socks5"|"https")
+/// - `host`: 服务器地址
+/// - `port`: 端口
+/// - `username`: 用户名（可选）
+/// - `password`: 密码（可选，明文传输，内部 base64 存储）
+#[tauri::command]
+async fn add_proxy(
+    app: tauri::AppHandle,
+    name: String,
+    proxy_type: ProxyType,
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<ProxyConfig, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut config = ProxyConfig::new(name, proxy_type, host, port);
+    config.username = username;
+    config.set_password(password);
+    
+    let mut store = load_proxy_store(&app_data);
+    store.proxies.push(config.clone());
+    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    
+    Ok(config)
+}
+
+/// 更新代理配置
+#[tauri::command]
+async fn update_proxy(
+    app: tauri::AppHandle,
+    id: String,
+    name: Option<String>,
+    proxy_type: Option<ProxyType>,
+    host: Option<String>,
+    port: Option<u16>,
+    username: Option<String>,
+    password: Option<String>,
+    enabled: Option<bool>,
+) -> Result<ProxyConfig, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut store = load_proxy_store(&app_data);
+    
+    let proxy = store.proxies.iter_mut().find(|p| p.id == id)
+        .ok_or("代理不存在")?;
+    
+    if let Some(n) = name { proxy.name = n; }
+    if let Some(t) = proxy_type { proxy.proxy_type = t; }
+    if let Some(h) = host { proxy.host = h; }
+    if let Some(p) = port { proxy.port = p; }
+    if let Some(u) = username { proxy.username = Some(u); }
+    if let Some(pw) = password { proxy.set_password(Some(pw)); }
+    if let Some(e) = enabled { proxy.enabled = e; }
+    proxy.updated_at = chrono::Utc::now().timestamp_millis();
+    
+    let updated = proxy.clone();
+    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    
+    Ok(updated)
+}
+
+/// 删除代理配置
+#[tauri::command]
+async fn delete_proxy(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut store = load_proxy_store(&app_data);
+    let len_before = store.proxies.len();
+    store.proxies.retain(|p| p.id != id);
+    if store.proxies.len() == len_before {
+        return Err("代理不存在".to_string());
+    }
+    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 测试代理连通性
+/// - `host`: 代理服务器地址
+/// - `port`: 端口
+/// - `username`: 用户名（可选）
+/// - `password`: 密码（可选）
+#[tauri::command]
+async fn test_proxy(
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<ProxyTestResult, String> {
+    let mut config = ProxyConfig::new("test".to_string(), ProxyType::Http, host.clone(), port);
+    config.username = username;
+    config.set_password(password);
+    config.id = "test".to_string();
+    
+    // 构建带认证的 URL 进行测试
+    if let Some(url) = config.to_authenticated_url() {
+        // 使用 reqwest 构建代理客户端进行实际连接测试
+        let test_url = "http://www.gstatic.com/generate_204";
+        let timeout = std::time::Duration::from_secs(10);
+        
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&url).map_err(|e| e.to_string())?)
+            .timeout(timeout)
+            .build()
+            .map_err(|e| e.to_string())?;
+        
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(timeout, client.head(test_url).send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() || resp.status().as_u16() == 204 => {
+                Ok(ProxyTestResult {
+                    proxy_id: "test".to_string(),
+                    success: true,
+                    latency_ms: Some(start.elapsed().as_millis() as u32),
+                    error: None,
+                })
+            }
+            Ok(Ok(resp)) => Ok(ProxyTestResult {
+                proxy_id: "test".to_string(),
+                success: false,
+                latency_ms: Some(start.elapsed().as_millis() as u32),
+                error: Some(format!("HTTP {}", resp.status().as_u16())),
+            }),
+            Ok(Err(e)) => Ok(ProxyTestResult {
+                proxy_id: "test".to_string(),
+                success: false,
+                latency_ms: None,
+                error: Some(e.to_string()),
+            }),
+            Err(_) => Ok(ProxyTestResult {
+                proxy_id: "test".to_string(),
+                success: false,
+                latency_ms: None,
+                error: Some("连接超时".to_string()),
+            }),
+        }
+    } else {
+        Err("无效代理配置".to_string())
+    }
+}
+
+/// 列出所有代理规则
+#[tauri::command]
+async fn list_proxy_rules(app: tauri::AppHandle) -> Result<Vec<ProxyRule>, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let store = load_proxy_store(&app_data);
+    Ok(store.rules)
+}
+
+/// 添加代理规则
+#[tauri::command]
+async fn add_proxy_rule(
+    app: tauri::AppHandle,
+    name: String,
+    match_type: ProxyMatchType,
+    patterns: Vec<String>,
+    proxy_id: String,
+    priority: Option<i32>,
+) -> Result<ProxyRule, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut rule = ProxyRule::new(name, match_type, patterns, proxy_id);
+    if let Some(p) = priority { rule.priority = p; }
+    
+    let mut store = load_proxy_store(&app_data);
+    store.rules.push(rule.clone());
+    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    
+    Ok(rule)
+}
+
+/// 更新代理规则
+#[tauri::command]
+async fn update_proxy_rule(
+    app: tauri::AppHandle,
+    id: String,
+    name: Option<String>,
+    enabled: Option<bool>,
+    match_type: Option<ProxyMatchType>,
+    patterns: Option<Vec<String>>,
+    proxy_id: Option<String>,
+    priority: Option<i32>,
+) -> Result<ProxyRule, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut store = load_proxy_store(&app_data);
+    
+    let rule = store.rules.iter_mut().find(|r| r.id == id)
+        .ok_or("规则不存在")?;
+    
+    if let Some(n) = name { rule.name = n; }
+    if let Some(e) = enabled { rule.enabled = e; }
+    if let Some(m) = match_type { rule.match_type = m; }
+    if let Some(p) = patterns { rule.patterns = p; }
+    if let Some(pid) = proxy_id { rule.proxy_id = pid; }
+    if let Some(p) = priority { rule.priority = p; }
+    rule.updated_at = chrono::Utc::now().timestamp_millis();
+    
+    let updated = rule.clone();
+    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    
+    Ok(updated)
+}
+
+/// 删除代理规则
+#[tauri::command]
+async fn delete_proxy_rule(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut store = load_proxy_store(&app_data);
+    let len_before = store.rules.len();
+    store.rules.retain(|r| r.id != id);
+    if store.rules.len() == len_before {
+        return Err("规则不存在".to_string());
+    }
+    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 // 调试日志函数
 fn debug_log(app: &tauri::AppHandle, message: &str, data: Option<&str>) {
@@ -68,11 +589,13 @@ fn debug_log(app: &tauri::AppHandle, message: &str, data: Option<&str>) {
 }
 
 // 详细日志函数（用于更详细的调试信息）
+#[allow(dead_code)]
 fn debug_log_detailed(app: &tauri::AppHandle, message: &str, details: &str) {
     debug_log(app, message, Some(details));
 }
 
 // 错误日志函数
+#[allow(dead_code)]
 fn error_log(app: &tauri::AppHandle, message: &str, error: &str) {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
     let log_message = format!("[{}] [Multidown Main] [ERROR] {}: {}", timestamp, message, error);
@@ -289,7 +812,7 @@ fn open_with(path: String) -> Result<(), String> {
     if !path.exists() {
         return Err("文件不存在".to_string());
     }
-    let path_str = path.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+    let _path_str = path.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]
     std::process::Command::new("rundll32.exe")
         .args(["shell32.dll,OpenAs_RunDLL", &path_str])
@@ -400,6 +923,7 @@ fn write_clipboard_text(text: String) -> Result<(), String> {
 }
 
 /// 递归复制目录
+#[allow(dead_code)]
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -887,7 +1411,7 @@ fn install_to_chrome(ext_path: &str) -> Result<(), String> {
 }
 
 /// 安装扩展到 Firefox
-fn install_to_firefox(ext_path: &str) -> Result<(), String> {
+fn install_to_firefox(_ext_path: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]{
         // 尝试查找 Firefox
         let firefox_paths = [
@@ -1445,10 +1969,10 @@ pub fn run() {
                             let DownloadTask {
                                 url,
                                 filename,
-                                referer,
-                                user_agent,
-                                cookie,
-                                post_data,
+                                referer: _,
+                                user_agent: _,
+                                cookie: _,
+                                post_data: _,
                                 save_path,
                                 open_window,
                                 responder,
@@ -1613,6 +2137,47 @@ pub fn run() {
             package_browser_extension,
             export_tasks,
             import_tasks,
+            // Queue commands
+            list_queues,
+            create_queue,
+            update_queue,
+            delete_queue,
+            reorder_queues,
+            pause_queue,
+            resume_queue,
+            assign_task_to_queue,
+            get_task_queue,
+            // Batch commands
+            list_batches,
+            create_batch,
+            add_task_to_batch,
+            remove_task_from_batch,
+            delete_batch,
+            // Rules commands
+            list_rules,
+            create_rule,
+            update_rule,
+            delete_rule,
+            reorder_rules,
+            test_rules,
+            // Schedule commands
+            get_schedule_state,
+            set_schedule_enabled,
+            get_schedule_tasks,
+            create_schedule_task,
+            update_schedule_task,
+            delete_schedule_task,
+            trigger_schedule_task,
+            // Proxy commands
+            list_proxies,
+            add_proxy,
+            update_proxy,
+            delete_proxy,
+            test_proxy,
+            list_proxy_rules,
+            add_proxy_rule,
+            update_proxy_rule,
+            delete_proxy_rule,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

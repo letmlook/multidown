@@ -2312,11 +2312,13 @@ name = "multidown"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "dirs 5.0.1",
  "futures-util",
  "opener",
+ "parking_lot",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2327,6 +2329,7 @@ dependencies = [
  "tauri-plugin-notification",
  "thiserror 1.0.69",
  "tokio",
+ "url",
  "urlencoding",
  "uuid",
  "walkdir",

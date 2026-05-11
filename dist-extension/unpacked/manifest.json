@@ -3,8 +3,38 @@
   "name": "Multidown 下载助手",
   "version": "0.1.0",
   "description": "使用 Multidown 下载链接与文件",
-  "permissions": ["contextMenus", "nativeMessaging", "storage"],
+  "permissions": [
+    "contextMenus",
+    "nativeMessaging",
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js"
-  }
+  },
+  "action": {
+    "default_title": "Multidown 下载助手",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
 }
