@@ -943,7 +943,7 @@ fn open_with(path: String) -> Result<(), String> {
     if !path.exists() {
         return Err("文件不存在".to_string());
     }
-    let _path_str = path.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().to_string();
+    let path_str = path.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]
     std::process::Command::new("rundll32.exe")
         .args(["shell32.dll,OpenAs_RunDLL", &path_str])
@@ -1357,6 +1357,7 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         key_edge.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
 
         // 注册 Firefox Native Host（Firefox 要求 allowed_extensions 精确匹配，单独写 manifest）
+        let native_host_exe_path = native_host_dir.join("multidown-native-host.exe");
         let ff_manifest_path = native_host_dir.join("com.multidown.app.firefox.json");
         std::fs::write(&ff_manifest_path, firefox_manifest_content(&native_host_exe_path.to_string_lossy()))
             .map_err(|e| e.to_string())?;

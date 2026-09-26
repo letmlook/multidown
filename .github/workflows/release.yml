@@ -61,6 +61,21 @@ jobs:
       - name: Build browser extension
         run: npm run build:extension
 
+      - name: Build native messaging host
+        working-directory: integration/native-host
+        shell: bash
+        run: |
+          ARGS=""
+          if [ -n "$NATIVE_TARGET" ]; then ARGS="--target $NATIVE_TARGET"; fi
+          cargo build --release $ARGS
+          BIN="target/release/multidown-native-host"
+          if [ -n "$NATIVE_TARGET" ]; then BIN="target/$NATIVE_TARGET/release/multidown-native-host"; fi
+          # 统一复制到 tauri 资源声明期望的路径
+          mkdir -p target/release
+          cp "$BIN" target/release/multidown-native-host
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:

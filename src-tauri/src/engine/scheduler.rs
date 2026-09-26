@@ -1046,7 +1046,8 @@ impl Scheduler {
         match load_rules(path) {
             Ok(rules) => {
                 let rm = self.rule_manager.clone();
-                let _ = tokio::spawn(async move {
+                // fire-and-forget：JoinHandle 直接丢弃以分离任务
+                tokio::spawn(async move {
                     let mut guard = rm.write().await;
                     *guard = rules;
                 });

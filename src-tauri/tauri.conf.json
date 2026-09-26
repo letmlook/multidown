@@ -29,7 +29,6 @@
     "targets": "all",
     "resources": {
       "../dist-extension/unpacked": "extension/unpacked",
-      "../dist-extension/multidown-extension.crx": "extension/multidown-extension.crx",
       "../integration/extension/com.multidown.app.json": "native-host/com.multidown.app.json"
     },
     "icon": [
