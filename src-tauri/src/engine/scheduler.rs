@@ -372,10 +372,10 @@ impl Scheduler {
 
     /// 新建 BitTorrent 任务（磁力链接或种子文件）。
     ///
-    /// **这一步需要元数据**：磁力链接会走 DHT/tracker 解析（可能耗时数秒到数分钟），
-    /// 所以调用方应当先在 UI 上显示"解析中"，并把拿到的 `metainfo_b64` 回传，
-    /// 后续重建任务时就是纯本地操作了。解析结果是文件列表与落盘位置，
-    /// 一旦确定就不再变化，因此 `Task` 的种子字段全程只读。
+    /// 元数据已缓存（metainfo_b64）或为本地 `.torrent` 时立即解析并落库；
+    /// 否则（裸磁力链接 / .torrent URL）**先创建占位任务立即返回**，
+    /// 元数据在 `start_download` 的下载路径里解析——解析可能耗时数秒到数分钟，
+    /// 不应让调用方干等，任务在列表里以"解析元数据中"的状态可见。
     #[allow(clippy::too_many_arguments)] // 与 HTTP 路径的 create_task_internal 一致
     pub async fn create_torrent_task(
         &self,
@@ -392,21 +392,69 @@ impl Scheduler {
             return Err("不是磁力链接或种子文件，无法创建种子任务".to_string());
         }
 
+        // 磁力链接先做本地校验（不联网）：格式错误 / v2-only 直接报错，
+        // 顺带拿到 info hash 用于去重与占位文件名
+        let magnet = if crate::torrent::detect::sniff(&input) == crate::torrent::detect::InputProtocol::Magnet {
+            Some(crate::torrent::detect::parse_magnet(&input)?)
+        } else {
+            None
+        };
+
+        // 本地可得的 info hash：调用方传入，或磁力链接解析（不联网）
+        let local_info_hash = info_hash.or_else(|| magnet.as_ref().map(|m| m.info_hash.clone()));
+
         if !force {
             // 种子按 info hash 去重，而不是按 URL —— 同一资源的磁力链接参数可能不同
-            let key = info_hash.clone().unwrap_or_else(|| input.clone());
+            let key = local_info_hash
+                .clone()
+                .unwrap_or_else(|| input.clone());
             if let Some(existing_id) = self.find_duplicate_torrent(&key).await {
                 self.handle_duplicate(&existing_id).await?;
             }
         }
 
+        // ── 快速路径：没有缓存的 metainfo → 占位任务，立即返回 ──
+        // BEP 53 的 so= 参数此时就可以应用；其余文件选择等元数据就绪后再说
+        let Some(metainfo_b64) = metainfo_b64 else {
+            let placeholder = filename
+                .filter(|f| !f.trim().is_empty())
+                .map(|f| crate::torrent::detect::sanitize_filename(&f))
+                .or_else(|| {
+                    magnet
+                        .as_ref()
+                        .map(|m| m.placeholder_filename())
+                })
+                .unwrap_or_else(|| "torrent".to_string());
+            let meta = TorrentMeta {
+                input,
+                info_hash: local_info_hash,
+                metainfo_b64: None,
+                selected_files: selected_files.or_else(|| {
+                    magnet.as_ref().and_then(|m| m.select_only.clone())
+                }),
+                metadata_ready: false,
+                uploaded_bytes: 0,
+            };
+            let task = Task::new_torrent(meta, save_dir, placeholder);
+            let id = task.id.clone();
+
+            if let Some(ref qm) = self.queue_manager {
+                let manager = qm.lock().await;
+                let _ = manager.assign_task_to_queue(&id, &manager.default_queue_id).await;
+            }
+
+            self.tasks.lock().await.insert(id.clone(), Arc::new(task));
+            self.save_tasks().await;
+            return Ok(id);
+        };
+
         let engine = self.torrent_engine().await?;
         let meta = TorrentMeta {
             input: input.clone(),
-            info_hash: info_hash.clone(),
-            metainfo_b64,
+            info_hash: local_info_hash,
+            metainfo_b64: Some(metainfo_b64),
             selected_files: selected_files.clone(),
-            metadata_ready: false,
+            metadata_ready: true,
             uploaded_bytes: 0,
         };
         let inspected = engine
@@ -461,8 +509,7 @@ impl Scheduler {
                 continue;
             }
             let matches = t
-                .torrent
-                .as_ref()
+                .torrent_meta()
                 .map(|m| {
                     m.info_hash.as_deref() == Some(key) || m.input == key
                 })
@@ -780,16 +827,26 @@ impl Scheduler {
             Err(e) => fail!(e),
         };
 
-        let meta = match task.torrent.clone() {
+        let meta = match task.torrent_meta() {
             Some(m) => m,
             None => fail!("任务缺少种子元数据".to_string()),
         };
 
-        // 元数据在 create_torrent_task 阶段已解析并缓存，此处是纯本地操作
+        // 元数据可能尚未就绪（磁力链接的占位任务）：此处解析磁力会进
+        // DHT/tracker，可能耗时数秒到数分钟；解析完成后回填到任务，
+        // 这样重启后无需再解析。
         let inspected = match engine.inspect(&meta).await {
             Ok(i) => i,
             Err(e) => fail!(format!("解析种子元数据失败: {e}")),
         };
+        task.update_torrent_meta(TorrentMeta {
+            input: meta.input.clone(),
+            info_hash: Some(inspected.info_hash.clone()),
+            metainfo_b64: Some(base64_encode(&inspected.metainfo)),
+            selected_files: meta.selected_files.clone(),
+            metadata_ready: true,
+            uploaded_bytes: 0,
+        });
 
         // 单文件 → 直接放下载目录；多文件 → 以种子名命名的子目录
         // （librqbit 的多文件路径不含种子名，必须由调用方补上）
@@ -1754,7 +1811,7 @@ async fn task_to_info(t: &Arc<Task>) -> TaskInfo {
             .filter(|f| !f.is_empty()),
         // HTTP 任务没有"元数据解析"阶段，恒为就绪，避免前端出现无意义的等待态
         metadata_ready: if is_torrent {
-            t.torrent.as_ref().map(|m| m.metadata_ready).unwrap_or(false)
+            t.torrent_meta().map(|m| m.metadata_ready).unwrap_or(false)
         } else {
             true
         },
@@ -2094,5 +2151,65 @@ mod tests {
         // forever / stop 不在此判定（由轮询器直接处理）
         assert!(!seeding_pause_due("forever", 0, 100, 0, Duration::from_secs(3600), 0));
         assert!(!seeding_pause_due("stop", 0, 100, 0, Duration::ZERO, 0));
+    }
+
+    #[tokio::test]
+    async fn magnet_without_metainfo_creates_placeholder_task_immediately() {
+        let s = scheduler();
+        // 裸磁力链接：不解析元数据、不碰引擎，任务立即落库（metadata_ready=false）
+        let magnet = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862\
+                      &dn=ubuntu-21.04&tr=udp%3A%2F%2Ftracker.example%3A1337";
+        let id = s
+            .create_torrent_task(magnet.into(), ".".into(), None, None, None, None, false)
+            .await
+            .expect("占位任务应立即创建成功");
+
+        let (meta, filename) = {
+            let tasks = s.tasks.lock().await;
+            let task = tasks.get(&id).expect("任务应在列表里");
+            assert!(task.kind.is_torrent());
+            let meta = task.torrent_meta().expect("种子元数据应存在");
+            (meta, task.filename.clone())
+        };
+        assert!(!meta.metadata_ready, "占位任务的元数据尚未解析");
+        assert!(meta.metainfo_b64.is_none());
+        assert_eq!(
+            meta.info_hash.as_deref(),
+            Some("cab507494d02ebb1178b38f2e9d7be299c86b862"),
+            "info hash 来自本地解析，无需联网"
+        );
+        assert_eq!(filename, "ubuntu-21.04", "占位名取自 dn 参数");
+
+        // so= 参数在占位阶段就生效（与首个磁力同 hash，force 绕过查重）
+        let so_magnet = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&so=0,2";
+        let id2 = s
+            .create_torrent_task(so_magnet.into(), ".".into(), None, None, None, None, true)
+            .await
+            .unwrap();
+        let selected = {
+            let tasks = s.tasks.lock().await;
+            tasks.get(&id2).unwrap().torrent_meta().unwrap().selected_files.clone()
+        };
+        assert_eq!(selected, Some(vec![0, 2]));
+    }
+
+    #[tokio::test]
+    async fn magnet_placeholder_dedupes_by_info_hash() {
+        let s = scheduler();
+        let settings = crate::settings::AppSettings {
+            duplicate_action: "skip".to_string(),
+            ..Default::default()
+        };
+        s.update_from_settings(&settings);
+        // 同一资源的两个磁力链接：dn/tr 参数不同，info hash 相同 → 视为重复
+        let first = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=a";
+        let second = "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862&dn=b&tr=x";
+        s.create_torrent_task(first.into(), ".".into(), None, None, None, None, false)
+            .await
+            .expect("第一个应成功");
+        let again = s
+            .create_torrent_task(second.into(), ".".into(), None, None, None, None, false)
+            .await;
+        assert_eq!(again.unwrap_err(), "重复下载：已存在相同地址的任务");
     }
 }

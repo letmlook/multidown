@@ -84,7 +84,7 @@ impl Task {
             etag: Arc::new(Mutex::new(p.etag)),
             last_modified: Arc::new(Mutex::new(p.last_modified)),
             kind: p.kind,
-            torrent: p.torrent,
+            torrent: std::sync::RwLock::new(p.torrent),
             total_dynamic: Arc::new(AtomicU64::new(p.total_dynamic)),
             torrent_stats: Arc::new(Mutex::new(None)),
         }
@@ -118,7 +118,7 @@ impl PersistedTask {
             etag: task.etag.lock().await.clone(),
             last_modified: task.last_modified.lock().await.clone(),
             kind: task.kind,
-            torrent: task.torrent.clone(),
+            torrent: task.torrent.read().unwrap().clone(),
             total_dynamic: task.total_dynamic.load(Ordering::Relaxed),
         }
     }
@@ -190,7 +190,7 @@ mod tests {
         let task = Task::from_persisted(tasks.remove(0));
 
         assert_eq!(task.kind, TaskKind::Http);
-        assert!(task.torrent.is_none());
+        assert!(task.torrent.read().unwrap().is_none());
         // HTTP 任务的有效总大小走原有的 total_bytes 路径
         assert_eq!(task.effective_total_bytes(), Some(1048576));
         assert_eq!(task.downloaded_bytes(), 65536);

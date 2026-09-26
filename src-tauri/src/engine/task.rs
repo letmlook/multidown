@@ -37,8 +37,11 @@ pub struct Task {
     pub last_modified: Arc<Mutex<Option<String>>>,
     /// 协议类型：HTTP 分段下载 / BitTorrent
     pub kind: TaskKind,
-    /// 种子任务的持久化元数据；HTTP 任务为 None
-    pub torrent: Option<TorrentMeta>,
+    /// 种子任务的持久化元数据；HTTP 任务为 None。
+    ///
+    /// 磁力链接支持"先建占位任务、后台解析元数据"，所以这里需要可变：
+    /// 解析完成后由下载路径回填 metainfo / info_hash。
+    pub torrent: std::sync::RwLock<Option<TorrentMeta>>,
     /// 动态总大小。
     ///
     /// BT 在元数据解析完成前不知道总大小，而 `total_bytes` 在 HTTP 路径上是不可变的，
@@ -95,7 +98,7 @@ impl Task {
             etag: Arc::new(Mutex::new(None)),
             last_modified: Arc::new(Mutex::new(None)),
             kind: TaskKind::Http,
-            torrent: None,
+            torrent: std::sync::RwLock::new(None),
             total_dynamic: Arc::new(AtomicU64::new(0)),
             torrent_stats: Arc::new(Mutex::new(None)),
         }
@@ -103,8 +106,9 @@ impl Task {
 
     /// 新建 BitTorrent 任务。
     ///
-    /// 此时通常还没有元数据（磁力链接），所以 `filename` 允许用 info hash 之类的占位名，
-    /// `total_bytes` 未知；两者都会在元数据解析完成后被回填。
+    /// `filename` 允许用磁力链接 `dn` 参数之类的占位名——此时元数据还没解析，
+    /// `total_bytes` 未知；元数据解析完成后总大小会被回填，占位名保留
+    /// （与 qBittorrent 等客户端一致，`dn` 就是该资源通常显示的名字）。
     pub fn new_torrent(meta: TorrentMeta, save_dir: String, filename: String) -> Self {
         let save_path = std::path::Path::new(&save_dir)
             .join(&filename)
@@ -133,10 +137,21 @@ impl Task {
             etag: Arc::new(Mutex::new(None)),
             last_modified: Arc::new(Mutex::new(None)),
             kind: TaskKind::Torrent,
-            torrent: Some(meta),
+            torrent: std::sync::RwLock::new(Some(meta)),
             total_dynamic: Arc::new(AtomicU64::new(0)),
             torrent_stats: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 回填（覆盖）种子元数据。元数据解析完成后调用，
+    /// 让重启后无需再进 DHT 解析。
+    pub fn update_torrent_meta(&self, meta: TorrentMeta) {
+        *self.torrent.write().unwrap() = Some(meta);
+    }
+
+    /// 读取种子元数据快照。
+    pub fn torrent_meta(&self) -> Option<TorrentMeta> {
+        self.torrent.read().unwrap().clone()
     }
 
     /// 任务的有效总大小：种子任务以 `total_dynamic` 为准（元数据就绪前为 None）。
