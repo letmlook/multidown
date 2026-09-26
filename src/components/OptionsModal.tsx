@@ -59,7 +59,6 @@ const defaultSettings: AppSettings = {
   global_speed_limit_kbps: 0,
   capture_enabled: true,
   capture_domain_blacklist: [],
-  allow_insecure_tls: false,
 };
 
 function newRule(): CategoryRule {
@@ -820,14 +819,6 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                       <span style={{ color: "#666", fontSize: 12 }}>0 表示不限速</span>
                     </div>
                   </div>
-                  <label className="form-check-row">
-                    <input
-                      type="checkbox"
-                      checked={settings.allow_insecure_tls ?? false}
-                      onChange={(e) => update({ allow_insecure_tls: e.target.checked })}
-                    />
-                    <span>允许无效 TLS 证书（自签名场景，存在安全风险）</span>
-                  </label>
                   <div className="form-group">
                     <label>请求超时（秒）</label>
                     <input

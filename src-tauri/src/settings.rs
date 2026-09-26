@@ -60,9 +60,6 @@ pub struct AppSettings {
     /// 浏览器捕获域名黑名单（一行一个域名，子域名同样命中）
     #[serde(default)]
     pub capture_domain_blacklist: Vec<String>,
-    /// 允许无效 TLS 证书（自签名场景，默认严格校验）
-    #[serde(default)]
-    pub allow_insecure_tls: bool,
 }
 
 fn default_true() -> bool {
@@ -93,7 +90,6 @@ impl Default for AppSettings {
             global_speed_limit_kbps: 0,
             capture_enabled: true,
             capture_domain_blacklist: Vec::new(),
-            allow_insecure_tls: false,
         }
     }
 }

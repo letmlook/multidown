@@ -58,8 +58,6 @@ export interface AppSettings {
   capture_enabled?: boolean;
   /** 浏览器捕获域名黑名单 */
   capture_domain_blacklist?: string[];
-  /** 允许无效 TLS 证书 */
-  allow_insecure_tls?: boolean;
 }
 
 // ---------------------------------------------------------------------------

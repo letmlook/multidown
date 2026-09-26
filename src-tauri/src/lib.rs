@@ -752,7 +752,6 @@ fn network_options_from_settings(settings: &AppSettings) -> NetworkOptions {
         proxy_url: effective_proxy_url(settings),
         timeout_secs: settings.timeout_secs,
         user_agent: Some(settings.user_agent.clone()).filter(|s| !s.is_empty()),
-        danger_accept_invalid_certs: settings.allow_insecure_tls,
         ..Default::default()
     }
 }

@@ -36,8 +36,6 @@ pub struct NetworkOptions {
     pub user_agent: Option<String>,
     pub extra_headers: Vec<(String, String)>,
     pub auth: Option<AuthConfig>,
-    /// 跳过 TLS 证书校验（仅自签名等特殊场景）
-    pub danger_accept_invalid_certs: bool,
 }
 
 fn default_timeout() -> Duration {
@@ -63,9 +61,6 @@ fn build_client(options: &NetworkOptions) -> Result<Client, Error> {
     }
     if let Some(url) = options.proxy_url.as_deref().filter(|s| !s.is_empty()) {
         builder = builder.proxy(reqwest::Proxy::all(url).map_err(|e| Error::Url(e.to_string()))?);
-    }
-    if options.danger_accept_invalid_certs {
-        builder = builder.danger_accept_invalid_certs(true);
     }
     builder.build().map_err(Error::Request)
 }
