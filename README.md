@@ -136,7 +136,10 @@ npm run icons
 
 - 设置页全量接线：默认保存路径、连接数、并发数、重试、UA、超时、进度保存间隔、限速、通知、剪贴板监视、开始/完成对话框、使用上次保存路径、开机自启
 - 托盘菜单、系统通知、自定义标题栏、单实例
-- **URL Scheme**：`multidown://add?url=...` 唤起主程序添加任务（无扩展浏览器兜底）
+- **URL Scheme**：`multidown://add?url=...` 添加任务（无扩展浏览器兜底）
+  > ⚠️ **目前仅 macOS 可用**。Windows / Linux 上该 scheme 未注册到系统（代码从未调用
+  > `deep_link().register_all()`，且 `tauri-plugin-single-instance` 未开启 `deep-link`
+  > feature），点击链接不会唤起程序。修复方式见 [开发计划](./docs/开发计划.md) 的 P0 项。
 
 ### 浏览器集成
 
