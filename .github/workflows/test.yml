@@ -1,10 +1,14 @@
 name: Test Build
 
+# 暂不自动触发：需手动到 Actions 页 run workflow，或在本地跑
+#   cargo test --lib && cargo clippy --all-targets && npx tsc --noEmit && npm run build
+# 恢复自动触发：把下面的注释去掉，并删除 workflow_dispatch。
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
+  workflow_dispatch:
 
 jobs:
   test-tauri:
