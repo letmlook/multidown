@@ -81,10 +81,6 @@ export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, o
       {tasks.map((t, index) => {
         const total = t.total_bytes ?? 0;
         const pct = total > 0 ? Math.min(100, (t.downloaded_bytes / total) * 100) : 0;
-        const statusDisplay =
-          t.status === "downloading" && total > 0
-            ? `${pct.toFixed(1)}%`
-            : statusText[t.status] ?? t.status;
         const remaining =
           t.status === "downloading" && total > 0 && t.speed_bps != null
             ? formatRemaining(total, t.downloaded_bytes, t.speed_bps)
@@ -96,6 +92,14 @@ export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, o
 
         const isSelected = selectedId === t.id;
         const progressClass = t.status;
+        // 磁力任务在元数据就绪前显示专门状态，避免"0% 下载中"的困惑
+        const resolvingMetadata =
+          t.kind === "torrent" && t.metadata_ready === false && t.status === "downloading";
+        const statusDisplay = resolvingMetadata
+          ? "解析元数据中…"
+          : t.status === "downloading" && total > 0
+            ? `${pct.toFixed(1)}%`
+            : statusText[t.status] ?? t.status;
 
         return (
           <div
@@ -112,9 +116,16 @@ export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, o
           >
             <div className="task-card-header">
               <div className="task-file-icon">
-                <svg viewBox="0 0 24 24">
-                  <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-                </svg>
+                {t.kind === "torrent" ? (
+                  // 磁铁图标：与 HTTP 任务的下载图标区分
+                  <svg viewBox="0 0 24 24">
+                    <path d="M13 2v9.5L17.5 7l1.4 1.4L12 15.3 5.1 8.4 6.5 7 11 11.5V2h2zM4 17h16v3H4v-3z"/>
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                  </svg>
+                )}
               </div>
               <div className="task-info">
                 <div className="task-filename" title={t.filename || t.url}>
@@ -129,7 +140,7 @@ export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, o
               </div>
             </div>
 
-            {t.status === "downloading" && total > 0 && (
+            {t.status === "downloading" && total > 0 && !resolvingMetadata && (
               <div className="task-progress-section">
                 <div className="task-progress-bar-bg">
                   <div
@@ -153,10 +164,27 @@ export function TaskList({ tasks, selectedId, onSelect, onRefresh: _onRefresh, o
                   {speedDisplay}
                 </span>
               </div>
-              <div className="task-stat">
-                <span className="task-stat-label">剩余:</span>
-                <span className="task-stat-value">{remaining}</span>
-              </div>
+              {t.kind === "torrent" ? (
+                <>
+                  <div className="task-stat">
+                    <span className="task-stat-label">上传:</span>
+                    <span className="task-stat-value">
+                      {t.upload_speed_bps ? `${formatSpeed(t.upload_speed_bps)}` : "—"}
+                    </span>
+                  </div>
+                  <div className="task-stat">
+                    <span className="task-stat-label">Peer:</span>
+                    <span className="task-stat-value">
+                      {t.peers != null ? t.peers : "—"}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div className="task-stat">
+                  <span className="task-stat-label">剩余:</span>
+                  <span className="task-stat-value">{remaining}</span>
+                </div>
+              )}
               <div className="task-stat">
                 <span className="task-stat-label">日期:</span>
                 <span className="task-stat-value">{formatDate(t.created_at)}</span>

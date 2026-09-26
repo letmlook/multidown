@@ -20,6 +20,7 @@ import { OptionsModal } from "./components/OptionsModal";
 import { ContextMenu } from "./components/ContextMenu";
 import { BatchAdd } from "./components/BatchAdd";
 import { DownloadFileInfo } from "./components/DownloadFileInfo";
+import { TorrentFilesModal } from "./components/TorrentFilesModal";
 import { PropertiesModal } from "./components/PropertiesModal";
 import { MoveRenameModal } from "./components/MoveRenameModal";
 import { AboutModal } from "./components/AboutModal";
@@ -57,6 +58,7 @@ function App() {
   const [moveRenameOpen, setMoveRenameOpen] = useState(false);
   const [propertiesTask, setPropertiesTask] = useState<TaskInfo | null>(null);
   const [moveRenameTask, setMoveRenameTask] = useState<TaskInfo | null>(null);
+  const [torrentFilesOpen, setTorrentFilesOpen] = useState(false);
   const [batchAddInitialUrls, setBatchAddInitialUrls] = useState("");
   /** 外部输入预填给「新建任务」的地址（磁力 / .torrent） */
   const [addTaskInitialUrl, setAddTaskInitialUrl] = useState("");
@@ -501,6 +503,19 @@ function App() {
         { type: "separator" },
         {
           type: "item",
+          label: "选择下载文件…",
+          onClick: () => {
+            setTorrentFilesOpen(true);
+            setContextMenu(null);
+          },
+          // 只有元数据就绪的种子任务才有文件表可改
+          disabled:
+            contextMenu.task.kind !== "torrent" ||
+            contextMenu.task.metadata_ready === false,
+        },
+        { type: "separator" },
+        {
+          type: "item",
           label: "继续下载",
           onClick: () =>
             invoke("resume_download", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
@@ -755,6 +770,13 @@ function App() {
           setPropertiesOpen(false);
           setPropertiesTask(null);
         }}
+      />
+
+      <TorrentFilesModal
+        open={torrentFilesOpen}
+        task={contextMenu?.task ?? selectedTask}
+        onClose={() => setTorrentFilesOpen(false)}
+        onSaved={refreshTasks}
       />
 
       <MoveRenameModal
