@@ -943,12 +943,18 @@ fn open_with(path: String) -> Result<(), String> {
     if !path.exists() {
         return Err("文件不存在".to_string());
     }
-    let path_str = path.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().to_string();
     #[cfg(target_os = "windows")]
-    std::process::Command::new("rundll32.exe")
-        .args(["shell32.dll,OpenAs_RunDLL", &path_str])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    {
+        let path_str = path
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .to_string();
+        std::process::Command::new("rundll32.exe")
+            .args(["shell32.dll,OpenAs_RunDLL", &path_str])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     #[cfg(not(target_os = "windows"))]
     opener::open(path).map_err(|e| e.to_string())?;
     Ok(())
