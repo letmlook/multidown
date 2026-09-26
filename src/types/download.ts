@@ -24,7 +24,14 @@ export interface ProbeResult {
   total_bytes: number | null;
   suggested_filename: string;
   final_url: string;
+  etag?: string | null;
+  last_modified?: string | null;
 }
+
+/** HTTP 认证配置（与 Rust AuthConfig 对应） */
+export type AuthConfig =
+  | { kind: "basic"; username: string; password: string }
+  | { kind: "bearer"; token: string };
 
 export interface AppSettings {
   default_save_path: string;
@@ -45,6 +52,8 @@ export interface AppSettings {
   notification_on_fail: boolean;
   timeout_secs: number;
   save_progress_interval_secs?: number;
+  /** 全局限速（KB/s），0 表示不限速 */
+  global_speed_limit_kbps?: number;
 }
 
 // ---------------------------------------------------------------------------

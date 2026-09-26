@@ -30,11 +30,15 @@ pub struct TaskInfo {
 }
 
 /// 新建任务参数
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CreateTaskInput {
     pub url: String,
     pub save_dir: String,
     pub filename: Option<String>,
+    /// HTTP 认证（Basic/Bearer）
+    pub auth: Option<crate::network::AuthConfig>,
+    /// 任务级附加请求头（如 Referer/Cookie/User-Agent）
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// 最小分段大小（64KB），动态分段时小于此值不再切分

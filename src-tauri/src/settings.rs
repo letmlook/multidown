@@ -51,6 +51,9 @@ pub struct AppSettings {
     pub timeout_secs: u64,
     /// 下载中周期保存进度间隔（秒），0 表示不周期保存
     pub save_progress_interval_secs: u64,
+    /// 全局限速（KB/s），0 表示不限速
+    #[serde(default)]
+    pub global_speed_limit_kbps: u32,
 }
 
 impl Default for AppSettings {
@@ -74,6 +77,7 @@ impl Default for AppSettings {
             notification_on_fail: true,
             timeout_secs: 30,
             save_progress_interval_secs: 30,
+            global_speed_limit_kbps: 0,
         }
     }
 }

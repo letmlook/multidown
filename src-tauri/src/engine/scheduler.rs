@@ -10,7 +10,10 @@ use crate::engine::schedule::{ScheduleManager, ScheduleRule};
 use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskInfo, TaskStatus};
 use crate::engine::writer::{run_file_writer, WriterMessage};
-use crate::network::{build_client_from_options, fetch_range_with_client, probe, probe_with_options, NetworkOptions, ProbeResult};
+use crate::network::{
+    build_client_from_options, probe, probe_with_options, AuthConfig, NetworkOptions, ProbeResult,
+    TokenBucket,
+};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::Mutex as AsyncMutex;
 use reqwest::Client;
@@ -56,6 +59,8 @@ pub struct Scheduler {
     limits: Arc<ParkingMutex<EngineLimits>>,
     /// 重复链接处理：ask | skip | overwrite | rename
     duplicate_action: Arc<ParkingMutex<String>>,
+    /// 全局限速令牌桶（rate=0 不限速），所有任务的 worker 共享
+    speed_limit: Arc<TokenBucket>,
 }
 
 /// 重复链接创建被拒绝时的错误标记；前端据此弹确认框后以 force 重试
@@ -74,6 +79,7 @@ impl Scheduler {
             schedule_enabled: Arc::new(ParkingMutex::new(true)),
             limits: Arc::new(ParkingMutex::new(EngineLimits::default())),
             duplicate_action: Arc::new(ParkingMutex::new("ask".to_string())),
+            speed_limit: Arc::new(TokenBucket::new(0)),
         }
     }
 
@@ -89,6 +95,14 @@ impl Scheduler {
             max_retries: settings.max_retries,
         };
         *self.duplicate_action.lock() = settings.duplicate_action.clone();
+        self.speed_limit
+            .set_rate((settings.global_speed_limit_kbps as u64).saturating_mul(1024));
+    }
+
+    /// 手动/计划任务设置全局限速（kbps，None 表示恢复设置里的值由调用方处理）
+    pub async fn set_effective_speed_limit(&self, kbps: Option<u64>) {
+        self.speed_limit
+            .set_rate(kbps.unwrap_or(0).saturating_mul(1024));
     }
 
     /// 从持久化文件加载任务（启动时调用）
@@ -109,6 +123,7 @@ impl Scheduler {
             schedule_enabled: Arc::new(ParkingMutex::new(true)),
             limits: Arc::new(ParkingMutex::new(EngineLimits::default())),
             duplicate_action: Arc::new(ParkingMutex::new("ask".to_string())),
+            speed_limit: Arc::new(TokenBucket::new(0)),
         })
     }
 
@@ -156,32 +171,33 @@ impl Scheduler {
             .map(|t| t.id.clone())
     }
 
-    /// 按设置中的 duplicate_action 处理重复链接；返回 Err 表示拒绝创建
-    async fn handle_duplicate(&self, existing_id: &TaskId, filename: &mut Option<String>) -> Result<(), String> {
+    /// 按设置中的 duplicate_action 处理重复链接。
+    /// 返回 Err 表示拒绝创建；Ok(true) 表示需要重命名（在探测解析出文件名后应用）。
+    async fn handle_duplicate(&self, existing_id: &TaskId) -> Result<bool, String> {
         let action = self.duplicate_action.lock().clone();
         match action.as_str() {
             "overwrite" => {
                 // 移除旧任务记录后重新创建；新任务下载时会截断旧文件
                 self.remove_task(existing_id).await?;
-                Ok(())
+                Ok(false)
             }
-            "rename" => {
-                // 为新任务文件名追加序号，避免覆盖
-                let tasks = self.tasks.lock().await;
-                let existing_paths: std::collections::HashSet<String> = tasks
-                    .values()
-                    .map(|t| t.save_path.clone())
-                    .collect();
-                drop(tasks);
-                if let Some(f) = filename.as_ref() {
-                    *filename = Some(next_available_filename(f, &existing_paths));
-                }
-                Ok(())
-            }
+            "rename" => Ok(true),
             "skip" => Err("重复下载：已存在相同地址的任务".to_string()),
             // ask：返回特殊标记，交互端弹确认后以 force 重新调用；非交互端按 skip 处理
             _ => Err(ERR_DUPLICATE_ASK.to_string()),
         }
+    }
+
+    /// 重命名去重：对最终文件名追加序号，避开已有任务的保存路径
+    async fn apply_rename_dedup(&self, filename: &mut Option<String>) {
+        let tasks = self.tasks.lock().await;
+        let existing_paths: std::collections::HashSet<String> =
+            tasks.values().map(|t| t.save_path.clone()).collect();
+        drop(tasks);
+        let base = filename
+            .clone()
+            .unwrap_or_else(|| "download".to_string());
+        *filename = Some(next_available_filename(&base, &existing_paths));
     }
 
     pub async fn create_task(
@@ -191,9 +207,11 @@ impl Scheduler {
         filename: Option<String>,
         probe_result: Option<ProbeResult>,
     ) -> Result<TaskId, String> {
-        self.create_task_internal(url, save_dir, filename, probe_result, false).await
+        self.create_task_internal(url, save_dir, filename, probe_result, false, None, Vec::new())
+            .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_task_internal(
         &self,
         url: String,
@@ -201,27 +219,48 @@ impl Scheduler {
         mut filename: Option<String>,
         probe_result: Option<ProbeResult>,
         force: bool,
+        auth: Option<AuthConfig>,
+        extra_headers: Vec<(String, String)>,
     ) -> Result<TaskId, String> {
-        // 重复检测放在探测之前，避免多余的网络请求
+        // 重复检测放在探测之前，避免多余的网络请求；重命名延后到文件名解析完成后应用
+        let mut rename_needed = false;
         if !force {
             if let Some(existing_id) = self.find_duplicate(&url).await {
-                self.handle_duplicate(&existing_id, &mut filename).await?;
+                rename_needed = self.handle_duplicate(&existing_id).await?;
             }
         }
-        let (supports_range, total_bytes, suggested_filename) = match probe_result {
-            Some(p) => (p.supports_range, p.total_bytes, p.suggested_filename),
+        let (supports_range, total_bytes, suggested_filename, validation) = match probe_result {
+            Some(p) => (
+                p.supports_range,
+                p.total_bytes,
+                p.suggested_filename.clone(),
+                Some((p.etag.clone(), p.last_modified.clone())),
+            ),
             None => {
                 let p = probe(&url).await.map_err(|e| e.to_string())?;
-                (p.supports_range, p.total_bytes, p.suggested_filename)
+                (
+                    p.supports_range,
+                    p.total_bytes,
+                    p.suggested_filename.clone(),
+                    Some((p.etag.clone(), p.last_modified.clone())),
+                )
             }
         };
-        let filename = filename.or(Some(suggested_filename));
+        let mut filename = filename.or(Some(suggested_filename));
+        if rename_needed {
+            self.apply_rename_dedup(&mut filename).await;
+        }
         let input = crate::engine::types::CreateTaskInput {
             url: url.clone(),
             save_dir,
             filename,
+            auth,
+            extra_headers,
         };
         let task = Task::new(input, supports_range, total_bytes);
+        if let Some((etag, last_modified)) = validation {
+            task.set_validation(etag, last_modified).await;
+        }
         let id = task.id.clone();
 
         // Auto-assign to default queue if queue manager is set
@@ -336,7 +375,12 @@ impl Scheduler {
         let task_clone = task.clone();
         let task_id_s = task_id.to_string();
         let url = task.url.clone();
-        let net_opts = network_options.unwrap_or_default();
+        // 全局设置 + 任务级认证/请求头（任务级优先）
+        let mut net_opts = network_options.unwrap_or_default();
+        net_opts.auth = task.auth.clone().or(net_opts.auth);
+        for (k, v) in &task.extra_headers {
+            net_opts.extra_headers.push((k.clone(), v.clone()));
+        }
         let client = match build_client_from_options(&net_opts) {
             Ok(c) => std::sync::Arc::new(c),
             Err(e) => {
@@ -384,8 +428,10 @@ impl Scheduler {
                     let tid = task_id_clone.clone();
                     let client_ref = client.clone();
                     let retries = max_retries;
+                    let opts_ref = net_opts.clone();
+                    let bucket_ref = scheduler_clone.speed_limit.clone();
                     handles.push(tokio::spawn(async move {
-                        run_worker(task_ref, &url_ref, tx_w, ah, &tid, &client_ref, retries).await;
+                        run_worker(task_ref, &url_ref, tx_w, ah, &tid, &client_ref, retries, &opts_ref, &bucket_ref).await;
                     }));
                 }
                 for h in handles {
@@ -983,6 +1029,7 @@ impl Scheduler {
             crate::engine::schedule::ScheduleType::SpeedLimit => {
                 if let Some(kbps) = rule.speed_limit_kbps {
                     self.schedule_manager.set_speed_limit(Some(kbps), true).await;
+                    self.set_effective_speed_limit(Some(kbps as u64)).await;
                 }
                 Ok(())
             }
@@ -1003,6 +1050,7 @@ impl Clone for Scheduler {
             schedule_enabled: self.schedule_enabled.clone(),
             limits: self.limits.clone(),
             duplicate_action: self.duplicate_action.clone(),
+            speed_limit: self.speed_limit.clone(),
         }
     }
 }
@@ -1052,67 +1100,247 @@ async fn run_worker(
     _task_id: &str,
     client: &Client,
     max_retries: u32,
+    net_opts: &NetworkOptions,
+    bucket: &TokenBucket,
 ) {
+    use futures_util::StreamExt;
+
     loop {
         let status = *task.status.lock().await;
-        if status == TaskStatus::Paused || status == TaskStatus::Cancelled || status == TaskStatus::Completed || status == TaskStatus::Failed {
+        if status == TaskStatus::Paused
+            || status == TaskStatus::Cancelled
+            || status == TaskStatus::Completed
+            || status == TaskStatus::Failed
+        {
             break;
         }
         let Some((start, end)) = task.take_next_segment() else {
             break;
         };
-        let len = end - start + 1;
-        // 分段级重试：瞬时网络错误按指数退避重取同一段，耗尽后才判任务失败
+        let if_range = task.etag.lock().await.clone();
+
+        // 下载单个分段：网络错误按指数退避重试同一段，耗尽后才判任务失败；
+        // 远端文件变更（If-Range 未满足）则重置任务全量重下
         let mut attempt: u32 = 0;
-        let data = loop {
-            match fetch_range_with_client(client, url, start, end).await {
-                Ok(data) => break Ok(data),
+        loop {
+            let mut written: u64 = 0;
+            let mut offset = start;
+            let outcome = match crate::network::open_range(
+                client,
+                url,
+                start,
+                end,
+                if_range.as_deref(),
+                net_opts,
+            )
+            .await
+            {
+                Ok(crate::network::RangeResponse::FileChanged { etag, last_modified }) => {
+                    task.reset_for_restart(etag, last_modified).await;
+                    if let Some(app) = &app_handle {
+                        let _ = app.emit("download-progress", ());
+                    }
+                    Ok(false)
+                }
+                Ok(crate::network::RangeResponse::Body { resp, etag, last_modified }) => {
+                    // 首个成功响应回填校验字段（探测未带 etag 的场景）
+                    task.set_validation(etag, last_modified).await;
+                    let mut stream = resp.bytes_stream();
+                    let mut stream_result: Result<(), crate::network::NetworkError> = Ok(());
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(chunk) => {
+                                let len = chunk.len() as u64;
+                                bucket.acquire(chunk.len()).await;
+                                if tx.send((offset, chunk)).await.is_err() {
+                                    break;
+                                }
+                                offset += len;
+                                written += len;
+                                task.add_downloaded(len);
+                                task.set_speed_sample(task.downloaded_bytes());
+                                if let Some(app) = &app_handle {
+                                    let _ = app.emit("download-progress", ());
+                                }
+                            }
+                            Err(e) => {
+                                stream_result = Err(crate::network::NetworkError::from(e));
+                                break;
+                            }
+                        }
+                    }
+                    match stream_result {
+                        Ok(()) => Ok(true),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+
+            match outcome {
+                Ok(true) => break,          // 段完成
+                Ok(false) => return,        // 远端文件已变更并重置，退出本 worker 由新段驱动
                 Err(e) => {
+                    // 回退已计入的进度并重试整段
+                    if written > 0 {
+                        task.sub_downloaded(written);
+                    }
+                    let st = *task.status.lock().await;
+                    if st == TaskStatus::Paused || st == TaskStatus::Cancelled {
+                        task.return_segment(start, end).await;
+                        if let Some(app) = &app_handle {
+                            let _ = app.emit("download-progress", ());
+                        }
+                        return;
+                    }
                     if attempt >= max_retries {
-                        break Err(e);
+                        let _ = task.error_message.lock().await.insert(e.to_string());
+                        let mut st = task.status.lock().await;
+                        *st = TaskStatus::Failed;
+                        if let Some(app) = &app_handle {
+                            let _ = app.emit("download-finished", (
+                                _task_id.to_string(),
+                                "failed".to_string(),
+                                task.filename.clone(),
+                            ));
+                        }
+                        return;
                     }
                     attempt += 1;
                     let backoff = std::time::Duration::from_secs(1u64 << (attempt.min(3u32) - 1));
                     tokio::time::sleep(backoff).await;
-                    // 重试等待期间被用户暂停/取消则放弃本段
-                    let st = *task.status.lock().await;
-                    if st == TaskStatus::Paused || st == TaskStatus::Cancelled {
-                        break Err(e);
-                    }
                 }
-            }
-        };
-        match data {
-            Ok(data) => {
-                if data.len() as u64 != len {
-                    // 可能服务器返回不完整，仍写入
-                }
-                task.add_downloaded(data.len() as u64);
-                task.set_speed_sample(task.downloaded_bytes());
-                if tx.send((start, data)).await.is_err() {
-                    break;
-                }
-                if let Some(app) = &app_handle {
-                    let _ = app.emit("download-progress", ());
-                }
-            }
-            Err(e) => {
-                let _ = task
-                    .error_message
-                    .lock()
-                    .await
-                    .insert(e.to_string());
-                let mut st = task.status.lock().await;
-                *st = TaskStatus::Failed;
-                if let Some(app) = &app_handle {
-                    let _ = app.emit("download-finished", (
-                        _task_id.to_string(),
-                        "failed".to_string(),
-                        task.filename.clone(),
-                    ));
-                }
-                break;
             }
         }
+    }
+}
+
+// ── 单元测试 ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scheduler() -> Scheduler {
+        Scheduler::new(None)
+    }
+
+    #[tokio::test]
+    async fn duplicate_skip_rejects() {
+        let s = scheduler();
+        let mut settings = crate::settings::AppSettings::default();
+        settings.duplicate_action = "skip".to_string();
+        s.update_from_settings(&settings);
+        let id = s
+            .create_task_internal(
+                "http://example.com/f.zip".into(),
+                ".".into(),
+                None,
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(100),
+                    suggested_filename: "f.zip".into(),
+                    final_url: "http://example.com/f.zip".into(),
+                    etag: None,
+                    last_modified: None,
+                }),
+                false,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let again = s
+            .create_task_internal(
+                "http://example.com/f.zip".into(),
+                ".".into(),
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+            )
+            .await;
+        assert!(again.is_err());
+        // force 绕过查重
+        let forced = s
+            .create_task_internal(
+                "http://example.com/f.zip".into(),
+                ".".into(),
+                None,
+                None,
+                true,
+                None,
+                Vec::new(),
+            )
+            .await;
+        assert!(forced.is_ok());
+        assert_ne!(forced.unwrap(), id);
+    }
+
+    #[tokio::test]
+    async fn duplicate_rename_avoids_conflict() {
+        let s = scheduler();
+        let mut settings = crate::settings::AppSettings::default();
+        settings.duplicate_action = "rename".to_string();
+        s.update_from_settings(&settings);
+        s.create_task_internal(
+            "http://example.com/a.zip".into(),
+            ".".into(),
+            None,
+            Some(ProbeResult {
+                supports_range: true,
+                total_bytes: Some(100),
+                suggested_filename: "a.zip".into(),
+                final_url: "http://example.com/a.zip".into(),
+                etag: None,
+                last_modified: None,
+            }),
+            false,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let second = s
+            .create_task_internal(
+                "http://example.com/a.zip".into(),
+                ".".into(),
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let tasks = s.tasks.lock().await;
+        let names: Vec<String> = tasks.values().map(|t| t.filename.clone()).collect();
+        assert!(names.contains(&"a (1).zip".to_string()), "names={:?}", names);
+        assert_eq!(names.len(), 2);
+        let _ = second;
+    }
+
+    #[test]
+    fn filename_dedup() {
+        let mut taken = std::collections::HashSet::new();
+        taken.insert("a (1).zip".to_string());
+        assert_eq!(next_available_filename("a.zip", &taken), "a (2).zip");
+        let empty = std::collections::HashSet::new();
+        assert_eq!(next_available_filename("a.zip", &empty), "a (1).zip");
+        assert_eq!(next_available_filename("noext", &empty), "noext (1)");
+    }
+
+    #[test]
+    fn limits_from_settings() {
+        let s = scheduler();
+        let mut settings = crate::settings::AppSettings::default();
+        settings.max_concurrent_tasks = 2;
+        settings.max_retries = 5;
+        settings.global_speed_limit_kbps = 512;
+        s.update_from_settings(&settings);
+        assert_eq!(s.limits.lock().max_concurrent_tasks, 2);
+        assert_eq!(s.limits.lock().max_retries, 5);
+        assert_eq!(s.speed_limit.rate_bps(), 512 * 1024);
     }
 }

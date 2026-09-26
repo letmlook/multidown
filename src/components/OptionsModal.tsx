@@ -54,6 +54,7 @@ const defaultSettings: AppSettings = {
   notification_on_fail: true,
   timeout_secs: 30,
   save_progress_interval_secs: 30,
+  global_speed_limit_kbps: 0,
 };
 
 function newRule(): CategoryRule {
@@ -760,6 +761,19 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     <span style={{ color: "#666", fontSize: 12, marginLeft: 8 }}>
                       网络出错时自动重试，0 表示不重试
                     </span>
+                  </div>
+                  <div className="form-group">
+                    <label>全局下载限速（KB/s）</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        value={settings.global_speed_limit_kbps ?? 0}
+                        onChange={(e) => update({ global_speed_limit_kbps: Number(e.target.value) || 0 })}
+                        style={{ width: 100, padding: "6px 10px" }}
+                      />
+                      <span style={{ color: "#666", fontSize: 12 }}>0 表示不限速</span>
+                    </div>
                   </div>
                   <div className="form-group">
                     <label>请求超时（秒）</label>

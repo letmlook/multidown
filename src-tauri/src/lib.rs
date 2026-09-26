@@ -8,7 +8,7 @@ mod network;
 mod settings;
 
 use engine::scheduler::Scheduler;
-use network::{NetworkOptions, ProbeResult};
+use network::{AuthConfig, NetworkOptions, ProbeResult};
 use settings::proxy::{
     load_proxy_store, save_proxy_store, ProxyConfig, ProxyMatchType,
     ProxyRule, ProxyTestResult, ProxyType,
@@ -694,6 +694,25 @@ async fn probe_download(
         .map_err(|e: network::NetworkError| e.to_string())
 }
 
+/// 按代理类型解析实际代理地址：none / system / manual
+fn effective_proxy_url(settings: &AppSettings) -> Option<String> {
+    match settings.proxy_type.as_str() {
+        "manual" => settings.proxy_url(),
+        "system" => network::detect_system_proxy(),
+        _ => None,
+    }
+}
+
+/// 从应用设置构建网络选项（代理 / 超时 / 默认 User-Agent）
+fn network_options_from_settings(settings: &AppSettings) -> NetworkOptions {
+    NetworkOptions {
+        proxy_url: effective_proxy_url(settings),
+        timeout_secs: settings.timeout_secs,
+        user_agent: Some(settings.user_agent.clone()).filter(|s| !s.is_empty()),
+        ..Default::default()
+    }
+}
+
 async fn network_options_from_app(app: &tauri::AppHandle) -> NetworkOptions {
     let path = match app_settings_path(app) {
         Ok(p) => p,
@@ -703,10 +722,7 @@ async fn network_options_from_app(app: &tauri::AppHandle) -> NetworkOptions {
         Ok(s) => s,
         Err(_) => return NetworkOptions::default(),
     };
-    NetworkOptions {
-        proxy_url: settings.proxy_url(),
-        timeout_secs: settings.timeout_secs,
-    }
+    network_options_from_settings(&settings)
 }
 
 #[tauri::command]
@@ -715,10 +731,20 @@ async fn create_download(
     save_dir: String,
     filename: Option<String>,
     force: Option<bool>,
+    auth: Option<AuthConfig>,
+    headers: Option<Vec<(String, String)>>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
     state
-        .create_task_internal(url, save_dir, filename, None, force.unwrap_or(false))
+        .create_task_internal(
+            url,
+            save_dir,
+            filename,
+            None,
+            force.unwrap_or(false),
+            auth,
+            headers.unwrap_or_default(),
+        )
         .await
 }
 
@@ -729,10 +755,20 @@ async fn create_download_with_probe(
     filename: Option<String>,
     probe_result: Option<ProbeResult>,
     force: Option<bool>,
+    auth: Option<AuthConfig>,
+    headers: Option<Vec<(String, String)>>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
     state
-        .create_task_internal(url, save_dir, filename, probe_result, force.unwrap_or(false))
+        .create_task_internal(
+            url,
+            save_dir,
+            filename,
+            probe_result,
+            force.unwrap_or(false),
+            auth,
+            headers.unwrap_or_default(),
+        )
         .await
 }
 
@@ -746,10 +782,7 @@ async fn start_download(
     let path = app_settings_path(&app_handle)?;
     let settings = load_settings(&path).unwrap_or_default();
     let max_connections = Some(settings.max_connections_per_task as usize);
-    let net_opts = NetworkOptions {
-        proxy_url: settings.proxy_url(),
-        timeout_secs: settings.timeout_secs,
-    };
+    let net_opts = network_options_from_settings(&settings);
     state
         .start_download(
             &task_id,
@@ -776,10 +809,7 @@ async fn resume_download(
     let path = app_settings_path(&app_handle)?;
     let settings = load_settings(&path).unwrap_or_default();
     let max_connections = Some(settings.max_connections_per_task as usize);
-    let net_opts = NetworkOptions {
-        proxy_url: settings.proxy_url(),
-        timeout_secs: settings.timeout_secs,
-    };
+    let net_opts = network_options_from_settings(&settings);
     state
         .resume_task(
             &task_id,
@@ -2004,14 +2034,26 @@ pub fn run() {
                             let DownloadTask {
                                 url,
                                 filename,
-                                referer: _,
-                                user_agent: _,
-                                cookie: _,
+                                referer,
+                                user_agent,
+                                cookie,
                                 post_data: _,
                                 save_path,
                                 open_window,
                                 responder,
                             } = task;
+
+                            // 扩展传来的 Referer/Cookie/User-Agent 转为任务级请求头
+                            let mut ext_headers: Vec<(String, String)> = Vec::new();
+                            if let Some(r) = referer.filter(|s| !s.is_empty()) {
+                                ext_headers.push(("Referer".to_string(), r));
+                            }
+                            if let Some(c) = cookie.filter(|s| !s.is_empty()) {
+                                ext_headers.push(("Cookie".to_string(), c));
+                            }
+                            if let Some(ua) = user_agent.filter(|s| !s.is_empty()) {
+                                ext_headers.push(("User-Agent".to_string(), ua));
+                            }
 
                             let settings = app_settings_path(&app_worker)
                                 .ok()
@@ -2042,7 +2084,10 @@ pub fn run() {
                             }
 
                             let save_dir = save_path.unwrap_or_else(|| default_save_dir_for_browser(&app_worker));
-                            let result = match sched_worker.create_task(url.clone(), save_dir, filename, None).await {
+                            let result = match sched_worker
+                                .create_task_internal(url.clone(), save_dir, filename, None, false, None, ext_headers)
+                                .await
+                            {
                                 Ok(id) => {
                                     let path = match app_settings_path(&app_worker) {
                                         Ok(p) => p,
@@ -2052,10 +2097,7 @@ pub fn run() {
                                         }
                                     };
                                     let settings = load_settings(&path).unwrap_or_default();
-                                    let net_opts = NetworkOptions {
-                                        proxy_url: settings.proxy_url(),
-                                        timeout_secs: settings.timeout_secs,
-                                    };
+                                    let net_opts = network_options_from_settings(&settings);
                                     match sched_worker
                                         .start_download(
                                             &id,
@@ -2106,10 +2148,7 @@ pub fn run() {
                                             }
                                         };
                                         let settings = load_settings(&path).unwrap_or_default();
-                                        let net_opts = NetworkOptions {
-                                            proxy_url: settings.proxy_url(),
-                                            timeout_secs: settings.timeout_secs,
-                                        };
+                                        let net_opts = network_options_from_settings(&settings);
                                         match sched_worker
                                             .start_download(
                                                 &id,

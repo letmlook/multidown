@@ -392,7 +392,16 @@ fn parse_url_with_extras(line: &str) -> (String, Option<String>) {
 }
 
 fn is_valid_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return false;
+    }
+    // host 必须含点（域名/IP）或为 localhost，排除 "http://invalid" 这类伪 URL
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = host.split('/').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("");
+    !host.is_empty() && (host.contains('.') || host.eq_ignore_ascii_case("localhost"))
 }
 
 /// 应用文件名模板
@@ -507,6 +516,6 @@ mod tests {
     #[test]
     fn test_sanitize_filename() {
         let result = sanitize_filename("file:name?.mp4");
-        assert_eq!(result, "file_name__.mp4");
+        assert_eq!(result, "file_name_.mp4");
     }
 }

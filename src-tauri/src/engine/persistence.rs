@@ -19,6 +19,14 @@ pub struct PersistedTask {
     pub pending_segments: Vec<(u64, u64)>,
     pub supports_range: bool,
     pub created_at: i64,
+    #[serde(default)]
+    pub auth: Option<crate::network::AuthConfig>,
+    #[serde(default)]
+    pub extra_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 pub fn tasks_to_json(tasks: &[PersistedTask]) -> Result<String, serde_json::Error> {
@@ -62,6 +70,10 @@ impl Task {
             created_at: p.created_at,
             last_downloaded: Arc::new(AtomicU64::new(0)),
             last_speed_time: Arc::new(Mutex::new(None)),
+            auth: p.auth,
+            extra_headers: p.extra_headers,
+            etag: Arc::new(Mutex::new(p.etag)),
+            last_modified: Arc::new(Mutex::new(p.last_modified)),
         }
     }
 }
@@ -88,6 +100,10 @@ impl PersistedTask {
             pending_segments: pending,
             supports_range: task.supports_range,
             created_at: task.created_at,
+            auth: task.auth.clone(),
+            extra_headers: task.extra_headers.clone(),
+            etag: task.etag.lock().await.clone(),
+            last_modified: task.last_modified.lock().await.clone(),
         }
     }
 }

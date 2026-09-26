@@ -239,6 +239,7 @@ fn proxy_config_to_network_options(config: &ProxyConfig) -> Option<NetworkOption
     config.to_authenticated_url().map(|url| NetworkOptions {
         proxy_url: Some(url),
         timeout_secs: 30,
+        ..Default::default()
     })
 }
 

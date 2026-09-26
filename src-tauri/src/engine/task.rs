@@ -1,4 +1,5 @@
 use crate::engine::types::{CreateTaskInput, TaskId, TaskStatus, MIN_SEGMENT_SIZE};
+use crate::network::AuthConfig;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -25,6 +26,13 @@ pub struct Task {
     #[allow(dead_code)]
     pub last_downloaded: Arc<AtomicU64>,
     pub last_speed_time: Arc<Mutex<Option<(u64, std::time::Instant)>>>,
+    /// HTTP 认证（创建时指定，只读）
+    pub auth: Option<AuthConfig>,
+    /// 任务级附加请求头（创建时指定，只读）
+    pub extra_headers: Vec<(String, String)>,
+    /// 续传一致性校验：远端 ETag / Last-Modified
+    pub etag: Arc<Mutex<Option<String>>>,
+    pub last_modified: Arc<Mutex<Option<String>>>,
 }
 
 impl Task {
@@ -68,6 +76,10 @@ impl Task {
                 .as_secs() as i64,
             last_downloaded: Arc::new(AtomicU64::new(0)),
             last_speed_time: Arc::new(Mutex::new(None)),
+            auth: input.auth,
+            extra_headers: input.extra_headers,
+            etag: Arc::new(Mutex::new(None)),
+            last_modified: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -105,6 +117,16 @@ impl Task {
         self.downloaded.fetch_add(delta, Ordering::Relaxed);
     }
 
+    /// 下载中断时回退本段已计入的进度（重试会重新下载整段）
+    pub fn sub_downloaded(&self, delta: u64) {
+        self.downloaded.fetch_sub(delta, Ordering::Relaxed);
+    }
+
+    /// 把未完成的段放回待下载队列（暂停/取消时避免数据区间丢失）
+    pub async fn return_segment(&self, start: u64, end: u64) {
+        self.pending_segments.lock().await.push_back((start, end));
+    }
+
     pub fn set_speed_sample(&self, downloaded: u64) {
         let now = std::time::Instant::now();
         let mut last = self.last_speed_time.try_lock().ok();
@@ -122,5 +144,29 @@ impl Task {
         }
         let current = self.downloaded.load(Ordering::Relaxed);
         Some((current.saturating_sub(prev_dl)) / elapsed)
+    }
+
+    /// 远端文件已变更时重置：清空进度、恢复全量段，更新一致性校验字段
+    pub async fn reset_for_restart(&self, etag: Option<String>, last_modified: Option<String>) {
+        if let Some(total) = self.total_bytes.filter(|&t| t > 0) {
+            *self.pending_segments.lock().await =
+                VecDeque::from_iter(std::iter::once((0, total - 1)));
+        }
+        self.downloaded.store(0, Ordering::Relaxed);
+        *self.error_message.lock().await = None;
+        *self.etag.lock().await = etag;
+        *self.last_modified.lock().await = last_modified;
+    }
+
+    /// 任务创建后（或恢复时）回填探测得到的一致性校验字段
+    pub async fn set_validation(&self, etag: Option<String>, last_modified: Option<String>) {
+        let mut e = self.etag.lock().await;
+        if e.is_none() {
+            *e = etag;
+        }
+        let mut lm = self.last_modified.lock().await;
+        if lm.is_none() {
+            *lm = last_modified;
+        }
     }
 }

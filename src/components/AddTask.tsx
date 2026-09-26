@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState, useEffect } from "react";
-import type { AppSettings, ProbeResult } from "../types/download";
+import type { AppSettings, AuthConfig, ProbeResult } from "../types/download";
 
 interface AddTaskProps {
   open: boolean;
@@ -65,22 +65,24 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
     setLoading(true);
     try {
       const dir = saveDir.trim() || ".";
+      // 勾选授权且填写了用户名时启用 Basic 认证
+      const auth: AuthConfig | undefined =
+        useAuth && username.trim()
+          ? { kind: "basic", username: username.trim(), password }
+          : undefined;
+      const createArgs = {
+        url: url.trim(),
+        saveDir: dir,
+        filename: filename.trim() || undefined,
+        auth,
+      };
       let taskId: string;
       try {
-        taskId = await invoke<string>("create_download", {
-          url: url.trim(),
-          saveDir: dir,
-          filename: filename.trim() || undefined,
-        });
+        taskId = await invoke<string>("create_download", createArgs);
       } catch (err) {
         if (String(err) !== DUPLICATE_ASK) throw err;
         if (!window.confirm("已存在相同地址的任务，仍然重新下载吗？")) return;
-        taskId = await invoke<string>("create_download", {
-          url: url.trim(),
-          saveDir: dir,
-          filename: filename.trim() || undefined,
-          force: true,
-        });
+        taskId = await invoke<string>("create_download", { ...createArgs, force: true });
       }
       await invoke("start_download", { taskId });
       try {
