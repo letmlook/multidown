@@ -17,6 +17,7 @@ use settings::{load_settings, save_settings, settings_path, AppSettings};
 use engine::TaskStatus;
 use std::sync::Arc;
 use tauri::{Manager, State};
+use tauri::Emitter;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -656,7 +657,28 @@ async fn get_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
 #[tauri::command]
 async fn set_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
     let path = app_settings_path(&app)?;
-    save_settings(&path, &settings).await.map_err(|e| e.to_string())
+    save_settings(&path, &settings).await.map_err(|e| e.to_string())?;
+    // 同步引擎限制（全局并发/重试次数/重复链接策略）
+    if let Some(scheduler) = app.try_state::<Arc<Scheduler>>() {
+        scheduler.update_from_settings(&settings);
+    }
+    // 同步开机自启
+    sync_autostart(&app, settings.run_at_startup);
+    Ok(())
+}
+
+/// 按设置开启/关闭开机自启（失败仅记录日志，不影响设置保存）
+fn sync_autostart(app: &tauri::AppHandle, enabled: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let autostart = app.autolaunch();
+    let result = if enabled {
+        autostart.enable()
+    } else {
+        autostart.disable()
+    };
+    if let Err(e) = result {
+        debug_log(app, "设置开机自启失败", Some(&e.to_string()));
+    }
 }
 
 #[tauri::command]
@@ -692,10 +714,11 @@ async fn create_download(
     url: String,
     save_dir: String,
     filename: Option<String>,
+    force: Option<bool>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
     state
-        .create_task(url, save_dir, filename, None)
+        .create_task_internal(url, save_dir, filename, None, force.unwrap_or(false))
         .await
 }
 
@@ -705,10 +728,11 @@ async fn create_download_with_probe(
     save_dir: String,
     filename: Option<String>,
     probe_result: Option<ProbeResult>,
+    force: Option<bool>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
     state
-        .create_task(url, save_dir, filename, probe_result)
+        .create_task_internal(url, save_dir, filename, probe_result, force.unwrap_or(false))
         .await
 }
 
@@ -1629,6 +1653,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let path = app
                 .path()
@@ -1639,6 +1667,13 @@ pub fn run() {
             let scheduler = Arc::new(scheduler);
             let sched_clone = scheduler.clone();
             let app_handle = app.handle().clone();
+            // 启动时同步引擎限制与开机自启状态
+            if let Ok(settings_path) = app_settings_path(&app_handle) {
+                if let Ok(settings) = load_settings(&settings_path) {
+                    scheduler.update_from_settings(&settings);
+                    sync_autostart(&app_handle, settings.run_at_startup);
+                }
+            }
             app.manage(scheduler);
             
             // 检查是否首次运行，如果是则自动安装扩展
@@ -1977,7 +2012,35 @@ pub fn run() {
                                 open_window,
                                 responder,
                             } = task;
-                            
+
+                            let settings = app_settings_path(&app_worker)
+                                .ok()
+                                .and_then(|p| load_settings(&p).ok())
+                                .unwrap_or_default();
+
+                            // 显示主窗口
+                            let show_main = |app: &tauri::AppHandle| {
+                                if let Some(window) = app.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.unminimize();
+                                    let _ = window.set_focus();
+                                }
+                            };
+
+                            // 开启"显示开始下载对话框"时：不自动创建任务，
+                            // 改为通知前端弹出下载信息确认框
+                            if settings.show_start_dialog {
+                                if open_window {
+                                    show_main(&app_worker);
+                                }
+                                let _ = app_worker.emit(
+                                    "extension-download-request",
+                                    serde_json::json!({ "url": url, "filename": filename }),
+                                );
+                                let _ = responder.send(Ok(()));
+                                continue;
+                            }
+
                             let save_dir = save_path.unwrap_or_else(|| default_save_dir_for_browser(&app_worker));
                             let result = match sched_worker.create_task(url.clone(), save_dir, filename, None).await {
                                 Ok(id) => {
@@ -2006,17 +2069,15 @@ pub fn run() {
                                         Ok(()) => {
                                             // 如果需要打开窗口，显示主窗口
                                             if open_window {
-                                                if let Some(window) = app_worker.get_webview_window("main") {
-                                                    let _ = window.show();
-                                                    let _ = window.unminimize();
-                                                    let _ = window.set_focus();
-                                                }
+                                                show_main(&app_worker);
                                             }
                                             Ok(())
                                         },
                                         Err(e) => Err(e),
                                     }
                                 }
+                                // 重复链接且策略为 ask：非交互路径视为已存在，不报错
+                                Err(e) if e == engine::scheduler::ERR_DUPLICATE_ASK => Ok(()),
                                 Err(e) => Err(e),
                             };
                             let _ = responder.send(result);
@@ -2063,6 +2124,8 @@ pub fn run() {
                                             Err(e) => Err(e),
                                         }
                                     }
+                                    // 重复链接且策略为 ask：非交互路径视为已存在，不报错
+                                    Err(e) if e == engine::scheduler::ERR_DUPLICATE_ASK => Ok(()),
                                     Err(e) => Err(e),
                                 };
                                 let _ = responder.send(result);

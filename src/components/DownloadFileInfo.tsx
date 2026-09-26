@@ -25,6 +25,8 @@ interface DownloadFileInfoProps {
   onAdded: () => void;
 }
 
+const DUPLICATE_ASK = "DUPLICATE_ASK";
+
 export function DownloadFileInfo({
   open,
   initialUrl = "",
@@ -82,6 +84,21 @@ export function DownloadFileInfo({
     return { saveDir, filename };
   };
 
+  // 返回 null 表示用户取消；否则返回创建好的任务 ID
+  const createTaskWithDuplicateCheck = async (
+    url: string,
+    saveDir: string,
+    filename: string | undefined
+  ): Promise<string | null> => {
+    try {
+      return await invoke<string>("create_download", { url, saveDir, filename });
+    } catch (err) {
+      if (String(err) !== DUPLICATE_ASK) throw err;
+      if (!window.confirm("已存在相同地址的任务，仍然重新下载吗？")) return null;
+      return invoke<string>("create_download", { url, saveDir, filename, force: true });
+    }
+  };
+
   const handleStartDownload = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!url.trim()) return;
@@ -89,11 +106,8 @@ export function DownloadFileInfo({
     setLoading(true);
     try {
       const { saveDir, filename } = parseSavePath();
-      const taskId = await invoke<string>("create_download", {
-        url: url.trim(),
-        saveDir,
-        filename: filename || undefined,
-      });
+      const taskId = await createTaskWithDuplicateCheck(url.trim(), saveDir, filename || undefined);
+      if (taskId == null) return;
       await invoke("start_download", { taskId });
       onAdded();
       onClose();
@@ -111,11 +125,8 @@ export function DownloadFileInfo({
     setLoading(true);
     try {
       const { saveDir, filename } = parseSavePath();
-      await invoke<string>("create_download", {
-        url: url.trim(),
-        saveDir,
-        filename: filename || undefined,
-      });
+      const taskId = await createTaskWithDuplicateCheck(url.trim(), saveDir, filename || undefined);
+      if (taskId == null) return;
       onAdded();
       onClose();
     } catch (e) {

@@ -20,6 +20,24 @@ use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::{mpsc, RwLock};
 
+/// 引擎级限制：来自应用设置，随 set_settings 实时更新
+#[derive(Debug, Clone)]
+pub struct EngineLimits {
+    /// 全局同时下载的任务数上限
+    pub max_concurrent_tasks: usize,
+    /// 任务失败自动重试次数（0 表示不重试）
+    pub max_retries: u32,
+}
+
+impl Default for EngineLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_tasks: 8,
+            max_retries: 3,
+        }
+    }
+}
+
 pub struct Scheduler {
     tasks: Arc<AsyncMutex<HashMap<TaskId, Arc<Task>>>>,
     save_path: Option<PathBuf>,
@@ -34,7 +52,14 @@ pub struct Scheduler {
     schedule_manager: Arc<ScheduleManager>,
     /// Global schedule on/off switch
     schedule_enabled: Arc<ParkingMutex<bool>>,
+    /// 引擎限制（全局并发 / 重试次数）
+    limits: Arc<ParkingMutex<EngineLimits>>,
+    /// 重复链接处理：ask | skip | overwrite | rename
+    duplicate_action: Arc<ParkingMutex<String>>,
 }
+
+/// 重复链接创建被拒绝时的错误标记；前端据此弹确认框后以 force 重试
+pub const ERR_DUPLICATE_ASK: &str = "DUPLICATE_ASK";
 
 impl Scheduler {
     pub fn new(save_path: Option<PathBuf>) -> Self {
@@ -47,12 +72,23 @@ impl Scheduler {
             rule_manager: Arc::new(RwLock::new(Vec::new())),
             schedule_manager: Arc::new(ScheduleManager::new()),
             schedule_enabled: Arc::new(ParkingMutex::new(true)),
+            limits: Arc::new(ParkingMutex::new(EngineLimits::default())),
+            duplicate_action: Arc::new(ParkingMutex::new("ask".to_string())),
         }
     }
 
     /// Set the queue manager reference
     pub fn set_queue_manager(&mut self, qm: GlobalQueueManager) {
         self.queue_manager = Some(qm);
+    }
+
+    /// 从应用设置同步引擎限制与重复链接策略（启动时与 set_settings 时调用）
+    pub fn update_from_settings(&self, settings: &crate::settings::AppSettings) {
+        *self.limits.lock() = EngineLimits {
+            max_concurrent_tasks: (settings.max_concurrent_tasks as usize).max(1),
+            max_retries: settings.max_retries,
+        };
+        *self.duplicate_action.lock() = settings.duplicate_action.clone();
     }
 
     /// 从持久化文件加载任务（启动时调用）
@@ -71,6 +107,8 @@ impl Scheduler {
             rule_manager: Arc::new(RwLock::new(Vec::new())),
             schedule_manager: Arc::new(ScheduleManager::new()),
             schedule_enabled: Arc::new(ParkingMutex::new(true)),
+            limits: Arc::new(ParkingMutex::new(EngineLimits::default())),
+            duplicate_action: Arc::new(ParkingMutex::new("ask".to_string())),
         })
     }
 
@@ -100,6 +138,52 @@ impl Scheduler {
         probe_with_options(url, options).await
     }
 
+    /// 查找相同 URL 的已有任务（排除已取消）
+    async fn find_duplicate(&self, url: &str) -> Option<TaskId> {
+        let tasks = self.tasks.lock().await;
+        tasks
+            .values()
+            .find(|t| {
+                t.url == url
+                    && {
+                        let st = t.status.try_lock();
+                        match st {
+                            Ok(s) => *s != TaskStatus::Cancelled,
+                            Err(_) => true, // 状态锁被持有（正在变更），保守视为存在
+                        }
+                    }
+            })
+            .map(|t| t.id.clone())
+    }
+
+    /// 按设置中的 duplicate_action 处理重复链接；返回 Err 表示拒绝创建
+    async fn handle_duplicate(&self, existing_id: &TaskId, filename: &mut Option<String>) -> Result<(), String> {
+        let action = self.duplicate_action.lock().clone();
+        match action.as_str() {
+            "overwrite" => {
+                // 移除旧任务记录后重新创建；新任务下载时会截断旧文件
+                self.remove_task(existing_id).await?;
+                Ok(())
+            }
+            "rename" => {
+                // 为新任务文件名追加序号，避免覆盖
+                let tasks = self.tasks.lock().await;
+                let existing_paths: std::collections::HashSet<String> = tasks
+                    .values()
+                    .map(|t| t.save_path.clone())
+                    .collect();
+                drop(tasks);
+                if let Some(f) = filename.as_ref() {
+                    *filename = Some(next_available_filename(f, &existing_paths));
+                }
+                Ok(())
+            }
+            "skip" => Err("重复下载：已存在相同地址的任务".to_string()),
+            // ask：返回特殊标记，交互端弹确认后以 force 重新调用；非交互端按 skip 处理
+            _ => Err(ERR_DUPLICATE_ASK.to_string()),
+        }
+    }
+
     pub async fn create_task(
         &self,
         url: String,
@@ -107,6 +191,23 @@ impl Scheduler {
         filename: Option<String>,
         probe_result: Option<ProbeResult>,
     ) -> Result<TaskId, String> {
+        self.create_task_internal(url, save_dir, filename, probe_result, false).await
+    }
+
+    pub async fn create_task_internal(
+        &self,
+        url: String,
+        save_dir: String,
+        mut filename: Option<String>,
+        probe_result: Option<ProbeResult>,
+        force: bool,
+    ) -> Result<TaskId, String> {
+        // 重复检测放在探测之前，避免多余的网络请求
+        if !force {
+            if let Some(existing_id) = self.find_duplicate(&url).await {
+                self.handle_duplicate(&existing_id, &mut filename).await?;
+            }
+        }
         let (supports_range, total_bytes, suggested_filename) = match probe_result {
             Some(p) => (p.supports_range, p.total_bytes, p.suggested_filename),
             None => {
@@ -122,13 +223,13 @@ impl Scheduler {
         };
         let task = Task::new(input, supports_range, total_bytes);
         let id = task.id.clone();
-        
+
         // Auto-assign to default queue if queue manager is set
         if let Some(ref qm) = self.queue_manager {
             let manager = qm.lock().await;
             let _ = manager.assign_task_to_queue(&id, &manager.default_queue_id).await;
         }
-        
+
         self.tasks.lock().await.insert(id.clone(), Arc::new(task));
         self.save_tasks().await;
         Ok(id)
@@ -136,25 +237,25 @@ impl Scheduler {
 
     /// Check if a queue can start more tasks based on its concurrency limit
     async fn can_start_for_queue(&self, queue_id: &str) -> Result<bool, String> {
-        // Get global max from queue manager settings (use default 8 if not set)
-        let global_max = 8usize;
-        
-        // Get queue-specific max
-        let queue_max = if let Some(ref qm) = self.queue_manager {
-            let manager = qm.lock().await;
-            if let Some(queue) = manager.queues.get(queue_id) {
-                queue.lock().max_concurrent as usize
-            } else {
-                3
-            }
-        } else {
-            3
-        };
+        // 全局并发上限来自设置
+        let global_max = self.limits.lock().max_concurrent_tasks;
 
         // Get current active count for this queue
         let active_count = {
             let counts = self.active_task_counts.lock();
             *counts.get(queue_id).unwrap_or(&0)
+        };
+
+        // 未配置队列管理器时只受全局上限约束
+        let queue_max = if let Some(ref qm) = self.queue_manager {
+            let manager = qm.lock().await;
+            if let Some(queue) = manager.queues.get(queue_id) {
+                queue.lock().max_concurrent as usize
+            } else {
+                usize::MAX
+            }
+        } else {
+            usize::MAX
         };
 
         // Check against both global and queue limits
@@ -198,7 +299,7 @@ impl Scheduler {
 
         // Check queue can accept more tasks
         if !self.can_start_for_queue(&queue_id).await? {
-            return Err("队列并发数已达上限".to_string());
+            return Err("已达到最大并发任务数上限".to_string());
         }
 
         let tasks = self.tasks.clone();
@@ -222,15 +323,10 @@ impl Scheduler {
         if let Some(parent) = std::path::Path::new(&task.save_path).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        let (tx, rx) = mpsc::channel::<WriterMessage>(32);
         let path = task.save_path.clone();
         let total_bytes = task.total_bytes;
         let scheduler_self = scheduler_for_save.clone().unwrap_or_else(|| Arc::new(self.clone()));
         let queue_id_clone = queue_id.clone();
-        
-        let writer_handle = tokio::spawn(async move {
-            let _ = run_file_writer(path, total_bytes, rx).await;
-        });
 
         let n_workers = if task.supports_range {
             max_connections.unwrap_or(8).max(1).min(32)
@@ -254,8 +350,6 @@ impl Scheduler {
                         task_clone.filename.clone(),
                     ));
                 }
-                drop(tx);
-                let _ = writer_handle.await;
                 scheduler_self.decrement_active(&queue_id_clone).await;
                 if let Some(s) = scheduler_for_save {
                     s.save_tasks().await;
@@ -268,43 +362,84 @@ impl Scheduler {
         let task_id_clone = task_id_s.clone();
         let scheduler_clone = scheduler_self.clone();
         let queue_id_final = queue_id.clone();
+        let max_retries = scheduler_self.limits.lock().max_retries;
 
         tokio::spawn(async move {
-            let mut handles = Vec::new();
-            for _ in 0..n_workers {
-                let task_ref = task_clone.clone();
-                let url_ref = url.clone();
-                let tx_w = tx.clone();
-                let ah = app_handle_clone.clone();
-                let tid = task_id_clone.clone();
-                let client_ref = client.clone();
-                handles.push(tokio::spawn(async move {
-                    run_worker(task_ref, &url_ref, tx_w, ah, &tid, &client_ref).await;
-                }));
-            }
-            for h in handles {
-                let _ = h.await;
-            }
-            drop(tx);
-            let _ = writer_handle.await;
+            let mut retry_attempts: u32 = 0;
+            loop {
+                // 每轮尝试独立创建 writer 与通道：失败重试时不截断已有数据
+                let (tx, rx) = mpsc::channel::<WriterMessage>(32);
+                let path_attempt = path.clone();
+                let total_attempt = total_bytes;
+                let writer_handle = tokio::spawn(async move {
+                    let _ = run_file_writer(path_attempt, total_attempt, rx).await;
+                });
 
-            // Decrement active count on completion
-            scheduler_clone.decrement_active(&queue_id_final).await;
+                let mut handles = Vec::new();
+                for _ in 0..n_workers {
+                    let task_ref = task_clone.clone();
+                    let url_ref = url.clone();
+                    let tx_w = tx.clone();
+                    let ah = app_handle_clone.clone();
+                    let tid = task_id_clone.clone();
+                    let client_ref = client.clone();
+                    let retries = max_retries;
+                    handles.push(tokio::spawn(async move {
+                        run_worker(task_ref, &url_ref, tx_w, ah, &tid, &client_ref, retries).await;
+                    }));
+                }
+                for h in handles {
+                    let _ = h.await;
+                }
+                drop(tx);
+                let _ = writer_handle.await;
 
-            let mut st = task_clone.status.lock().await;
-            if *st == TaskStatus::Downloading {
-                let pending = task_clone.pending_segments.lock().await;
-                if pending.is_empty() {
-                    *st = TaskStatus::Completed;
-                    if let Some(app) = &app_handle_clone {
-                        let _ = app.emit("download-finished", (
-                            task_id_clone.clone(),
-                            "completed".to_string(),
-                            task_clone.filename.clone(),
-                        ));
+                let final_status = *task_clone.status.lock().await;
+                if final_status == TaskStatus::Downloading {
+                    let pending = task_clone.pending_segments.lock().await;
+                    if pending.is_empty() {
+                        drop(pending);
+                        let mut st = task_clone.status.lock().await;
+                        *st = TaskStatus::Completed;
+                        if let Some(app) = &app_handle_clone {
+                            let _ = app.emit("download-finished", (
+                                task_id_clone.clone(),
+                                "completed".to_string(),
+                                task_clone.filename.clone(),
+                            ));
+                        }
+                        break;
                     }
                 }
+                // 任务级自动重试：worker 已把分段重试耗尽并标记 Failed
+                if final_status == TaskStatus::Failed && retry_attempts < max_retries {
+                    retry_attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let paused_or_cancelled = {
+                        let st = task_clone.status.lock().await;
+                        *st == TaskStatus::Paused || *st == TaskStatus::Cancelled
+                    };
+                    if paused_or_cancelled {
+                        break;
+                    }
+                    {
+                        let mut st = task_clone.status.lock().await;
+                        *st = TaskStatus::Downloading;
+                    }
+                    if let Some(app) = &app_handle_clone {
+                        let _ = app.emit("download-retry", (
+                            task_id_clone.clone(),
+                            retry_attempts,
+                            max_retries,
+                        ));
+                    }
+                    continue;
+                }
+                break;
             }
+
+            // Decrement active count on final completion
+            scheduler_clone.decrement_active(&queue_id_final).await;
             if let Some(app) = app_handle_clone {
                 let _ = app.emit("download-progress", ());
             }
@@ -866,6 +1001,8 @@ impl Clone for Scheduler {
             rule_manager: self.rule_manager.clone(),
             schedule_manager: self.schedule_manager.clone(),
             schedule_enabled: self.schedule_enabled.clone(),
+            limits: self.limits.clone(),
+            duplicate_action: self.duplicate_action.clone(),
         }
     }
 }
@@ -887,6 +1024,26 @@ async fn task_to_info(t: &Arc<Task>) -> TaskInfo {
     }
 }
 
+/// 为重复文件名生成不冲突的名称：a.zip → a (1).zip → a (2).zip
+fn next_available_filename(filename: &str, taken: &std::collections::HashSet<String>) -> String {
+    let candidate = |n: usize| {
+        let p = std::path::Path::new(filename);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or(filename);
+        let ext = p.extension().and_then(|s| s.to_str());
+        match ext {
+            Some(e) => format!("{} ({}).{}", stem, n, e),
+            None => format!("{} ({})", filename, n),
+        }
+    };
+    let mut n = 1usize;
+    let mut name = candidate(n);
+    while taken.contains(&name) {
+        n += 1;
+        name = candidate(n);
+    }
+    name
+}
+
 async fn run_worker(
     task: Arc<Task>,
     url: &str,
@@ -894,17 +1051,38 @@ async fn run_worker(
     app_handle: Option<tauri::AppHandle>,
     _task_id: &str,
     client: &Client,
+    max_retries: u32,
 ) {
     loop {
         let status = *task.status.lock().await;
-        if status == TaskStatus::Paused || status == TaskStatus::Cancelled || status == TaskStatus::Completed {
+        if status == TaskStatus::Paused || status == TaskStatus::Cancelled || status == TaskStatus::Completed || status == TaskStatus::Failed {
             break;
         }
         let Some((start, end)) = task.take_next_segment() else {
             break;
         };
         let len = end - start + 1;
-        match fetch_range_with_client(client, url, start, end).await {
+        // 分段级重试：瞬时网络错误按指数退避重取同一段，耗尽后才判任务失败
+        let mut attempt: u32 = 0;
+        let data = loop {
+            match fetch_range_with_client(client, url, start, end).await {
+                Ok(data) => break Ok(data),
+                Err(e) => {
+                    if attempt >= max_retries {
+                        break Err(e);
+                    }
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_secs(1u64 << (attempt.min(3u32) - 1));
+                    tokio::time::sleep(backoff).await;
+                    // 重试等待期间被用户暂停/取消则放弃本段
+                    let st = *task.status.lock().await;
+                    if st == TaskStatus::Paused || st == TaskStatus::Cancelled {
+                        break Err(e);
+                    }
+                }
+            }
+        };
+        match data {
             Ok(data) => {
                 if data.len() as u64 != len {
                     // 可能服务器返回不完整，仍写入

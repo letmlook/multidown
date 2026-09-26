@@ -32,3 +32,9 @@ Thumbs.db
 *.log
 npm-debug.log*
 pnpm-debug.log*
+
+# Download engine test artifacts
+src-tauri/download
+
+# Local security scanner state
+**/.mimosa/

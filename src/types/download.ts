@@ -30,6 +30,7 @@ export interface AppSettings {
   default_save_path: string;
   max_connections_per_task: number;
   max_concurrent_tasks: number;
+  max_retries: number;
   run_at_startup: boolean;
   clipboard_monitor: boolean;
   show_start_dialog: boolean;

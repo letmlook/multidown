@@ -20,12 +20,22 @@
 # 安装依赖
 npm install
 
+# 1. 先编译浏览器扩展 Native Messaging Host（打包资源依赖其产物）
+cd integration/native-host && cargo build --release && cd ../..
+
+# 2. 构建前端（Tauri 宏要求 dist/ 存在）
+npm run build
+
 # 开发模式（会启动 Vite + Tauri 窗口）
 npm run tauri:dev
 
-# 打包
+# 打包（包含 build:all = 前端 + 扩展 + CRX 签名）
 npm run tauri:build
 ```
+
+> 注意：跳过第 1、2 步会导致 `cargo check` / `tauri build` 失败——
+> `tauri.macos.conf.json` 将 native host 产物声明为打包资源，
+> `tauri::generate_context!` 宏要求 `frontendDist` 目录存在。
 
 打包产物在 `src-tauri/target/release/`（可执行文件）及 `src-tauri/target/release/bundle/`（安装包）。
 
@@ -57,10 +67,11 @@ multidown/
 
 ## 应用图标
 
-当前未配置图标（`tauri.conf.json` 中 `bundle.icon` 为空）。有 logo 后可执行：
+图标已生成于 `src-tauri/icons/`（含 macOS/Windows/Linux 所需尺寸）。如需更换，替换
+`src-tauri/icons/icon-1024.png` 后执行：
 
 ```bash
-npm run tauri icon path/to/your/icon.png
+npm run icons
 ```
 
 会生成各平台所需尺寸并写入 `src-tauri/icons/`。
@@ -116,9 +127,10 @@ npm run tauri icon path/to/your/icon.png
 
 ## 开发路线（规划）
 
-1. ~~**阶段一**：多连接 + 静态分段 + 断点续传（Rust 下载引擎 + 简单 UI）~~ ✅
-2. **阶段二**：动态分段 + 连接复用、设置页
-3. **阶段三**：浏览器扩展、通知与托盘、批量下载等
+1. ~~**阶段一**：多连接 + 动态分段 + 断点续传（Rust 下载引擎 + 简单 UI）~~ ✅
+2. ~~**阶段二**：设置页、托盘、通知、导入导出、队列~~ ✅（限速待做，见开发计划）
+3. ~~**阶段三**：浏览器扩展、通知与托盘、批量下载~~ ✅
+4. **阶段四**：分类规则/定时/代理/批次与引擎深度接线（进行中，见 [开发计划](./docs/开发计划.md)）
 
 ## License
 

@@ -7,6 +7,10 @@ pub mod proxy;
 
 const SETTINGS_FILENAME: &str = "multidown_settings.json";
 
+fn default_max_retries() -> u32 {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct AppSettings {
@@ -14,8 +18,11 @@ pub struct AppSettings {
     pub default_save_path: String,
     /// 每任务最大连接数
     pub max_connections_per_task: u32,
-    /// 全局最大并发任务数（暂未用）
+    /// 全局最大并发任务数
     pub max_concurrent_tasks: u32,
+    /// 任务失败自动重试次数（0 表示不重试）
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
     /// 系统启动时运行
     pub run_at_startup: bool,
     /// 监视剪贴板中的下载链接，复制链接后切回窗口时显示下载文件信息
@@ -51,7 +58,8 @@ impl Default for AppSettings {
         Self {
             default_save_path: String::new(),
             max_connections_per_task: 8,
-            max_concurrent_tasks: 4,
+            max_concurrent_tasks: 8,
+            max_retries: default_max_retries(),
             run_at_startup: false,
             clipboard_monitor: true,
             show_start_dialog: true,

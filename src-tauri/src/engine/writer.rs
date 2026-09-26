@@ -2,7 +2,6 @@
 
 use bytes::Bytes;
 use std::path::Path;
-use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -15,7 +14,14 @@ pub async fn run_file_writer(
     mut rx: mpsc::Receiver<WriterMessage>,
 ) -> Result<(), std::io::Error> {
     let path = path.as_ref();
-    let mut file = File::create(path).await?;
+    // 打开已有文件时不得截断：暂停/恢复与失败重试都会重建 writer，
+    // 截断会把已完成分段的数据清掉（pending_segments 不含已完成段）
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .await?;
     if let Some(total) = total_bytes {
         file.set_len(total).await?;
     }

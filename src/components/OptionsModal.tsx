@@ -38,7 +38,8 @@ const TABS = [
 const defaultSettings: AppSettings = {
   default_save_path: "",
   max_connections_per_task: 8,
-  max_concurrent_tasks: 4,
+  max_concurrent_tasks: 8,
+  max_retries: 3,
   run_at_startup: false,
   clipboard_monitor: false,
   show_start_dialog: true,
@@ -743,6 +744,21 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     </select>
                     <span style={{ color: "#666", fontSize: 12, marginLeft: 8 }}>
                       同时进行中的下载任务数上限
+                    </span>
+                  </div>
+                  <div className="form-group">
+                    <label>失败自动重试次数</label>
+                    <select
+                      style={{ padding: "6px 10px", minWidth: 80, marginTop: 6 }}
+                      value={settings.max_retries}
+                      onChange={(e) => update({ max_retries: Number(e.target.value) })}
+                    >
+                      {[0, 1, 3, 5, 10].map((n) => (
+                        <option key={n} value={n}>{n}</option>
+                      ))}
+                    </select>
+                    <span style={{ color: "#666", fontSize: 12, marginLeft: 8 }}>
+                      网络出错时自动重试，0 表示不重试
                     </span>
                   </div>
                   <div className="form-group">

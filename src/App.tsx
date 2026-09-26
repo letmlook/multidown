@@ -111,6 +111,22 @@ function App() {
     } catch {}
   }, [darkMode]);
 
+  // 浏览器扩展抓链：后端开启"显示开始下载对话框"时不再自动建任务，
+  // 改为发事件让前端弹出下载信息确认框
+  useEffect(() => {
+    const unlisten = listen<{ url: string; filename?: string | null }>(
+      "extension-download-request",
+      (e) => {
+        if (!e.payload?.url) return;
+        setDownloadFileInfoUrl(e.payload.url);
+        setDownloadFileInfoOpen(true);
+      }
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   const lastClipboardUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -296,6 +312,7 @@ function App() {
         url: selectedTask.url,
         saveDir,
         filename: filename || undefined,
+        force: true,
       });
       await invoke("start_download", { taskId });
       refreshTasks();
@@ -376,6 +393,7 @@ function App() {
           url: t.url,
           saveDir,
           filename: filename || undefined,
+          force: true,
         });
         await invoke("start_download", { taskId });
         refreshTasks();

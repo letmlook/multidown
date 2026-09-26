@@ -1,12 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState, useEffect } from "react";
-import type { ProbeResult } from "../types/download";
+import type { AppSettings, ProbeResult } from "../types/download";
 
 interface AddTaskProps {
   open: boolean;
   onClose: () => void;
   onAdded: () => void;
 }
+
+const LAST_SAVE_DIR_KEY = "multidown-last-save-dir";
+const DUPLICATE_ASK = "DUPLICATE_ASK";
 
 export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
   const [url, setUrl] = useState("");
@@ -20,11 +23,23 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (open) {
+    if (!open) return;
+    // "使用上次的保存路径"开启时优先取上次目录，否则用系统默认下载目录
+    (async () => {
+      try {
+        const s = await invoke<AppSettings>("get_settings");
+        const last = localStorage.getItem(LAST_SAVE_DIR_KEY);
+        if (s.use_last_save_path && last) {
+          setSaveDir(last);
+          return;
+        }
+      } catch {
+        // 忽略设置读取失败，退回默认目录
+      }
       invoke<string>("get_default_download_dir")
         .then(setSaveDir)
         .catch(() => {});
-    }
+    })();
   }, [open]);
 
   const handleProbe = async () => {
@@ -50,12 +65,27 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
     setLoading(true);
     try {
       const dir = saveDir.trim() || ".";
-      const taskId = await invoke<string>("create_download", {
-        url: url.trim(),
-        saveDir: dir,
-        filename: filename.trim() || undefined,
-      });
+      let taskId: string;
+      try {
+        taskId = await invoke<string>("create_download", {
+          url: url.trim(),
+          saveDir: dir,
+          filename: filename.trim() || undefined,
+        });
+      } catch (err) {
+        if (String(err) !== DUPLICATE_ASK) throw err;
+        if (!window.confirm("已存在相同地址的任务，仍然重新下载吗？")) return;
+        taskId = await invoke<string>("create_download", {
+          url: url.trim(),
+          saveDir: dir,
+          filename: filename.trim() || undefined,
+          force: true,
+        });
+      }
       await invoke("start_download", { taskId });
+      try {
+        localStorage.setItem(LAST_SAVE_DIR_KEY, dir);
+      } catch {}
       setUrl("");
       setFilename("");
       setProbeResult(null);
