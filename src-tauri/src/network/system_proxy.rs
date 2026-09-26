@@ -4,11 +4,11 @@
 pub fn detect_system_proxy() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return detect_macos();
+        detect_macos()
     }
     #[cfg(windows)]
     {
-        return detect_windows();
+        detect_windows()
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

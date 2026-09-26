@@ -9,19 +9,14 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// 代理协议类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 #[allow(dead_code)]
 pub enum ProxyType {
+    #[default]
     Http,
     Socks5,
     Https,
-}
-
-impl Default for ProxyType {
-    fn default() -> Self {
-        ProxyType::Http
-    }
 }
 
 impl std::fmt::Display for ProxyType {
@@ -120,19 +115,14 @@ impl ProxyConfig {
 }
 
 /// 代理规则匹配类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum ProxyMatchType {
+    #[default]
     DomainContains,
     UrlContains,
     Extension,
-}
-
-impl Default for ProxyMatchType {
-    fn default() -> Self {
-        ProxyMatchType::DomainContains
-    }
 }
 
 /// 一条代理规则：满足匹配条件时使用指定代理
@@ -245,11 +235,10 @@ fn proxy_config_to_network_options(config: &ProxyConfig) -> Option<NetworkOption
 
 /// 根据 URL 从规则列表中匹配代理，返回匹配的 proxy_id 或 None
 #[allow(dead_code)]
-pub 
-fn match_proxy_rule<'a>(url: &str, store: &'a ProxyStore) -> Option<&'a ProxyConfig> {
+pub fn match_proxy_rule<'a>(url: &str, store: &'a ProxyStore) -> Option<&'a ProxyConfig> {
     // 按 priority 降序排序后匹配
     let mut sorted_rules: Vec<&'a ProxyRule> = store.rules.iter().collect();
-    sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    sorted_rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
     for rule in sorted_rules {
         if rule.matches(url) {

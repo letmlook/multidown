@@ -66,7 +66,7 @@ impl TokenBucket {
                 return want as usize;
             }
             // 单次最多等 200ms 保持响应性；令牌跨迭代持续累积
-            let wait_secs = (want / rate as f64).min(0.2).max(0.005);
+            let wait_secs = (want / rate as f64).clamp(0.005, 0.2);
             tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
         }
     }

@@ -250,13 +250,13 @@ impl BatchScheduler {
 
     /// 设置每批添加到下载队列的任务数
     pub fn with_batch_size(mut self, size: usize) -> Self {
-        self.batch_size = size.max(1).min(20);
+        self.batch_size = size.clamp(1, 20);
         self
     }
 
     /// 设置探测并发数
     pub fn with_probe_concurrency(mut self, n: usize) -> Self {
-        self.probe_concurrency = n.max(1).min(10);
+        self.probe_concurrency = n.clamp(1, 10);
         self
     }
 
@@ -518,7 +518,7 @@ fn probe_batch(
     use tokio::sync::Semaphore;
     use std::sync::Arc;
 
-    let sem = Arc::new(Semaphore::new(concurrency.max(1).min(10)));
+    let sem = Arc::new(Semaphore::new(concurrency.clamp(1, 10)));
     let mut handles = Vec::new();
 
     for url in urls {

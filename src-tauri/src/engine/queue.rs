@@ -277,7 +277,7 @@ impl QueueManager {
     /// List all queues
     pub async fn list_queues(&self) -> Vec<QueueSummary> {
         let mut summaries = Vec::new();
-        for (_id, q) in self.queues.iter() {
+        for q in self.queues.values() {
             let task_count = q.lock().task_ids.len();
             summaries.push(QueueSummary::from(((*q).clone(), task_count)));
         }
@@ -287,7 +287,7 @@ impl QueueManager {
     /// Get active queues (non-deleted, non-paused) at given time
     pub async fn get_active_queues(&self, weekday: chrono::Weekday, hour: u32, minute: u32) -> Vec<QueueSummary> {
         let mut active = Vec::new();
-        for (_id, q) in self.queues.iter() {
+        for q in self.queues.values() {
             let q_guard = q.lock();
             if !q_guard.deleted && !q_guard.is_paused {
                 let day_match = q_guard.active_days.is_empty() || q_guard.active_days.contains(&DayOfWeek::from_chrono_weekday(weekday));

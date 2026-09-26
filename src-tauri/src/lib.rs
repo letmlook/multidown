@@ -137,6 +137,7 @@ async fn list_batches(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::ba
 /// - `urls`: URL 列表（每行一个，或 JSON 数组）
 /// - `template`: 文件名模板，如 "video_{n}.mp4"
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command：参数即 IPC 契约
 async fn create_batch(
     name: String,
     urls: Vec<String>,
@@ -411,6 +412,7 @@ async fn add_proxy(
 
 /// 更新代理配置
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command：参数即 IPC 契约
 async fn update_proxy(
     app: tauri::AppHandle,
     id: String,
@@ -551,6 +553,7 @@ async fn add_proxy_rule(
 
 /// 更新代理规则
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command：参数即 IPC 契约
 async fn update_proxy_rule(
     app: tauri::AppHandle,
     id: String,
@@ -797,6 +800,7 @@ async fn should_auto_categorize(app: &tauri::AppHandle, save_dir: &str) -> bool 
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command：参数即 IPC 契约
 async fn create_download(
     url: String,
     save_dir: String,
@@ -823,6 +827,7 @@ async fn create_download(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command：参数即 IPC 契约
 async fn create_download_with_probe(
     url: String,
     save_dir: String,
@@ -1508,13 +1513,9 @@ fn install_to_chrome(ext_path: &str) -> Result<(), String> {
                     .arg("--disable-backgrounding-occluded-windows")
                     .arg("--disable-renderer-backgrounding")
                     .arg("chrome://extensions/")
-                    .spawn();
-                
-                if result.is_ok() {
-                    return Ok(());
-                } else {
-                    return Err(format!("无法启动浏览器: {}", result.unwrap_err()));
-                }
+                    .spawn()
+                    .map_err(|e| format!("无法启动浏览器: {}", e))?;
+                return Ok(());
             }
         }
         Err("未找到 Chrome 或 Edge 浏览器".to_string())
@@ -1552,18 +1553,14 @@ fn install_to_chrome(ext_path: &str) -> Result<(), String> {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 
                 // 启动 Chrome 并加载扩展
-                let result = std::process::Command::new(chrome_path)
+                std::process::Command::new(chrome_path)
                     .arg(format!("--load-extension={}", ext_path))
                     .arg("--enable-extensions")
                     .arg("--enable-dev-tools")
                     .arg("chrome://extensions/")
-                    .spawn();
-                
-                if result.is_ok() {
-                    return Ok(());
-                } else {
-                    return Err(format!("无法启动浏览器: {}", result.unwrap_err()));
-                }
+                    .spawn()
+                    .map_err(|e| format!("无法启动浏览器: {}", e))?;
+                return Ok(());
             }
         }
         Err("未找到 Chrome 或 Edge 浏览器".to_string())
@@ -1595,18 +1592,14 @@ fn install_to_chrome(ext_path: &str) -> Result<(), String> {
                     std::thread::sleep(std::time::Duration::from_millis(1000));
                     
                     // 启动 Chrome 并加载扩展
-                    let result = std::process::Command::new(cmd)
+                    std::process::Command::new(cmd)
                         .arg(format!("--load-extension={}", ext_path))
                         .arg("--enable-extensions")
                         .arg("--enable-dev-tools")
                         .arg("chrome://extensions/")
-                        .spawn();
-                    
-                    if result.is_ok() {
-                        return Ok(());
-                    } else {
-                        return Err(format!("无法启动浏览器: {}", result.unwrap_err()));
-                    }
+                        .spawn()
+                        .map_err(|e| format!("无法启动浏览器: {}", e))?;
+                    return Ok(());
                 }
             }
         }

@@ -381,7 +381,7 @@ impl Scheduler {
         let queue_id_clone = queue_id.clone();
 
         let n_workers = if task.supports_range {
-            max_connections.unwrap_or(8).max(1).min(32)
+            max_connections.unwrap_or(8).clamp(1, 32)
         } else {
             1
         };
@@ -577,10 +577,10 @@ impl Scheduler {
         let mut n = 0;
         for id in &job.task_ids {
             if let Some(task) = tasks.get(id) {
-                if *task.status.lock().await == TaskStatus::Failed {
-                    if Self::reset_failed_task(task).await.is_ok() {
-                        n += 1;
-                    }
+                if *task.status.lock().await == TaskStatus::Failed
+                    && Self::reset_failed_task(task).await.is_ok()
+                {
+                    n += 1;
                 }
             }
         }
@@ -1296,6 +1296,7 @@ fn next_available_filename(filename: &str, taken: &std::collections::HashSet<Str
     name
 }
 
+#[allow(clippy::too_many_arguments)] // 下载 worker 的热路径，拆包会引入额外克隆
 async fn run_worker(
     task: Arc<Task>,
     url: &str,
@@ -1432,8 +1433,10 @@ mod tests {
     #[tokio::test]
     async fn duplicate_skip_rejects() {
         let s = scheduler();
-        let mut settings = crate::settings::AppSettings::default();
-        settings.duplicate_action = "skip".to_string();
+        let settings = crate::settings::AppSettings {
+            duplicate_action: "skip".to_string(),
+            ..Default::default()
+        };
         s.update_from_settings(&settings);
         let id = s
             .create_task_internal(
@@ -1488,8 +1491,10 @@ mod tests {
     #[tokio::test]
     async fn duplicate_rename_avoids_conflict() {
         let s = scheduler();
-        let mut settings = crate::settings::AppSettings::default();
-        settings.duplicate_action = "rename".to_string();
+        let settings = crate::settings::AppSettings {
+            duplicate_action: "rename".to_string(),
+            ..Default::default()
+        };
         s.update_from_settings(&settings);
         s.create_task_internal(
             "http://example.com/a.zip".into(),
@@ -1543,10 +1548,12 @@ mod tests {
     #[test]
     fn limits_from_settings() {
         let s = scheduler();
-        let mut settings = crate::settings::AppSettings::default();
-        settings.max_concurrent_tasks = 2;
-        settings.max_retries = 5;
-        settings.global_speed_limit_kbps = 512;
+        let settings = crate::settings::AppSettings {
+            max_concurrent_tasks: 2,
+            max_retries: 5,
+            global_speed_limit_kbps: 512,
+            ..Default::default()
+        };
         s.update_from_settings(&settings);
         assert_eq!(s.limits.lock().max_concurrent_tasks, 2);
         assert_eq!(s.limits.lock().max_retries, 5);

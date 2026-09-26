@@ -70,14 +70,14 @@ pub fn load_rules(path: &Path) -> Result<Vec<CategoryRule>, Box<dyn std::error::
     }
     let json = std::fs::read_to_string(path)?;
     let dtos: Vec<RuleDto> = serde_json::from_str(&json)?;
-    Ok(dtos.iter().map(|dto| CategoryRule::from(dto)).collect())
+    Ok(dtos.iter().map(CategoryRule::from).collect())
 }
 
 pub async fn save_rules(path: &Path, rules: &[CategoryRule]) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let dtos: Vec<RuleDto> = rules.iter().map(|r| RuleDto::from(r)).collect();
+    let dtos: Vec<RuleDto> = rules.iter().map(RuleDto::from).collect();
     let json = serde_json::to_string_pretty(&dtos)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     tokio::fs::write(path, json).await
