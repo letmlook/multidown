@@ -6,6 +6,7 @@
 mod engine;
 mod network;
 mod settings;
+mod torrent;
 
 use engine::scheduler::Scheduler;
 use network::{AuthConfig, NetworkOptions, ProbeResult};
@@ -740,6 +741,118 @@ async fn probe_download(
         .map_err(|e: network::NetworkError| e.to_string())
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// BitTorrent Commands（磁力链接 / 种子文件）
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 种子文件解析结果（前端用于文件选择）
+#[derive(serde::Serialize)]
+struct ResolvedTorrent {
+    info_hash: String,
+    name: String,
+    total_bytes: u64,
+    multi_file: bool,
+    files: Vec<ResolvedTorrentFile>,
+    /// 缓存的 metainfo，回传给 create_torrent_download 可避免二次解析
+    metainfo_b64: String,
+}
+
+#[derive(serde::Serialize)]
+struct ResolvedTorrentFile {
+    index: usize,
+    name: String,
+    length: u64,
+}
+
+/// 解析磁力链接或种子文件，返回文件列表。
+///
+/// **对磁力链接这一步需要联网**（DHT/tracker 交换元数据），可能耗时数秒到数分钟，
+/// 所以前端必须先显示"解析中"再调用。
+#[tauri::command]
+async fn resolve_torrent(
+    input: String,
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<ResolvedTorrent, String> {
+    // 磁力链接先做本地校验：格式错误或 v2-only 应立刻报错，
+    // 而不是进 DHT 兜一大圈才失败。顺带把显示名透出去，让 UI 能显示"正在解析 xxx"。
+    if torrent::detect::sniff(&input) == torrent::detect::InputProtocol::Magnet {
+        let magnet = torrent::detect::parse_magnet(&input)?;
+        let _ = app.emit(
+            "torrent-resolve-started",
+            serde_json::json!({
+                "input": input,
+                "hint": magnet.placeholder_filename(),
+                "infoHash": magnet.info_hash,
+            }),
+        );
+    }
+
+    let engine = state.torrent_engine().await?;
+    let meta = crate::engine::TorrentMeta {
+        input: input.clone(),
+        ..Default::default()
+    };
+    let inspected = engine.inspect(&meta).await.map_err(|e| e.to_string())?;
+    Ok(ResolvedTorrent {
+        info_hash: inspected.info_hash.clone(),
+        name: inspected.name.clone(),
+        total_bytes: inspected.total_bytes,
+        multi_file: inspected.is_multi_file(),
+        files: inspected
+            .files
+            .iter()
+            .map(|(index, name, length)| ResolvedTorrentFile {
+                index: *index,
+                name: name.clone(),
+                length: *length,
+            })
+            .collect(),
+        metainfo_b64: base64_encode_bytes(&inspected.metainfo),
+    })
+}
+
+fn base64_encode_bytes(bytes: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    STANDARD.encode(bytes)
+}
+
+/// 改变种子任务选中的文件（运行中生效）。
+#[tauri::command]
+async fn set_torrent_files(
+    task_id: String,
+    files: Vec<usize>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.set_torrent_files(&task_id, files).await
+}
+
+/// 创建种子任务。`metainfo_b64` 来自 `resolve_torrent`，传了就无需再次解析。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn create_torrent_download(
+    input: String,
+    save_dir: String,
+    filename: Option<String>,
+    selected_files: Option<Vec<usize>>,
+    metainfo_b64: Option<String>,
+    info_hash: Option<String>,
+    force: Option<bool>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<String, String> {
+    state
+        .create_torrent_task(
+            input,
+            save_dir,
+            filename,
+            selected_files,
+            metainfo_b64,
+            info_hash,
+            force.unwrap_or(false),
+        )
+        .await
+}
+
 /// 按代理类型解析实际代理地址：none / system / manual
 fn effective_proxy_url(settings: &AppSettings) -> Option<String> {
     match settings.proxy_type.as_str() {
@@ -1016,7 +1129,13 @@ fn get_default_download_dir(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn exit_app(app: tauri::AppHandle) {
+async fn exit_app(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    // 优雅关闭 BitTorrent 会话：释放监听端口并落盘 fastresume 状态
+    state.shutdown_torrent().await;
+
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.destroy();
     }
@@ -1034,6 +1153,7 @@ fn exit_app(app: tauri::AppHandle) {
         std::thread::sleep(std::time::Duration::from_millis(350));
         app.exit(0);
     });
+    Ok(())
 }
 
 #[tauri::command]
@@ -2517,6 +2637,9 @@ pub fn run() {
             get_settings,
             set_settings,
             probe_download,
+            resolve_torrent,
+            create_torrent_download,
+            set_torrent_files,
             create_download,
             create_download_with_probe,
             start_download,

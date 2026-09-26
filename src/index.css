@@ -1101,6 +1101,70 @@ body {
   margin-left: 64px;
 }
 
+/* ===== 种子文件选择列表 ===== */
+.add-task-torrent-files {
+  margin-top: 10px;
+  margin-left: 64px;
+  border: 1px solid var(--border-color, #e0e0e0);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.add-task-torrent-files-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  background: var(--bg-subtle, rgba(0, 0, 0, 0.03));
+  font-size: 12px;
+}
+
+.add-task-torrent-files-head label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.add-task-torrent-summary {
+  color: var(--text-muted);
+}
+
+.add-task-torrent-file-list {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.add-task-torrent-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.add-task-torrent-file:hover {
+  background: var(--bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.add-task-torrent-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* 种子内路径可能很深，保留方向标记以便识别层级 */
+  direction: ltr;
+}
+
+.add-task-torrent-file-size {
+  flex: none;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ===== 下载文件信息弹窗 ===== */
 .download-file-info-modal {
   min-width: 560px;

@@ -3,7 +3,9 @@ name = "multidown"
 version = "0.2.0"
 description = "Multidown - 对标 IDM 的跨平台下载工具"
 edition = "2021"
-rust-version = "1.70"
+# 真实下限由依赖决定：tauri 2.x 要求 >= 1.77.2，librqbit 9.x（edition 2024 + let chains）
+# 要求 >= 1.88。librqbit 未声明 rust-version，所以这里不写对会得到编译报错而不是解析错误。
+rust-version = "1.88"
 license = "MIT"
 
 [lib]
@@ -39,6 +41,12 @@ zip = "0.6"
 walkdir = "2"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+
+# ── BitTorrent 引擎（磁力链接 / 种子文件）─────────────────────────────
+# default-features = false 避免引入 http-api(axum) / webui；Api facade 未被 feature 门控。
+# default-tls 与项目现有 reqwest 0.12 的 native-tls 栈一致，不会多引入一个 TLS 后端。
+librqbit = { version = "9.0.1", default-features = false, features = ["default-tls"] }
+anyhow = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

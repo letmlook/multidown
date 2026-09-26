@@ -3,6 +3,73 @@ use uuid::Uuid;
 
 pub type TaskId = String;
 
+/// 任务协议类型。
+///
+/// `Http` 为默认值，保证旧的 `multidown_tasks.json`（没有 kind 字段）反序列化后
+/// 行为与升级前完全一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    #[default]
+    Http,
+    Torrent,
+}
+
+impl TaskKind {
+    pub fn is_torrent(self) -> bool {
+        matches!(self, TaskKind::Torrent)
+    }
+}
+
+/// 种子任务的持久化状态（不含运行时句柄）。
+///
+/// 设计要点：磁力链接在元数据解析完成前不知道文件名/总大小，所以这些都允许为空；
+/// 解析完成后把 metainfo 原始字节缓存下来，重启后可直接重新挂载，无需再次进 DHT。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TorrentMeta {
+    /// 原始输入：`magnet:...`、`.torrent` 文件路径或 `.torrent` URL
+    pub input: String,
+    /// v1 info hash（40 位小写 hex）
+    #[serde(default)]
+    pub info_hash: Option<String>,
+    /// 缓存的最小 metainfo（bencode 原始字节的 base64）
+    #[serde(default)]
+    pub metainfo_b64: Option<String>,
+    /// 用户勾选的文件索引；None = 全部
+    #[serde(default)]
+    pub selected_files: Option<Vec<usize>>,
+    /// 元数据是否已解析完成（磁力链接刚添加时为 false）
+    #[serde(default)]
+    pub metadata_ready: bool,
+    /// 累计上传字节（UI 展示 / 导出用；运行时真值在引擎侧）
+    #[serde(default)]
+    pub uploaded_bytes: u64,
+}
+
+/// 种子内的单个文件，前端用于文件列表与选择。
+#[derive(Debug, Clone, Serialize)]
+pub struct TorrentFileInfo {
+    pub index: usize,
+    /// 相对种子根目录的路径
+    pub name: String,
+    pub length: u64,
+    pub progress_bytes: u64,
+    pub selected: bool,
+}
+
+/// 种子任务的运行时快照，由 BT 引擎的 stats 轮询器写入任务对象。
+///
+/// 文件表也放在这里，避免为同一份引擎状态维护两把锁。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TorrentStatsSnapshot {
+    pub upload_speed_bps: u64,
+    pub uploaded_bytes: u64,
+    pub peers: u32,
+    /// 做种方数量。librqbit 的聚合 stats 不提供，取不到时为 None（而不是误报 0）
+    pub seeds: Option<u32>,
+    pub files: Vec<TorrentFileInfo>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -27,6 +94,19 @@ pub struct TaskInfo {
     pub error_message: Option<String>,
     pub speed_bps: Option<u64>,
     pub created_at: i64,
+    /// 协议类型（`http` / `torrent`）
+    pub kind: TaskKind,
+    // ── 以下仅种子任务有值；HTTP 任务为 None ──
+    pub upload_speed_bps: Option<u64>,
+    pub uploaded_bytes: Option<u64>,
+    /// 已连接的 peer 数
+    pub peers: Option<u32>,
+    /// 其中已完成全部分片的 peer 数（做种方）
+    pub seeds: Option<u32>,
+    /// 种子内文件列表（含每文件进度与是否选中）
+    pub files: Option<Vec<TorrentFileInfo>>,
+    /// 元数据是否就绪；磁力链接刚添加时为 false
+    pub metadata_ready: bool,
 }
 
 /// 新建任务参数

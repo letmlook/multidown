@@ -8,7 +8,8 @@ use crate::engine::rules::{match_rule, CategoryRule};
 use crate::engine::rules_persistence::{load_rules, save_rules};
 use crate::engine::schedule::{ScheduleManager, ScheduleRule};
 use crate::engine::task::Task;
-use crate::engine::types::{TaskId, TaskInfo, TaskStatus};
+use crate::engine::types::{TaskId, TaskInfo, TaskStatus, TorrentMeta, TorrentStatsSnapshot};
+use crate::torrent::engine::TorrentRunState;
 use crate::engine::writer::{run_file_writer, WriterMessage};
 use crate::network::{
     build_client_from_options, probe, probe_with_options, AuthConfig, NetworkOptions, ProbeResult,
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OnceCell, RwLock};
 
 /// 引擎级限制：来自应用设置，随 set_settings 实时更新
 #[derive(Debug, Clone)]
@@ -61,6 +62,10 @@ pub struct Scheduler {
     duplicate_action: Arc<ParkingMutex<String>>,
     /// 全局限速令牌桶（rate=0 不限速），所有任务的 worker 共享
     speed_limit: Arc<TokenBucket>,
+    /// 种子引擎配置，由 `update_from_settings` 同步
+    torrent_cfg: Arc<ParkingMutex<Option<crate::torrent::engine::TorrentEngineConfig>>>,
+    /// 内嵌 BitTorrent 会话（惰性初始化：只有真正用到种子时才创建）
+    torrent_engine: Arc<OnceCell<Arc<crate::torrent::engine::TorrentEngine>>>,
 }
 
 /// 重复链接创建被拒绝时的错误标记；前端据此弹确认框后以 force 重试
@@ -80,6 +85,8 @@ impl Scheduler {
             limits: Arc::new(ParkingMutex::new(EngineLimits::default())),
             duplicate_action: Arc::new(ParkingMutex::new("ask".to_string())),
             speed_limit: Arc::new(TokenBucket::new(0)),
+            torrent_cfg: Arc::new(ParkingMutex::new(None)),
+            torrent_engine: Arc::new(OnceCell::new()),
         }
     }
 
@@ -98,6 +105,75 @@ impl Scheduler {
         *self.duplicate_action.lock() = settings.duplicate_action.clone();
         self.speed_limit
             .set_rate((settings.global_speed_limit_kbps as u64).saturating_mul(1024));
+
+        // 种子引擎配置：应用数据目录就是任务文件的父目录
+        if let Some(app_data) = self.save_path.as_ref().and_then(|p| p.parent()) {
+            let cfg = crate::torrent::engine::TorrentEngineConfig::from_settings(settings, app_data);
+            // 会话已存在时限速可以实时生效（librqbit 的 Limits 是同步可变的）
+            if let Some(engine) = self.torrent_engine.get() {
+                engine.set_limits(cfg.download_bps, cfg.upload_bps);
+            }
+            *self.torrent_cfg.lock() = Some(cfg);
+        }
+    }
+
+    /// 取（必要时惰性创建）种子引擎。
+    ///
+    /// 创建会话必须在 tokio 运行时上下文里进行，所以这里是 async；
+    /// 只有真正添加/解析种子时才会付出这个代价。
+    pub async fn torrent_engine(
+        &self,
+    ) -> Result<Arc<crate::torrent::engine::TorrentEngine>, String> {
+        let cfg = self
+            .torrent_cfg
+            .lock()
+            .clone()
+            .ok_or_else(|| "种子引擎尚未初始化（缺少应用数据目录配置）".to_string())?;
+        let engine = self
+            .torrent_engine
+            .get_or_try_init(|| async move {
+                crate::torrent::engine::TorrentEngine::new(cfg)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| format!("初始化 BitTorrent 引擎失败: {e}"))
+            })
+            .await?;
+        Ok(engine.clone())
+    }
+
+    /// 运行中改变种子任务选中的文件。
+    ///
+    /// 引擎侧（librqbit 会话）是权威来源，并会随会话状态一起持久化；
+    /// 前端应以任务快照里的 `files[].selected` 为准，而不是自己的本地缓存。
+    pub async fn set_torrent_files(
+        &self,
+        task_id: &str,
+        files: Vec<usize>,
+    ) -> Result<(), String> {
+        let task = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| "任务不存在".to_string())?
+        };
+        if !task.kind.is_torrent() {
+            return Err("只有种子任务支持文件选择".to_string());
+        }
+        let engine = self.torrent_engine().await?;
+        engine
+            .select_files(task_id, &files)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.save_tasks().await;
+        Ok(())
+    }
+
+    /// 关闭 BitTorrent 会话（应用退出时调用，尽量优雅地释放监听端口）。
+    pub async fn shutdown_torrent(&self) {
+        if let Some(engine) = self.torrent_engine.get() {
+            engine.stop().await;
+        }
     }
 
     /// 手动/计划任务设置全局限速（kbps，None 表示恢复设置里的值由调用方处理）
@@ -125,6 +201,8 @@ impl Scheduler {
             limits: Arc::new(ParkingMutex::new(EngineLimits::default())),
             duplicate_action: Arc::new(ParkingMutex::new("ask".to_string())),
             speed_limit: Arc::new(TokenBucket::new(0)),
+            torrent_cfg: Arc::new(ParkingMutex::new(None)),
+            torrent_engine: Arc::new(OnceCell::new()),
         })
     }
 
@@ -287,6 +365,110 @@ impl Scheduler {
         Ok(id)
     }
 
+    /// 新建 BitTorrent 任务（磁力链接或种子文件）。
+    ///
+    /// **这一步需要元数据**：磁力链接会走 DHT/tracker 解析（可能耗时数秒到数分钟），
+    /// 所以调用方应当先在 UI 上显示"解析中"，并把拿到的 `metainfo_b64` 回传，
+    /// 后续重建任务时就是纯本地操作了。解析结果是文件列表与落盘位置，
+    /// 一旦确定就不再变化，因此 `Task` 的种子字段全程只读。
+    #[allow(clippy::too_many_arguments)] // 与 HTTP 路径的 create_task_internal 一致
+    pub async fn create_torrent_task(
+        &self,
+        input: String,
+        save_dir: String,
+        filename: Option<String>,
+        selected_files: Option<Vec<usize>>,
+        metainfo_b64: Option<String>,
+        info_hash: Option<String>,
+        force: bool,
+    ) -> Result<TaskId, String> {
+        // 防止把普通 http 链接当种子建任务：那种情况应走 HTTP 下载路径
+        if !crate::torrent::detect::sniff(&input).is_torrent() {
+            return Err("不是磁力链接或种子文件，无法创建种子任务".to_string());
+        }
+
+        if !force {
+            // 种子按 info hash 去重，而不是按 URL —— 同一资源的磁力链接参数可能不同
+            let key = info_hash.clone().unwrap_or_else(|| input.clone());
+            if let Some(existing_id) = self.find_duplicate_torrent(&key).await {
+                self.handle_duplicate(&existing_id).await?;
+            }
+        }
+
+        let engine = self.torrent_engine().await?;
+        let meta = TorrentMeta {
+            input: input.clone(),
+            info_hash: info_hash.clone(),
+            metainfo_b64,
+            selected_files: selected_files.clone(),
+            metadata_ready: false,
+            uploaded_bytes: 0,
+        };
+        let inspected = engine
+            .inspect(&meta)
+            .await
+            .map_err(|e| format!("解析种子元数据失败: {e}"))?;
+
+        // 单文件用文件本身的名字；多文件用种子名（最终落盘为同名子目录）
+        let resolved_name = filename
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| crate::torrent::detect::sanitize_filename(&f))
+            .unwrap_or_else(|| {
+                if inspected.is_multi_file() {
+                    crate::torrent::detect::sanitize_filename(&inspected.name)
+                } else {
+                    inspected
+                        .files
+                        .first()
+                        .map(|(_, name, _)| crate::torrent::detect::sanitize_filename(name))
+                        .unwrap_or_else(|| crate::torrent::detect::sanitize_filename(&inspected.name))
+                }
+            });
+
+        let finalized = TorrentMeta {
+            input,
+            info_hash: Some(inspected.info_hash.clone()),
+            metainfo_b64: Some(base64_encode(&inspected.metainfo)),
+            selected_files,
+            metadata_ready: true,
+            uploaded_bytes: 0,
+        };
+
+        let task = Task::new_torrent(finalized, save_dir, resolved_name);
+        task.set_torrent_total(inspected.total_bytes);
+        let id = task.id.clone();
+
+        if let Some(ref qm) = self.queue_manager {
+            let manager = qm.lock().await;
+            let _ = manager.assign_task_to_queue(&id, &manager.default_queue_id).await;
+        }
+
+        self.tasks.lock().await.insert(id.clone(), Arc::new(task));
+        self.save_tasks().await;
+        Ok(id)
+    }
+
+    /// 种子任务去重：按 info hash 匹配（回退到原始输入串）。
+    async fn find_duplicate_torrent(&self, key: &str) -> Option<TaskId> {
+        let tasks = self.tasks.lock().await;
+        for t in tasks.values() {
+            if !t.kind.is_torrent() {
+                continue;
+            }
+            let matches = t
+                .torrent
+                .as_ref()
+                .map(|m| {
+                    m.info_hash.as_deref() == Some(key) || m.input == key
+                })
+                .unwrap_or(false);
+            if matches {
+                return Some(t.id.clone());
+            }
+        }
+        None
+    }
+
     /// Check if a queue can start more tasks based on its concurrency limit
     async fn can_start_for_queue(&self, queue_id: &str) -> Result<bool, String> {
         // 全局并发上限来自设置
@@ -341,6 +523,20 @@ impl Scheduler {
         max_connections: Option<usize>,
         network_options: Option<NetworkOptions>,
     ) -> Result<(), String> {
+        // 种子任务走独立路径：BT 的分片调度在引擎内部，与 HTTP 分段逻辑无关
+        {
+            let tasks = self.tasks.lock().await;
+            if let Some(t) = tasks.get(task_id) {
+                if t.kind.is_torrent() {
+                    let task = t.clone();
+                    drop(tasks);
+                    return self
+                        .start_torrent_download(task, app_handle, scheduler_for_save)
+                        .await;
+                }
+            }
+        }
+
         // Determine which queue this task belongs to
         let queue_id = if let Some(ref qm) = self.queue_manager {
             qm.lock().await.get_task_queue(task_id).await
@@ -518,6 +714,220 @@ impl Scheduler {
         Ok(())
     }
 
+    /// 启动种子任务：加入 BT 会话 + 轮询 stats 驱动任务状态。
+    ///
+    /// 与 HTTP worker 的语义对齐：暂停/取消通过任务状态传递，轮询器负责落到引擎上；
+    /// 完成/失败同样写回任务状态并发出既有事件。
+    async fn start_torrent_download(
+        &self,
+        task: Arc<Task>,
+        app_handle: Option<tauri::AppHandle>,
+        scheduler_for_save: Option<Arc<Scheduler>>,
+    ) -> Result<(), String> {
+        let task_id = task.id.clone();
+
+        let queue_id = if let Some(ref qm) = self.queue_manager {
+            qm.lock()
+                .await
+                .get_task_queue(&task_id)
+                .await
+                .unwrap_or_else(|| "default".to_string())
+        } else {
+            "default".to_string()
+        };
+        if !self.can_start_for_queue(&queue_id).await? {
+            return Err("已达到最大并发任务数上限".to_string());
+        }
+        let was_paused;
+        {
+            let mut st = task.status.lock().await;
+            if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
+                return Err("任务状态不允许开始".to_string());
+            }
+            was_paused = *st == TaskStatus::Paused;
+            *st = TaskStatus::Downloading;
+        }
+        self.increment_active(&queue_id).await;
+
+        let scheduler_self = scheduler_for_save
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.clone()));
+
+        // 失败收尾：标记失败 + 释放并发位 + 落盘
+        macro_rules! fail {
+            ($msg:expr) => {{
+                *task.error_message.lock().await = Some($msg);
+                *task.status.lock().await = TaskStatus::Failed;
+                self.decrement_active(&queue_id).await;
+                scheduler_self.save_tasks().await;
+                if let Some(app) = &app_handle {
+                    let _ = app.emit(
+                        "download-finished",
+                        (task_id.clone(), "failed".to_string(), task.filename.clone()),
+                    );
+                }
+                return Ok(());
+            }};
+        }
+
+        let engine = match self.torrent_engine().await {
+            Ok(e) => e,
+            Err(e) => fail!(e),
+        };
+
+        let meta = match task.torrent.clone() {
+            Some(m) => m,
+            None => fail!("任务缺少种子元数据".to_string()),
+        };
+
+        // 元数据在 create_torrent_task 阶段已解析并缓存，此处是纯本地操作
+        let inspected = match engine.inspect(&meta).await {
+            Ok(i) => i,
+            Err(e) => fail!(format!("解析种子元数据失败: {e}")),
+        };
+
+        // 单文件 → 直接放下载目录；多文件 → 以种子名命名的子目录
+        // （librqbit 的多文件路径不含种子名，必须由调用方补上）
+        let save_dir = std::path::Path::new(&task.save_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let output_folder = crate::torrent::engine::output_folder_for(&save_dir, &inspected);
+        if let Err(e) = tokio::fs::create_dir_all(&output_folder).await {
+            fail!(format!("创建保存目录失败: {e}"));
+        }
+
+        if let Err(e) = engine
+            .add(
+                &task_id,
+                &inspected,
+                &output_folder,
+                meta.selected_files.as_deref(),
+                false,
+            )
+            .await
+        {
+            fail!(format!("加入种子下载失败: {e}"));
+        }
+
+        // 从暂停恢复时，`add` 对已托管的种子只是复用句柄、并不会解除暂停，
+        // 必须显式 resume，否则"继续"会没反应。
+        if was_paused {
+            if let Err(e) = engine.resume(&task_id).await {
+                fail!(format!("恢复种子下载失败: {e}"));
+            }
+        }
+
+        // 通知前端元数据已就绪（文件名/总大小/文件列表此刻才确定）
+        if let Some(app) = &app_handle {
+            let _ = app.emit(
+                "torrent-metadata",
+                serde_json::json!({
+                    "taskId": task_id,
+                    "infoHash": inspected.info_hash,
+                    "name": inspected.name,
+                    "totalBytes": inspected.total_bytes,
+                    "fileCount": inspected.files.len(),
+                    // 监听端口对用户的连通性排查有用（可据此做端口映射）
+                    "listenPort": engine.listen_addr().map(|a| a.port()),
+                }),
+            );
+        }
+
+        let app_handle_clone = app_handle.clone();
+        let queue_id_final = queue_id.clone();
+        let selected = meta.selected_files.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+
+                // 暂停 / 取消由任务状态传递进来
+                match *task.status.lock().await {
+                    TaskStatus::Paused => {
+                        if let Err(e) = engine.pause(&task_id).await {
+                            *task.error_message.lock().await = Some(e.to_string());
+                        }
+                        break;
+                    }
+                    TaskStatus::Cancelled => {
+                        // 保留已下载数据，便于之后续传
+                        let _ = engine.remove(&task_id, false).await;
+                        break;
+                    }
+                    TaskStatus::Downloading => {}
+                    // 其它状态（完成/失败）说明已被外部终结
+                    _ => break,
+                }
+
+                let Some(p) = engine.snapshot(&task_id) else {
+                    continue;
+                };
+
+                task.downloaded
+                    .store(p.progress_bytes, std::sync::atomic::Ordering::Relaxed);
+                if p.total_bytes > 0 {
+                    task.set_torrent_total(p.total_bytes);
+                }
+                task.set_speed_sample(p.progress_bytes);
+
+                let files = crate::torrent::engine::merge_file_infos(
+                    &inspected,
+                    &p,
+                    selected.as_deref(),
+                );
+                task.set_torrent_stats(TorrentStatsSnapshot {
+                    upload_speed_bps: p.upload_speed_bps,
+                    uploaded_bytes: p.uploaded_bytes,
+                    peers: p.peers,
+                    // librqbit 的聚合 stats 不区分"做种方"，这里如实留空而不是显示 0
+                    seeds: None,
+                    files,
+                })
+                .await;                if p.state == TorrentRunState::Error {
+                    *task.error_message.lock().await =
+                        p.error.clone().or_else(|| Some("种子下载出错".to_string()));
+                    *task.status.lock().await = TaskStatus::Failed;
+                    if let Some(app) = &app_handle_clone {
+                        let _ = app.emit(
+                            "download-finished",
+                            (task_id.clone(), "failed".to_string(), task.filename.clone()),
+                        );
+                    }
+                    break;
+                }
+
+                if p.is_finished() {
+                    *task.status.lock().await = TaskStatus::Completed;
+                    if let Some(app) = &app_handle_clone {
+                        let _ = app.emit(
+                            "download-finished",
+                            (
+                                task_id.clone(),
+                                "completed".to_string(),
+                                task.filename.clone(),
+                            ),
+                        );
+                    }
+                    break;
+                }
+
+                if let Some(app) = &app_handle_clone {
+                    let _ = app.emit("download-progress", ());
+                }
+            }
+
+            scheduler_self.decrement_active(&queue_id_final).await;
+            if let Some(app) = &app_handle_clone {
+                let _ = app.emit("download-progress", ());
+            }
+            scheduler_self.save_tasks().await;
+        });
+
+        Ok(())
+    }
+
     /// 开始所有待开始/已暂停任务（定时 StartAll / ResumeAll / 手动触发共用）
     pub async fn start_all_pending(
         &self,
@@ -637,6 +1047,14 @@ impl Scheduler {
             let mut st = task.status.lock().await;
             if *st == TaskStatus::Downloading {
                 *st = TaskStatus::Paused;
+            }
+        }
+        // 种子任务直接暂停引擎里的 torrent，不必等轮询器发现状态变化（手感差异明显）
+        if task.kind.is_torrent() {
+            if let Ok(engine) = self.torrent_engine().await {
+                if let Err(e) = engine.pause(task_id).await {
+                    *task.error_message.lock().await = Some(format!("暂停失败: {e}"));
+                }
             }
         }
         self.save_tasks().await;
@@ -1255,6 +1673,8 @@ impl Clone for Scheduler {
             limits: self.limits.clone(),
             duplicate_action: self.duplicate_action.clone(),
             speed_limit: self.speed_limit.clone(),
+            torrent_cfg: self.torrent_cfg.clone(),
+            torrent_engine: self.torrent_engine.clone(),
         }
     }
 }
@@ -1262,18 +1682,50 @@ impl Clone for Scheduler {
 async fn task_to_info(t: &Arc<Task>) -> TaskInfo {
     let status = *t.status.lock().await;
     let err = t.error_message.lock().await.clone();
+    let is_torrent = t.kind.is_torrent();
+    // 种子任务的 peer/上传/文件表来自引擎轮询快照；HTTP 任务全部为 None
+    let stats = if is_torrent {
+        t.torrent_stats.lock().await.clone()
+    } else {
+        None
+    };
     TaskInfo {
         id: t.id.clone(),
         url: t.url.clone(),
         filename: t.filename.clone(),
         save_path: t.save_path.clone(),
-        total_bytes: t.total_bytes,
+        total_bytes: t.effective_total_bytes(),
         downloaded_bytes: t.downloaded.load(std::sync::atomic::Ordering::Relaxed),
         status,
         error_message: err,
         speed_bps: t.speed_bps(),
         created_at: t.created_at,
+        kind: t.kind,
+        upload_speed_bps: is_torrent.then(|| stats.as_ref().map_or(0, |s| s.upload_speed_bps)),
+        uploaded_bytes: is_torrent.then(|| stats.as_ref().map_or(0, |s| s.uploaded_bytes)),
+        peers: is_torrent.then(|| stats.as_ref().map_or(0, |s| s.peers)),
+        seeds: if is_torrent {
+            stats.as_ref().and_then(|s| s.seeds)
+        } else {
+            None
+        },
+        files: stats
+            .as_ref()
+            .map(|s| s.files.clone())
+            .filter(|f| !f.is_empty()),
+        // HTTP 任务没有"元数据解析"阶段，恒为就绪，避免前端出现无意义的等待态
+        metadata_ready: if is_torrent {
+            t.torrent.as_ref().map(|m| m.metadata_ready).unwrap_or(false)
+        } else {
+            true
+        },
     }
+}
+
+/// 种子 metainfo 的 base64 编码（持久化用，避免二进制进 JSON）。
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    STANDARD.encode(bytes)
 }
 
 /// 为重复文件名生成不冲突的名称：a.zip → a (1).zip → a (2).zip
@@ -1448,8 +1900,7 @@ mod tests {
                     total_bytes: Some(100),
                     suggested_filename: "f.zip".into(),
                     final_url: "http://example.com/f.zip".into(),
-                    etag: None,
-                    last_modified: None,
+                    ..Default::default()
                 }),
                 false,
                 None,
@@ -1505,8 +1956,7 @@ mod tests {
                 total_bytes: Some(100),
                 suggested_filename: "a.zip".into(),
                 final_url: "http://example.com/a.zip".into(),
-                etag: None,
-                last_modified: None,
+                ..Default::default()
             }),
             false,
             None,

@@ -60,6 +60,19 @@ pub struct AppSettings {
     /// 浏览器捕获域名黑名单（一行一个域名，子域名同样命中）
     #[serde(default)]
     pub capture_domain_blacklist: Vec<String>,
+    // ── BitTorrent（磁力链接 / 种子）──
+    /// 是否启用 DHT：磁力链接没有可用 tracker 时靠它找 peer
+    #[serde(default = "default_true")]
+    pub torrent_enable_dht: bool,
+    /// 是否关闭本地服务发现（LSD 走组播，容易触发防火墙弹窗）
+    #[serde(default = "default_true")]
+    pub torrent_disable_lsd: bool,
+    /// BT 监听端口；0 表示随机端口（避免与其它 BT 客户端冲突）
+    #[serde(default)]
+    pub torrent_listen_port: u16,
+    /// 种子任务上传限速（KB/s），0 表示不限速
+    #[serde(default)]
+    pub torrent_upload_limit_kbps: u32,
 }
 
 fn default_true() -> bool {
@@ -90,6 +103,11 @@ impl Default for AppSettings {
             global_speed_limit_kbps: 0,
             capture_enabled: true,
             capture_domain_blacklist: Vec::new(),
+            torrent_enable_dht: true,
+            // 默认关闭 LSD：组播会在三平台触发防火墙提示，且对下载帮助有限
+            torrent_disable_lsd: true,
+            torrent_listen_port: 0,
+            torrent_upload_limit_kbps: 0,
         }
     }
 }

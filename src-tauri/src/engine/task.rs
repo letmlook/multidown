@@ -1,4 +1,6 @@
-use crate::engine::types::{CreateTaskInput, TaskId, TaskStatus, MIN_SEGMENT_SIZE};
+use crate::engine::types::{
+    CreateTaskInput, TaskId, TaskKind, TaskStatus, TorrentMeta, MIN_SEGMENT_SIZE,
+};
 use crate::network::AuthConfig;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +35,18 @@ pub struct Task {
     /// 续传一致性校验：远端 ETag / Last-Modified
     pub etag: Arc<Mutex<Option<String>>>,
     pub last_modified: Arc<Mutex<Option<String>>>,
+    /// 协议类型：HTTP 分段下载 / BitTorrent
+    pub kind: TaskKind,
+    /// 种子任务的持久化元数据；HTTP 任务为 None
+    pub torrent: Option<TorrentMeta>,
+    /// 动态总大小。
+    ///
+    /// BT 在元数据解析完成前不知道总大小，而 `total_bytes` 在 HTTP 路径上是不可变的，
+    /// 所以种子任务单独用它承载"随元数据到达而变化"的总大小，
+    /// 这样 `writer.rs` / probe / 分段逻辑一行都不用改。
+    pub total_dynamic: Arc<AtomicU64>,
+    /// 种子任务的实时状态（peer 数 / 上传速度 / 文件表）；HTTP 任务为 None
+    pub torrent_stats: Arc<Mutex<Option<crate::engine::types::TorrentStatsSnapshot>>>,
 }
 
 impl Task {
@@ -80,7 +94,71 @@ impl Task {
             extra_headers: input.extra_headers,
             etag: Arc::new(Mutex::new(None)),
             last_modified: Arc::new(Mutex::new(None)),
+            kind: TaskKind::Http,
+            torrent: None,
+            total_dynamic: Arc::new(AtomicU64::new(0)),
+            torrent_stats: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 新建 BitTorrent 任务。
+    ///
+    /// 此时通常还没有元数据（磁力链接），所以 `filename` 允许用 info hash 之类的占位名，
+    /// `total_bytes` 未知；两者都会在元数据解析完成后被回填。
+    pub fn new_torrent(meta: TorrentMeta, save_dir: String, filename: String) -> Self {
+        let save_path = std::path::Path::new(&save_dir)
+            .join(&filename)
+            .to_string_lossy()
+            .to_string();
+        Self {
+            id: crate::engine::types::new_task_id(),
+            url: meta.input.clone(),
+            save_path,
+            filename,
+            total_bytes: None,
+            downloaded: Arc::new(AtomicU64::new(0)),
+            status: Arc::new(Mutex::new(TaskStatus::Pending)),
+            error_message: Arc::new(Mutex::new(None)),
+            // BT 不使用线性分段队列（分片调度由引擎内部负责）
+            pending_segments: Arc::new(Mutex::new(VecDeque::new())),
+            supports_range: false,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            last_downloaded: Arc::new(AtomicU64::new(0)),
+            last_speed_time: Arc::new(Mutex::new(None)),
+            auth: None,
+            extra_headers: Vec::new(),
+            etag: Arc::new(Mutex::new(None)),
+            last_modified: Arc::new(Mutex::new(None)),
+            kind: TaskKind::Torrent,
+            torrent: Some(meta),
+            total_dynamic: Arc::new(AtomicU64::new(0)),
+            torrent_stats: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// 任务的有效总大小：种子任务以 `total_dynamic` 为准（元数据就绪前为 None）。
+    pub fn effective_total_bytes(&self) -> Option<u64> {
+        if self.kind.is_torrent() {
+            match self.total_dynamic.load(Ordering::Relaxed) {
+                0 => None,
+                n => Some(n),
+            }
+        } else {
+            self.total_bytes
+        }
+    }
+
+    /// 元数据解析完成后回填总大小。
+    pub fn set_torrent_total(&self, total: u64) {
+        self.total_dynamic.store(total, Ordering::Relaxed);
+    }
+
+    /// 更新种子任务的运行时快照（peer / 上传速度）。
+    pub async fn set_torrent_stats(&self, snapshot: crate::engine::types::TorrentStatsSnapshot) {
+        *self.torrent_stats.lock().await = Some(snapshot);
     }
 
     pub fn downloaded_bytes(&self) -> u64 {

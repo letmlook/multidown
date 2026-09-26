@@ -1,6 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState, useEffect } from "react";
-import type { AppSettings, AuthConfig, ProbeResult } from "../types/download";
+import type {
+  AppSettings,
+  AuthConfig,
+  ProbeResult,
+  ResolvedTorrent,
+} from "../types/download";
+import { isTorrentInput } from "../types/download";
 
 interface AddTaskProps {
   open: boolean;
@@ -10,6 +16,13 @@ interface AddTaskProps {
 
 const LAST_SAVE_DIR_KEY = "multidown-last-save-dir";
 const DUPLICATE_ASK = "DUPLICATE_ASK";
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
 
 export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
   const [url, setUrl] = useState("");
@@ -24,6 +37,12 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // ── 种子（磁力链接 / .torrent）──
+  const [torrent, setTorrent] = useState<ResolvedTorrent | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [resolving, setResolving] = useState(false);
+
+  const isTorrent = isTorrentInput(url);
 
   useEffect(() => {
     if (!open) return;
@@ -45,8 +64,43 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
     })();
   }, [open]);
 
+  // 输入内容变了就丢弃上一次的解析结果，避免张冠李戴
+  useEffect(() => {
+    setTorrent(null);
+    setSelected(new Set());
+  }, [url]);
+
+  /** 解析磁力链接/种子（磁力链接需要联网找元数据，可能较慢） */
+  const handleResolveTorrent = async (): Promise<ResolvedTorrent | null> => {
+    if (!url.trim()) return null;
+    setError(null);
+    setResolving(true);
+    try {
+      const result = await invoke<ResolvedTorrent>("resolve_torrent", {
+        input: url.trim(),
+      });
+      setTorrent(result);
+      setSelected(new Set(result.files.map((f) => f.index)));
+      if (result.files.length === 1 && !filename) {
+        setFilename(result.files[0].name);
+      }
+      return result;
+    } catch (e) {
+      setError(String(e));
+      setTorrent(null);
+      return null;
+    } finally {
+      setResolving(false);
+    }
+  };
+
   const handleProbe = async () => {
     if (!url.trim()) return;
+    // 磁力链接/种子走解析路径，不能走 HTTP 探测
+    if (isTorrent) {
+      await handleResolveTorrent();
+      return;
+    }
     setError(null);
     setLoading(true);
     try {
@@ -61,6 +115,15 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
     }
   };
 
+  const toggleFile = (index: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!url.trim()) return;
@@ -68,6 +131,52 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
     setLoading(true);
     try {
       const dir = saveDir.trim() || ".";
+
+      // ── 种子任务：解析（若尚未解析）→ 建任务 → 启动 ──
+      if (isTorrent) {
+        const resolved = torrent ?? (await handleResolveTorrent());
+        if (!resolved) return;
+        if (selected.size === 0) {
+          setError("请至少选择一个要下载的文件");
+          return;
+        }
+        const allSelected = selected.size === resolved.files.length;
+        const createArgs = {
+          input: url.trim(),
+          saveDir: dir,
+          filename: filename.trim() || undefined,
+          // 全选时传 undefined，语义更清晰（后端按"全部"处理）
+          selectedFiles: allSelected
+            ? undefined
+            : Array.from(selected).sort((a, b) => a - b),
+          metainfoB64: resolved.metainfo_b64,
+          infoHash: resolved.info_hash,
+        };
+        let taskId: string;
+        try {
+          taskId = await invoke<string>("create_torrent_download", createArgs);
+        } catch (err) {
+          if (String(err) !== DUPLICATE_ASK) throw err;
+          if (!window.confirm("已存在相同种子的任务，仍然重新下载吗？")) return;
+          taskId = await invoke<string>("create_torrent_download", {
+            ...createArgs,
+            force: true,
+          });
+        }
+        await invoke("start_download", { taskId });
+        try {
+          localStorage.setItem(LAST_SAVE_DIR_KEY, dir);
+        } catch {}
+        setUrl("");
+        setFilename("");
+        setTorrent(null);
+        setSelected(new Set());
+        onAdded();
+        onClose();
+        return;
+      }
+
+      // ── 普通 HTTP 任务 ──
       // 勾选授权且填写了用户名时启用 Basic 认证
       const auth: AuthConfig | undefined =
         useAuth && username.trim()
@@ -127,31 +236,94 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
               <label className="add-task-address-label">地址</label>
               <div className="add-task-address-input-wrap">
                 <input
-                  type="url"
+                  // 不用 type="url"：magnet: 链接通不过浏览器的 url 校验
+                  type="text"
                   className="add-task-address-input"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  placeholder="https://..."
+                  placeholder="https://... 或 magnet:?xt=urn:btih:..."
                 />
                 <button
                   type="button"
                   className="add-task-dropdown-btn"
                   onClick={handleProbe}
-                  disabled={loading}
-                  title="探测"
+                  disabled={loading || resolving}
+                  title={isTorrent ? "解析种子元数据" : "探测"}
                 >
-                  ▼
+                  {resolving ? "…" : "▼"}
                 </button>
               </div>
               <div className="add-task-actions">
-                <button type="submit" className="btn btn-primary" disabled={loading}>
-                  确定(K)
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={loading || resolving}
+                >
+                  {isTorrent && !torrent ? "解析并下载(K)" : "确定(K)"}
                 </button>
                 <button type="button" className="btn" onClick={onClose}>
                   取消(C)
                 </button>
               </div>
             </div>
+
+            {isTorrent && (
+              <div className="add-task-probe-hint">
+                {resolving
+                  ? "正在解析种子元数据…（磁力链接需要从 DHT/tracker 获取元数据，可能需要一会儿）"
+                  : torrent
+                    ? `种子: ${torrent.name} · ${torrent.files.length} 个文件 · 共 ${formatBytes(
+                        torrent.total_bytes,
+                      )} · info hash ${torrent.info_hash.slice(0, 12)}…`
+                    : "已识别为磁力链接/种子文件"}
+              </div>
+            )}
+
+            {torrent && torrent.files.length > 0 && (
+              <div className="add-task-torrent-files">
+                <div className="add-task-torrent-files-head">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={selected.size === torrent.files.length}
+                      onChange={(e) =>
+                        setSelected(
+                          e.target.checked
+                            ? new Set(torrent.files.map((f) => f.index))
+                            : new Set(),
+                        )
+                      }
+                    />
+                    <span>全选</span>
+                  </label>
+                  <span className="add-task-torrent-summary">
+                    已选 {selected.size}/{torrent.files.length} ·{" "}
+                    {formatBytes(
+                      torrent.files
+                        .filter((f) => selected.has(f.index))
+                        .reduce((sum, f) => sum + f.length, 0),
+                    )}
+                  </span>
+                </div>
+                <div className="add-task-torrent-file-list">
+                  {torrent.files.map((f) => (
+                    <label key={f.index} className="add-task-torrent-file">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(f.index)}
+                        onChange={() => toggleFile(f.index)}
+                      />
+                      <span className="add-task-torrent-file-name" title={f.name}>
+                        {f.name}
+                      </span>
+                      <span className="add-task-torrent-file-size">
+                        {formatBytes(f.length)}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {probeResult && (
               <div className="add-task-probe-hint">
@@ -161,6 +333,9 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
               </div>
             )}
 
+            {/* 授权与请求头只对 HTTP 任务有意义 */}
+            {!isTorrent && (
+              <>
             <label className="add-task-auth-check">
               <input
                 type="checkbox"
@@ -219,6 +394,8 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
                 />
               </div>
             </details>
+              </>
+            )}
 
             <details className="add-task-extra" style={{ marginTop: 12 }}>
               <summary>保存路径与文件名</summary>

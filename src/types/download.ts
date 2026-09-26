@@ -6,6 +6,19 @@ export type TaskStatus =
   | "failed"
   | "cancelled";
 
+/** 任务协议类型；旧任务数据默认为 "http" */
+export type TaskKind = "http" | "torrent";
+
+/** 种子内的单个文件（对应 Rust TorrentFileInfo） */
+export interface TorrentFileInfo {
+  index: number;
+  /** 相对种子根目录的路径 */
+  name: string;
+  length: number;
+  progress_bytes: number;
+  selected: boolean;
+}
+
 export interface TaskInfo {
   id: string;
   url: string;
@@ -17,15 +30,60 @@ export interface TaskInfo {
   error_message: string | null;
   speed_bps: number | null;
   created_at: number;
+  kind: TaskKind;
+  // ── 以下仅种子任务有值（HTTP 任务为 null）──
+  upload_speed_bps: number | null;
+  uploaded_bytes: number | null;
+  /** 已连接的 peer 数 */
+  peers: number | null;
+  /** 其中已完成全部分片的 peer 数（做种方） */
+  seeds: number | null;
+  files: TorrentFileInfo[] | null;
+  /** 元数据是否就绪；磁力链接刚添加时为 false */
+  metadata_ready: boolean;
 }
 
+/** 探测出的资源类型（对应 Rust ProbeKind） */
+export type ProbeKind = "http" | "torrent";
+
 export interface ProbeResult {
+  kind: ProbeKind;
   supports_range: boolean;
   total_bytes: number | null;
   suggested_filename: string;
   final_url: string;
   etag?: string | null;
   last_modified?: string | null;
+}
+
+/** 种子内的单个文件（resolve_torrent 返回） */
+export interface ResolvedTorrentFile {
+  index: number;
+  name: string;
+  length: number;
+}
+
+/** 磁力链接 / 种子文件的解析结果（对应 Rust ResolvedTorrent） */
+export interface ResolvedTorrent {
+  info_hash: string;
+  name: string;
+  total_bytes: number;
+  multi_file: boolean;
+  files: ResolvedTorrentFile[];
+  /** 缓存的 metainfo，回传后端可避免二次解析 */
+  metainfo_b64: string;
+}
+
+/** 判断输入是否为磁力链接或种子文件（与后端 torrent::detect::sniff 对齐） */
+export function isTorrentInput(input: string): boolean {
+  const s = input.trim().toLowerCase();
+  if (s.startsWith("magnet:?")) return true;
+  if (s.startsWith("file://")) return s.split(/[?#]/)[0].endsWith(".torrent");
+  if (s.startsWith("http://") || s.startsWith("https://")) {
+    const afterScheme = s.split("://")[1] ?? "";
+    return afterScheme.split(/[?#]/)[0].endsWith(".torrent");
+  }
+  return s.endsWith(".torrent");
 }
 
 /** HTTP 认证配置（与 Rust AuthConfig 对应） */

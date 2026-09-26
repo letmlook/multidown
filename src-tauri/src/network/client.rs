@@ -79,9 +79,22 @@ fn apply_request_options(mut rb: reqwest::RequestBuilder, options: &NetworkOptio
     rb
 }
 
+/// 探测出的资源类型。`Torrent` 表示这其实是一个 `.torrent` 种子文件，
+/// 调用方应该先把它取回内存再交给 BT 引擎，而不是当作普通文件下载。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeKind {
+    #[default]
+    Http,
+    Torrent,
+}
+
 /// 协议探测结果：是否支持 Range、总大小、建议文件名、最终 URL、一致性校验字段
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeResult {
+    /// 资源类型；旧前端忽略该字段
+    #[serde(default)]
+    pub kind: ProbeKind,
     pub supports_range: bool,
     pub total_bytes: Option<u64>,
     pub suggested_filename: String,
@@ -122,6 +135,8 @@ pub async fn probe_with_client(
     let status = resp.status();
     let headers = resp.headers().clone();
     let final_url = resp.url().to_string();
+    // 重定向后才是真实路径，判断 .torrent 必须用它
+    let final_path_lower = resp.url().path().to_ascii_lowercase();
 
     let etag = headers
         .get("etag")
@@ -182,7 +197,16 @@ pub async fn probe_with_client(
         .and_then(parse_content_disposition_filename)
         .unwrap_or_else(|| url_path_basename(url.path()));
 
+    // 判定这是不是一个 .torrent 种子文件。三个信号任一命中即可：
+    // ① Content-Type ② 最终 URL 的路径后缀 ③ Content-Disposition 里的文件名后缀
+    let kind = if is_torrent_response(&headers, &final_path_lower, &suggested_filename) {
+        ProbeKind::Torrent
+    } else {
+        ProbeKind::Http
+    };
+
     Ok(ProbeResult {
+        kind,
         supports_range,
         total_bytes,
         suggested_filename,
@@ -190,6 +214,23 @@ pub async fn probe_with_client(
         etag,
         last_modified,
     })
+}
+
+/// `.torrent` 响应的判定（抽成纯函数便于单测）。
+pub fn is_torrent_response(
+    headers: &reqwest::header::HeaderMap,
+    final_path_lower: &str,
+    suggested_filename: &str,
+) -> bool {
+    let content_type_torrent = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("application/x-bittorrent"))
+        .unwrap_or(false);
+
+    content_type_torrent
+        || final_path_lower.ends_with(".torrent")
+        || suggested_filename.to_ascii_lowercase().ends_with(".torrent")
 }
 
 fn parse_content_disposition_filename(disp: &str) -> Option<String> {
@@ -311,5 +352,80 @@ mod tests {
         assert!(json.contains("\"kind\":\"basic\""));
         let back: AuthConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AuthConfig::Basic { .. }));
+    }
+
+    fn headers_with(content_type: Option<&str>) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        if let Some(ct) = content_type {
+            h.insert(reqwest::header::CONTENT_TYPE, ct.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn detects_torrent_by_content_type() {
+        // 典型场景：URL 没有 .torrent 后缀，但服务器返回种子 MIME
+        assert!(is_torrent_response(
+            &headers_with(Some("application/x-bittorrent")),
+            "/download.php",
+            "download.php"
+        ));
+        // 带 charset 参数也要命中
+        assert!(is_torrent_response(
+            &headers_with(Some("application/x-bittorrent; charset=binary")),
+            "/x",
+            "x"
+        ));
+    }
+
+    #[test]
+    fn detects_torrent_by_url_path_and_filename() {
+        assert!(is_torrent_response(
+            &headers_with(Some("application/octet-stream")),
+            "/a/ubuntu.torrent",
+            "ubuntu.torrent"
+        ));
+        // 重定向后路径是 .torrent
+        assert!(is_torrent_response(
+            &headers_with(None),
+            "/real.torrent",
+            "whatever.bin"
+        ));
+        // Content-Disposition 的文件名是 .torrent
+        assert!(is_torrent_response(
+            &headers_with(None),
+            "/download",
+            "ubuntu.torrent"
+        ));
+    }
+
+    #[test]
+    fn does_not_misdetect_regular_files() {
+        assert!(!is_torrent_response(
+            &headers_with(Some("application/zip")),
+            "/a/big.zip",
+            "big.zip"
+        ));
+        assert!(!is_torrent_response(&headers_with(None), "/", "download"));
+        // 只是文件名里含 torrent 字样但后缀不同
+        assert!(!is_torrent_response(
+            &headers_with(None),
+            "/torrent-list.txt",
+            "torrent-list.txt"
+        ));
+    }
+
+    #[test]
+    fn probe_kind_defaults_to_http_for_older_payloads() {
+        // 模拟升级前写入的旧 probe 结果（没有 kind 字段）
+        let legacy = r#"{
+            "supports_range": true,
+            "total_bytes": 100,
+            "suggested_filename": "a.zip",
+            "final_url": "https://x/a.zip"
+        }"#;
+        let parsed: ProbeResult = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.kind, ProbeKind::Http);
+        assert_eq!(parsed.suggested_filename, "a.zip");
     }
 }
