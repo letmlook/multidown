@@ -26,6 +26,8 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Setup Rust cache
         uses: swatinem/rust-cache@v2
@@ -47,6 +49,18 @@ jobs:
 
       - name: Type check
         run: npx tsc --noEmit
+
+      - name: Build native messaging host
+        working-directory: integration/native-host
+        run: cargo build --release
+
+      - name: Run unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Clippy（正确性检查，风格告警不阻断）
+        working-directory: src-tauri
+        run: cargo clippy -- -D clippy::correctness -D clippy::suspicious
 
       - name: Build Tauri
         run: npm run tauri build

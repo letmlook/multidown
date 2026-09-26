@@ -24,6 +24,8 @@ impl TokenBucket {
         }
     }
 
+    /// 当前限速值（测试与诊断用）
+    #[allow(dead_code)]
     pub fn rate_bps(&self) -> u64 {
         self.rate_bps.load(Ordering::Relaxed)
     }

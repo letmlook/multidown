@@ -48,6 +48,31 @@ if (fs.existsSync(srcIcons) && !fs.existsSync(destIcons)) {
 }
 console.log(`   Copied to: ${unpackedDir}`);
 
+// ─── Firefox 变体：MV3 in Firefox 用 event page（background.scripts），需 gecko ID ───
+const firefoxDir = path.resolve(outputDir, 'firefox-unpacked');
+if (fs.existsSync(firefoxDir)) {
+  fs.rmSync(firefoxDir, { recursive: true });
+}
+fs.mkdirSync(firefoxDir, { recursive: true });
+copyDir(unpackedDir, firefoxDir);
+
+const ffManifestPath = path.join(firefoxDir, 'manifest.json');
+try {
+  const ffManifest = JSON.parse(fs.readFileSync(ffManifestPath, 'utf-8'));
+  delete ffManifest.background.service_worker;
+  ffManifest.background = { scripts: ['background.js'] };
+  ffManifest.browser_specific_settings = {
+    gecko: {
+      id: 'multidown@letmlook',
+      strict_min_version: '115.0'
+    }
+  };
+  fs.writeFileSync(ffManifestPath, JSON.stringify(ffManifest, null, 2));
+  console.log(`🦊 Firefox variant written to: ${firefoxDir}`);
+} catch (e) {
+  console.log(`⚠️  Firefox manifest generation failed: ${e.message}`);
+}
+
 // Generate a simple ZIP package for Chrome developer mode loading
 const zipPath = path.resolve(outputDir, 'multidown-extension.zip');
 console.log('\n📁 Creating ZIP package...');
@@ -118,7 +143,8 @@ console.log('\n==========================================');
 console.log('   Extension Build Complete!');
 console.log('==========================================');
 console.log('\n📦 Extension packages:');
-console.log(`   📂 Unpacked: ${unpackedDir}`);
+console.log(`   📂 Unpacked (Chromium): ${unpackedDir}`);
+console.log(`   🦊 Firefox:             ${firefoxDir}`);
 if (fs.existsSync(zipPath)) {
   console.log(`   📁 ZIP:     ${zipPath}`);
 }

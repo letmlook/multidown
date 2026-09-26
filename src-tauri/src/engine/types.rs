@@ -74,6 +74,7 @@ pub fn new_task_id() -> TaskId {
 // ── Category Rule summary (for frontend list) ──────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct RuleSummary {
     pub id: String,
     pub pattern: String,
@@ -97,6 +98,7 @@ pub struct MatchResult {
 // ── Schedule task summary ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct ScheduleTaskSummary {
     pub id: String,
     pub name: String,
@@ -111,6 +113,7 @@ pub struct ScheduleTaskSummary {
 // ── Batch summary ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct BatchSummary {
     pub id: String,
     pub name: String,

@@ -84,6 +84,7 @@ impl Scheduler {
     }
 
     /// Set the queue manager reference
+    #[allow(dead_code)]
     pub fn set_queue_manager(&mut self, qm: GlobalQueueManager) {
         self.queue_manager = Some(qm);
     }
@@ -141,6 +142,7 @@ impl Scheduler {
         let _ = save_tasks_to_file(&path, &snapshots).await;
     }
 
+    #[allow(dead_code)]
     pub async fn probe(&self, url: &str) -> Result<ProbeResult, crate::network::NetworkError> {
         probe(url).await
     }
@@ -216,7 +218,7 @@ impl Scheduler {
         &self,
         url: String,
         save_dir: String,
-        mut filename: Option<String>,
+        filename: Option<String>,
         probe_result: Option<ProbeResult>,
         force: bool,
         auth: Option<AuthConfig>,
@@ -553,6 +555,58 @@ impl Scheduler {
         started
     }
 
+    /// 重试失败任务：失败时分段可能已从队列丢失，重置为全量重下保证文件完整
+    pub async fn retry_task(&self, task_id: &str) -> Result<(), String> {
+        let task = {
+            let tasks = self.tasks.lock().await;
+            tasks.get(task_id).cloned().ok_or_else(|| "任务不存在".to_string())?
+        };
+        Self::reset_failed_task(&task).await?;
+        self.save_tasks().await;
+        Ok(())
+    }
+
+    /// 重试批次内所有失败任务（重置后由 start_batch 重新启动）
+    pub async fn retry_batch(&self, batch_id: &str) -> Result<usize, String> {
+        let job = self
+            .batch_manager
+            .get_job(batch_id)
+            .await
+            .ok_or("批次不存在")?;
+        let tasks = self.tasks.lock().await;
+        let mut n = 0;
+        for id in &job.task_ids {
+            if let Some(task) = tasks.get(id) {
+                if *task.status.lock().await == TaskStatus::Failed {
+                    if Self::reset_failed_task(task).await.is_ok() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        drop(tasks);
+        self.save_tasks().await;
+        Ok(n)
+    }
+
+    /// 把失败任务重置为 Pending 并恢复全量分段
+    async fn reset_failed_task(task: &Arc<Task>) -> Result<(), String> {
+        let st = *task.status.lock().await;
+        if st != TaskStatus::Failed {
+            return Err("只有失败的任务可以重试".to_string());
+        }
+        if let Some(total) = task.total_bytes.filter(|&t| t > 0) {
+            *task.pending_segments.lock().await =
+                std::collections::VecDeque::from_iter(std::iter::once((0, total - 1)));
+        } else {
+            task.pending_segments.lock().await.clear();
+        }
+        task.downloaded.store(0, std::sync::atomic::Ordering::Relaxed);
+        *task.error_message.lock().await = None;
+        *task.status.lock().await = TaskStatus::Pending;
+        Ok(())
+    }
+
     /// 暂停所有下载中任务
     pub async fn pause_all(&self) -> usize {
         let ids: Vec<TaskId> = {
@@ -835,6 +889,7 @@ impl Scheduler {
     }
 
     /// Get queue manager save path for persistence
+    #[allow(dead_code)]
     pub fn queue_save_path(&self) -> Option<PathBuf> {
         self.save_path.as_ref().map(|p| {
             p.parent().unwrap_or(std::path::Path::new(".")).join("queues.json")
@@ -842,6 +897,7 @@ impl Scheduler {
     }
 
     /// Save queue state
+    #[allow(dead_code)]
     pub async fn save_queues(&self) {
         if let (Some(ref qm), Some(ref path)) = (&self.queue_manager, self.queue_save_path()) {
             let manager = qm.lock().await;
@@ -1073,6 +1129,7 @@ impl Scheduler {
     }
 
     /// Test which rule matches a URL, return the matched save path or None
+    #[allow(dead_code)]
     pub async fn test_rules(&self, url: &str) -> Option<String> {
         let rules = self.rule_manager.read().await;
         let filename = url.rsplit('/').next().unwrap_or("download");

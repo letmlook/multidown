@@ -66,6 +66,7 @@ impl BatchJob {
         }
     }
 
+    #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         self.urls.len().saturating_sub(self.added_count)
     }
@@ -182,6 +183,7 @@ impl BatchManager {
         jobs.iter().find(|j| j.id == id).cloned()
     }
 
+    #[allow(dead_code)]
     pub async fn list_jobs(&self) -> Vec<BatchJobInfo> {
         let jobs = self.jobs.read().await;
         jobs.iter().map(BatchJobInfo::from).collect()
@@ -205,12 +207,14 @@ impl BatchManager {
     }
 
     /// 获取任务ID列表
+    #[allow(dead_code)]
     pub async fn get_task_ids(&self, id: &str) -> Option<Vec<String>> {
         let jobs = self.jobs.read().await;
         jobs.iter().find(|j| j.id == id).map(|j| j.task_ids.clone())
     }
 
     /// 删除已完成且任务全部完成的批量任务
+    #[allow(dead_code)]
     pub async fn cleanup_completed(&self) {
         let mut jobs = self.jobs.write().await;
         jobs.retain(|j| {
@@ -233,6 +237,7 @@ pub struct BatchScheduler {
     probe_concurrency: usize,
 }
 
+#[allow(dead_code)]
 impl BatchScheduler {
     pub fn new(scheduler: Arc<Scheduler>, manager: Arc<BatchManager>) -> Self {
         Self {
@@ -513,7 +518,7 @@ fn probe_batch(
     use tokio::sync::Semaphore;
     use std::sync::Arc;
 
-    let sem = Arc::new(Semaphore::new(concurrency.min(1).max(10)));
+    let sem = Arc::new(Semaphore::new(concurrency.max(1).min(10)));
     let mut handles = Vec::new();
 
     for url in urls {

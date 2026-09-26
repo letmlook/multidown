@@ -57,6 +57,9 @@ const defaultSettings: AppSettings = {
   timeout_secs: 30,
   save_progress_interval_secs: 30,
   global_speed_limit_kbps: 0,
+  capture_enabled: true,
+  capture_domain_blacklist: [],
+  allow_insecure_tls: false,
 };
 
 function newRule(): CategoryRule {
@@ -663,6 +666,36 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                   </label>
                 </div>
               )}
+              {tab === "general" && settings != null && (
+                <div className="options-section" style={{ marginTop: 12 }}>
+                  <div className="options-section-title">浏览器捕获</div>
+                  <label className="form-check-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.capture_enabled ?? true}
+                      onChange={(e) => update({ capture_enabled: e.target.checked })}
+                    />
+                    <span>允许浏览器扩展接管下载</span>
+                  </label>
+                  <div className="form-group" style={{ marginTop: 8 }}>
+                    <label>域名黑名单（一行一个域名，子域名同样命中）</label>
+                    <textarea
+                      value={(settings.capture_domain_blacklist ?? []).join("\n")}
+                      onChange={(e) =>
+                        update({
+                          capture_domain_blacklist: e.target.value
+                            .split("\n")
+                            .map((x) => x.trim())
+                            .filter(Boolean),
+                        })
+                      }
+                      rows={3}
+                      placeholder="例如：example.com"
+                      style={{ width: "100%", padding: "6px 10px", boxSizing: "border-box", fontFamily: "monospace" }}
+                    />
+                  </div>
+                </div>
+              )}
               {tab === "download" && (
                 <div className="options-section">
                   <div className="options-section-title">默认下载设置</div>
@@ -787,6 +820,14 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                       <span style={{ color: "#666", fontSize: 12 }}>0 表示不限速</span>
                     </div>
                   </div>
+                  <label className="form-check-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.allow_insecure_tls ?? false}
+                      onChange={(e) => update({ allow_insecure_tls: e.target.checked })}
+                    />
+                    <span>允许无效 TLS 证书（自签名场景，存在安全风险）</span>
+                  </label>
                   <div className="form-group">
                     <label>请求超时（秒）</label>
                     <input

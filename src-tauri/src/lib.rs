@@ -52,7 +52,7 @@ async fn list_queues(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::que
 async fn create_queue(
     name: String,
     max_concurrent: u32,
-    priority: Option<u32>,
+    _priority: Option<u32>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
     state.create_queue(name, max_concurrent).await
@@ -154,6 +154,24 @@ async fn create_batch(
         .await
 }
 
+/// 重试失败任务（重置为全量重下）
+#[tauri::command]
+async fn retry_task(
+    task_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state.retry_task(&task_id).await
+}
+
+/// 重试批次内所有失败任务
+#[tauri::command]
+async fn retry_batch(
+    batch_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<usize, String> {
+    state.retry_batch(&batch_id).await
+}
+
 /// 启动批次内所有待开始/已暂停任务
 #[tauri::command]
 async fn start_batch(
@@ -242,7 +260,7 @@ async fn create_rule(
 /// 更新分类规则
 #[tauri::command]
 async fn update_rule(
-    rule_id: String,
+    _rule_id: String,
     updates: engine::rules::CategoryRule,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<engine::rules::CategoryRule, String> {
@@ -330,7 +348,7 @@ async fn create_schedule_task(
 /// 更新计划任务
 #[tauri::command]
 async fn update_schedule_task(
-    id: String,
+    _id: String,
     updates: engine::schedule::ScheduleRule,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<engine::schedule::ScheduleRule, String> {
@@ -734,8 +752,27 @@ fn network_options_from_settings(settings: &AppSettings) -> NetworkOptions {
         proxy_url: effective_proxy_url(settings),
         timeout_secs: settings.timeout_secs,
         user_agent: Some(settings.user_agent.clone()).filter(|s| !s.is_empty()),
+        danger_accept_invalid_certs: settings.allow_insecure_tls,
         ..Default::default()
     }
+}
+
+/// 域名黑名单匹配：命中条目本身或其子域名
+fn domain_blacklisted(url: &str, blacklist: &[String]) -> bool {
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = host.split(':').next().unwrap_or("").to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    blacklist.iter().any(|entry| {
+        let entry = entry.trim().to_lowercase();
+        !entry.is_empty() && (host == entry || host.ends_with(&format!(".{}", entry)))
+    })
 }
 
 async fn network_options_from_app(app: &tauri::AppHandle) -> NetworkOptions {
@@ -1231,6 +1268,38 @@ async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, Stri
 }
 
 /// 注册 Native Host
+/// 解析 multidown://add?url=<encoded> 形式的唤起链接，返回目标下载地址
+fn parse_scheme_url(scheme_url: &str) -> Option<String> {
+    let rest = scheme_url.strip_prefix("multidown://")?;
+    // 形如 add?url=... 或 ?url=...
+    let query = rest.split_once('?').map(|(_, q)| q).unwrap_or(rest);
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "url" {
+                let decoded = urlencoding::decode(v).ok()?.into_owned();
+                if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                    return Some(decoded);
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Firefox Native Messaging manifest（要求 allowed_extensions 精确匹配扩展 ID）
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn firefox_manifest_content(native_host_path: &str) -> String {
+    serde_json::json!({
+        "name": "com.multidown.app",
+        "description": "Multidown Native Messaging Host",
+        "path": native_host_path,
+        "type": "stdio",
+        "allowed_extensions": ["multidown@letmlook"]
+    })
+    .to_string()
+}
+
 fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]{
         use winreg::enums::*;
@@ -1287,7 +1356,15 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         let path_edge = r"Software\Microsoft\Edge\NativeMessagingHosts\com.multidown.app";
         let (key_edge, _) = hkcu.create_subkey(path_edge).map_err(|e| e.to_string())?;
         key_edge.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
-        
+
+        // 注册 Firefox Native Host（Firefox 要求 allowed_extensions 精确匹配，单独写 manifest）
+        let ff_manifest_path = native_host_dir.join("com.multidown.app.firefox.json");
+        std::fs::write(&ff_manifest_path, firefox_manifest_content(&native_host_exe_path.to_string_lossy()))
+            .map_err(|e| e.to_string())?;
+        let path_ff = r"Software\Mozilla\NativeMessagingHosts\com.multidown.app";
+        let (key_ff, _) = hkcu.create_subkey(path_ff).map_err(|e| e.to_string())?;
+        key_ff.set_value("", &ff_manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
+
         Ok(())
     }
     #[cfg(target_os = "macos")]{
@@ -1311,12 +1388,25 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
             "type": "stdio",
             "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
         });
-        
+
         let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-        
+
         std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
         std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
-        
+
+        // Firefox：allowed_extensions 精确 ID
+        let mozilla_dir = home_dir.join("Library/Application Support/Mozilla/NativeMessagingHosts");
+        std::fs::create_dir_all(&mozilla_dir).map_err(|e| e.to_string())?;
+        let ff_manifest = serde_json::json!({
+            "name": "com.multidown.app",
+            "description": "Multidown Native Messaging Host",
+            "path": native_host_path.to_string_lossy().to_string(),
+            "type": "stdio",
+            "allowed_extensions": ["multidown@letmlook"]
+        });
+        let ff_str = serde_json::to_string_pretty(&ff_manifest).map_err(|e| e.to_string())?;
+        std::fs::write(mozilla_dir.join("com.multidown.app.json"), ff_str.as_bytes()).map_err(|e| e.to_string())?;
+
         Ok(())
     }
     #[cfg(target_os = "linux")]{
@@ -1324,6 +1414,7 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         let home_dir = dirs::home_dir().ok_or("无法获取用户主目录".to_string())?;
         let chrome_dir = home_dir.join(".config/google-chrome/NativeMessagingHosts");
         let edge_dir = home_dir.join(".config/microsoft-edge/NativeMessagingHosts");
+        let mozilla_dir = home_dir.join(".mozilla/native-messaging-hosts");
         
         std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
@@ -1340,12 +1431,24 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
             "type": "stdio",
             "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
         });
-        
+
         let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-        
+
         std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
         std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
-        
+
+        // Firefox：allowed_extensions 精确 ID
+        std::fs::create_dir_all(&mozilla_dir).map_err(|e| e.to_string())?;
+        let ff_manifest = serde_json::json!({
+            "name": "com.multidown.app",
+            "description": "Multidown Native Messaging Host",
+            "path": native_host_path.to_string_lossy().to_string(),
+            "type": "stdio",
+            "allowed_extensions": ["multidown@letmlook"]
+        });
+        let ff_str = serde_json::to_string_pretty(&ff_manifest).map_err(|e| e.to_string())?;
+        std::fs::write(mozilla_dir.join("com.multidown.app.json"), ff_str.as_bytes()).map_err(|e| e.to_string())?;
+
         Ok(())
     }
 }
@@ -1728,6 +1831,15 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 二次启动时唤起主窗口（deep-link 也依赖单实例语义）
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             let path = app
                 .path()
@@ -1761,6 +1873,55 @@ pub fn run() {
                 }
             }
             app.manage(scheduler);
+
+            // URL Scheme：multidown://add?url=... 直接唤起下载
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let sched_deep = sched_clone.clone();
+                let app_deep = app_handle.clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let url_str = url.to_string();
+                        let Some(task_url) = parse_scheme_url(&url_str) else {
+                            continue;
+                        };
+                        let sched = sched_deep.clone();
+                        let app = app_deep.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let settings = app_settings_path(&app)
+                                .ok()
+                                .and_then(|p| load_settings(&p).ok())
+                                .unwrap_or_default();
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                            if settings.show_start_dialog {
+                                let _ = app.emit(
+                                    "extension-download-request",
+                                    serde_json::json!({ "url": task_url, "filename": null }),
+                                );
+                                return;
+                            }
+                            if let Ok(id) = sched
+                                .create_task(task_url, default_save_dir_for_browser(&app), None, None)
+                                .await
+                            {
+                                let _ = sched
+                                    .start_download(
+                                        &id,
+                                        Some(app.clone()),
+                                        Some(sched.clone()),
+                                        Some(settings.max_connections_per_task as usize),
+                                        Some(network_options_from_settings(&settings)),
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
+                });
+            }
 
             // 计划任务后台 tick：每 20 秒检查一次规则并执行事件
             {
@@ -1887,6 +2048,7 @@ pub fn run() {
 
             // 浏览器扩展 Native Host：TCP 服务，接收扩展发来的消息并返回结果
             #[derive(Debug)]
+            #[allow(dead_code)]
             struct DownloadTask {
                 url: String,
                 filename: Option<String>,
@@ -2009,6 +2171,24 @@ pub fn run() {
                     debug_log(&app_handle_clone, "处理动作", Some(action));
                     
                     match action {
+                        "get_config" => {
+                            // 下发捕获配置给扩展（总开关 + 域名黑名单）
+                            let settings = app_settings_path(&app_handle_clone)
+                                .ok()
+                                .and_then(|p| load_settings(&p).ok())
+                                .unwrap_or_default();
+                            let resp = serde_json::json!({
+                                "ok": true,
+                                "config": {
+                                    "capture_enabled": settings.capture_enabled,
+                                    "domain_blacklist": settings.capture_domain_blacklist,
+                                }
+                            });
+                            let _ = writer
+                                .write_all(format!("{}\n", resp).as_bytes())
+                                .await;
+                            let _ = writer.shutdown().await;
+                        }
                         "download" => {
                             let url = msg
                                 .get("url")
@@ -2174,6 +2354,17 @@ pub fn run() {
                                 .ok()
                                 .and_then(|p| load_settings(&p).ok())
                                 .unwrap_or_default();
+
+                            // 捕获规则：总开关关闭或域名命中黑名单时拒绝
+                            if !settings.capture_enabled {
+                                let _ = responder.send(Err("浏览器捕获已在 Multidown 中关闭".to_string()));
+                                continue;
+                            }
+                            if domain_blacklisted(&url, &settings.capture_domain_blacklist) {
+                                debug_log(&app_worker, "URL 命中捕获黑名单，已拒绝", Some(&url));
+                                let _ = responder.send(Err("该域名已被捕获黑名单过滤".to_string()));
+                                continue;
+                            }
 
                             // 显示主窗口
                             let show_main = |app: &tauri::AppHandle| {
@@ -2369,6 +2560,8 @@ pub fn run() {
             list_batches,
             create_batch,
             start_batch,
+            retry_batch,
+            retry_task,
             add_task_to_batch,
             remove_task_from_batch,
             delete_batch,

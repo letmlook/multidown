@@ -300,6 +300,83 @@ fn handle_download_message(msg: &serde_json::Value, stdout: &mut impl Write) -> 
     true
 }
 
+/// 转发主程序的捕获配置（总开关 + 域名黑名单），供扩展端过滤
+fn handle_get_config_message(_msg: &serde_json::Value, stdout: &mut impl Write) -> bool {
+    let port = match port_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(s) => s.trim().parse::<u16>().unwrap_or(0),
+        None => 0,
+    };
+    if port == 0 {
+        // 主程序未运行：按默认开启处理，由扩展端继续尝试
+        let body = serde_json::json!({
+            "success": true,
+            "config": { "capture_enabled": true, "domain_blacklist": [] }
+        });
+        let bytes = body.to_string().into_bytes();
+        let len = bytes.len() as u32;
+        let _ = write_u32_le(stdout, len);
+        let _ = stdout.write_all(&bytes);
+        let _ = stdout.flush();
+        return true;
+    }
+
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            send_response(stdout, false, &format!("无法连接 Multidown: {}", e));
+            return false;
+        }
+    };
+    let line = format!("{}\n", serde_json::json!({ "action": "get_config" }));
+    if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
+        send_response(stdout, false, "发送失败");
+        return false;
+    }
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
+    let mut buf = vec![0u8; 4096];
+    let mut n = 0usize;
+    while n < buf.len() {
+        match stream.read(&mut buf[n..n + 1]) {
+            Ok(0) => break,
+            Ok(1) => {
+                if buf[n] == b'\n' {
+                    n += 1;
+                    break;
+                }
+                n += 1;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    match std::str::from_utf8(&buf[..n]) {
+        Ok(s) => {
+            let resp: serde_json::Value = serde_json::from_str(s.trim()).unwrap_or_else(|_| {
+                serde_json::json!({ "ok": true, "config": { "capture_enabled": true, "domain_blacklist": [] } })
+            });
+            let body = serde_json::json!({
+                "success": true,
+                "config": resp.get("config").cloned().unwrap_or_else(|| {
+                    serde_json::json!({ "capture_enabled": true, "domain_blacklist": [] })
+                })
+            });
+            let bytes = body.to_string().into_bytes();
+            let len = bytes.len() as u32;
+            let _ = write_u32_le(stdout, len);
+            let _ = stdout.write_all(&bytes);
+            let _ = stdout.flush();
+            true
+        }
+        Err(_) => {
+            send_response(stdout, false, "主程序响应无效");
+            false
+        }
+    }
+}
+
 fn handle_open_window_message(msg: &serde_json::Value, stdout: &mut impl Write) -> bool {
     let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
     
@@ -443,6 +520,10 @@ fn main() {
         "open_window" => {
             debug_log("处理打开窗口命令", None);
             handle_open_window_message(&msg, &mut stdout);
+        }
+        "get_config" => {
+            debug_log("处理配置查询命令", None);
+            handle_get_config_message(&msg, &mut stdout);
         }
         _ => {
             debug_log("未知命令", Some(action));

@@ -27,6 +27,7 @@ pub struct CategoryRule {
 
 impl CategoryRule {
     /// 判断规则是否匹配给定的 URL、文件名和 MIME
+    #[allow(dead_code)]
     pub fn matches(&self, url: &str, filename: &str, mime: Option<&str>) -> bool {
         if !self.enabled {
             return false;

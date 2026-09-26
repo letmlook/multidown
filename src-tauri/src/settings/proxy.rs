@@ -276,6 +276,7 @@ pub struct ProxyTestResult {
 
 impl ProxyConfig {
     /// 测试代理连通性：TCP connect 测延迟 + HTTP HEAD 请求
+    #[allow(dead_code)]
     pub async fn test(&self) -> ProxyTestResult {
         let start = Instant::now();
         let tcp_result = self.tcp_connect_test().await;
@@ -312,6 +313,7 @@ impl ProxyConfig {
     }
 
     /// TCP 连接测延迟（连接到代理服务器的端口）
+    #[allow(dead_code)]
     async fn tcp_connect_test(&self) -> bool {
         let addr = format!("{}:{}", self.host, self.port);
         let timeout = Duration::from_secs(5);
@@ -336,6 +338,7 @@ impl ProxyConfig {
     }
 
     /// 发送 HTTP HEAD 请求测试代理是否真正可用
+    #[allow(dead_code)]
     async fn http_head_test(&self) -> Option<String> {
         let test_url = "http://www.gstatic.com/generate_204";
         let timeout = Duration::from_secs(10);
@@ -354,6 +357,7 @@ impl ProxyConfig {
         }
     }
 
+    #[allow(dead_code)]
     fn build_client(&self, timeout: Duration) -> Result<Client, String> {
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))

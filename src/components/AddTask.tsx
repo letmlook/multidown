@@ -18,6 +18,9 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
   const [useAuth, setUseAuth] = useState(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [referer, setReferer] = useState("");
+  const [cookie, setCookie] = useState("");
+  const [userAgent, setUserAgent] = useState("");
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,11 +73,16 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
         useAuth && username.trim()
           ? { kind: "basic", username: username.trim(), password }
           : undefined;
+      const headers: Array<[string, string]> = [];
+      if (referer.trim()) headers.push(["Referer", referer.trim()]);
+      if (cookie.trim()) headers.push(["Cookie", cookie.trim()]);
+      if (userAgent.trim()) headers.push(["User-Agent", userAgent.trim()]);
       const createArgs = {
         url: url.trim(),
         saveDir: dir,
         filename: filename.trim() || undefined,
         auth,
+        headers: headers.length ? headers : undefined,
       };
       let taskId: string;
       try {
@@ -91,6 +99,9 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
       setUrl("");
       setFilename("");
       setProbeResult(null);
+      setReferer("");
+      setCookie("");
+      setUserAgent("");
       onAdded();
       onClose();
     } catch (e) {
@@ -177,6 +188,37 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
                 />
               </div>
             )}
+
+            <details className="add-task-extra" style={{ marginTop: 12 }}>
+              <summary>高级选项（请求头）</summary>
+              <div className="form-group" style={{ marginTop: 8 }}>
+                <label>Referer（可选）</label>
+                <input
+                  type="text"
+                  value={referer}
+                  onChange={(e) => setReferer(e.target.value)}
+                  placeholder="https://example.com/page"
+                />
+              </div>
+              <div className="form-group">
+                <label>Cookie（可选）</label>
+                <input
+                  type="text"
+                  value={cookie}
+                  onChange={(e) => setCookie(e.target.value)}
+                  placeholder="key=value; key2=value2"
+                />
+              </div>
+              <div className="form-group">
+                <label>User-Agent（可选）</label>
+                <input
+                  type="text"
+                  value={userAgent}
+                  onChange={(e) => setUserAgent(e.target.value)}
+                  placeholder="留空使用设置中的默认 UA"
+                />
+              </div>
+            </details>
 
             <details className="add-task-extra" style={{ marginTop: 12 }}>
               <summary>保存路径与文件名</summary>

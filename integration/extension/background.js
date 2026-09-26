@@ -60,6 +60,59 @@ function sendToNativeHost(action, data, useNative = true) {
   });
 }
 
+// ─── Capture Rules（与主程序设置同步：总开关 + 域名黑名单） ─────────────────────
+
+let captureConfig = null;
+let captureConfigFetchedAt = 0;
+const CAPTURE_CONFIG_TTL_MS = 60 * 1000;
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+async function getCaptureConfig(force = false) {
+  const now = Date.now();
+  if (!force && captureConfig && now - captureConfigFetchedAt < CAPTURE_CONFIG_TTL_MS) {
+    return captureConfig;
+  }
+  try {
+    const resp = await sendToNativeHost('get_config', {});
+    if (resp && resp.success && resp.config) {
+      captureConfig = {
+        capture_enabled: resp.config.capture_enabled !== false,
+        domain_blacklist: Array.isArray(resp.config.domain_blacklist)
+          ? resp.config.domain_blacklist
+          : [],
+      };
+      captureConfigFetchedAt = now;
+    }
+  } catch {
+    // 主程序未运行时不拦截，行为与旧版一致
+  }
+  return captureConfig || { capture_enabled: true, domain_blacklist: [] };
+}
+
+// 返回 null 表示放行；否则返回拒绝原因字符串
+async function checkCaptureRules(url) {
+  const cfg = await getCaptureConfig();
+  if (!cfg.capture_enabled) {
+    return '浏览器捕获已在 Multidown 中关闭';
+  }
+  const host = hostOf(url);
+  const blocked = cfg.domain_blacklist.some((entry) => {
+    const e = String(entry).trim().toLowerCase();
+    return e && (host === e || host.endsWith('.' + e));
+  });
+  if (blocked) {
+    return '该域名已被捕获黑名单过滤';
+  }
+  return null;
+}
+
 // ─── Context Menus ────────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -120,8 +173,22 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   };
 
   debugLog('处理上下文菜单下载', { menuItemId: info.menuItemId, url, filename });
-  sendToNativeHost('download', downloadData).catch(e => {
-    console.warn('[Multidown] 下载失败:', e.message);
+  checkCaptureRules(url).then((rejected) => {
+    if (rejected) {
+      debugLog('捕获规则拒绝下载', { url, reason: rejected });
+      chrome.notifications
+        ?.create({
+          type: 'basic',
+          iconUrl: 'icons/icon128.png',
+          title: 'Multidown',
+          message: rejected,
+        })
+        .catch?.(() => {});
+      return;
+    }
+    sendToNativeHost('download', downloadData).catch(e => {
+      console.warn('[Multidown] 下载失败:', e.message);
+    });
   });
 });
 
@@ -142,6 +209,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
       } else if (message.action === 'quick_download') {
+        const rejected = await checkCaptureRules(message.url);
+        if (rejected) {
+          return { success: false, message: rejected };
+        }
         // Direct URL download from popup
         const result = await sendToNativeHost('download', {
           url: message.url,
@@ -156,6 +227,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { success: result.success !== false, message: result?.message || '已添加' };
 
       } else if (message.action === 'download_media') {
+        const rejected = await checkCaptureRules(message.url);
+        if (rejected) {
+          return { success: false, message: rejected };
+        }
         // Media download from content script
         const result = await sendToNativeHost('download', {
           url: message.url,

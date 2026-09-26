@@ -54,6 +54,12 @@ export interface AppSettings {
   save_progress_interval_secs?: number;
   /** 全局限速（KB/s），0 表示不限速 */
   global_speed_limit_kbps?: number;
+  /** 浏览器捕获总开关 */
+  capture_enabled?: boolean;
+  /** 浏览器捕获域名黑名单 */
+  capture_domain_blacklist?: string[];
+  /** 允许无效 TLS 证书 */
+  allow_insecure_tls?: boolean;
 }
 
 // ---------------------------------------------------------------------------

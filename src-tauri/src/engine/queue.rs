@@ -22,6 +22,7 @@ pub enum DayOfWeek {
 }
 
 impl DayOfWeek {
+    #[allow(dead_code)]
     pub fn from_chrono_weekday(w: chrono::Weekday) -> Self {
         match w {
             chrono::Weekday::Mon => DayOfWeek::Monday,
@@ -45,10 +46,12 @@ pub struct TimeRange {
 }
 
 impl TimeRange {
+    #[allow(dead_code)]
     pub fn new(start_hour: u8, start_minute: u8, end_hour: u8, end_minute: u8) -> Self {
         Self { start_hour, start_minute, end_hour, end_minute }
     }
 
+    #[allow(dead_code)]
     pub fn is_active_at(&self, hour: u32, minute: u32) -> bool {
         let now_mins = hour * 60 + minute;
         let start_mins = self.start_hour as u32 * 60 + self.start_minute as u32;
@@ -100,6 +103,7 @@ impl DownloadQueue {
         self.task_ids.retain(|t| t != task_id);
     }
 
+    #[allow(dead_code)]
     pub fn is_active_at(&self, weekday: chrono::Weekday, hour: u32, minute: u32) -> bool {
         if self.deleted || self.is_paused {
             return false;
@@ -146,9 +150,11 @@ impl From<(Arc<Mutex<DownloadQueue>>, usize)> for QueueSummary {
 pub struct QueueManager {
     pub queues: HashMap<String, Arc<Mutex<DownloadQueue>>>,
     pub default_queue_id: String,
+    #[allow(dead_code)]
     active_queue_id: String,
 }
 
+#[allow(dead_code)]
 impl QueueManager {
     pub fn new() -> Self {
         let default_queue = Arc::new(Mutex::new(DownloadQueue::new(
@@ -271,7 +277,7 @@ impl QueueManager {
     /// List all queues
     pub async fn list_queues(&self) -> Vec<QueueSummary> {
         let mut summaries = Vec::new();
-        for (id, q) in self.queues.iter() {
+        for (_id, q) in self.queues.iter() {
             let task_count = q.lock().task_ids.len();
             summaries.push(QueueSummary::from(((*q).clone(), task_count)));
         }
@@ -281,7 +287,7 @@ impl QueueManager {
     /// Get active queues (non-deleted, non-paused) at given time
     pub async fn get_active_queues(&self, weekday: chrono::Weekday, hour: u32, minute: u32) -> Vec<QueueSummary> {
         let mut active = Vec::new();
-        for (id, q) in self.queues.iter() {
+        for (_id, q) in self.queues.iter() {
             let q_guard = q.lock();
             if !q_guard.deleted && !q_guard.is_paused {
                 let day_match = q_guard.active_days.is_empty() || q_guard.active_days.contains(&DayOfWeek::from_chrono_weekday(weekday));
@@ -323,6 +329,7 @@ impl QueueManager {
 pub type GlobalQueueManager = Arc<TokioMutex<QueueManager>>;
 
 /// Create a new global queue manager
+#[allow(dead_code)]
 pub fn new_queue_manager() -> GlobalQueueManager {
     Arc::new(TokioMutex::new(QueueManager::new()))
 }

@@ -3,6 +3,7 @@
 use crate::engine::rules::{CategoryRule, MatchType};
 use std::path::Path;
 
+#[allow(dead_code)]
 const RULES_FILENAME: &str = "category_rules.json";
 
 /// 简化版结构用于序列化（MatchType 是 ctor name）
@@ -58,6 +59,7 @@ impl From<&RuleDto> for CategoryRule {
     }
 }
 
+#[allow(dead_code)]
 pub fn rules_path(app_data_dir: &Path) -> std::path::PathBuf {
     app_data_dir.join(RULES_FILENAME)
 }

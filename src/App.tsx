@@ -436,6 +436,13 @@ function App() {
         },
         {
           type: "item",
+          label: "重试",
+          onClick: () =>
+            invoke("retry_task", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+          disabled: contextMenu.task.status !== "failed",
+        },
+        {
+          type: "item",
           label: "重新下载",
           onClick: () => doRedownload(contextMenu.task),
         },
@@ -677,7 +684,7 @@ function App() {
         }}
       />
 
-      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.1.0" />
+      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.2.0" />
 
       {toast && (
         <Toast

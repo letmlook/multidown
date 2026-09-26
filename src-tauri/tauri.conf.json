@@ -1,6 +1,6 @@
 {
   "productName": "MultiDown",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.multidown.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -54,5 +54,13 @@
     "copyright": "",
     "license": "MIT"
   },
-  "plugins": {}
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "multidown"
+        ]
+      }
+    }
+  }
 }

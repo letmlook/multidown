@@ -54,6 +54,19 @@ pub struct AppSettings {
     /// 全局限速（KB/s），0 表示不限速
     #[serde(default)]
     pub global_speed_limit_kbps: u32,
+    /// 浏览器捕获总开关（关闭后扩展的下载请求被拒绝）
+    #[serde(default = "default_true")]
+    pub capture_enabled: bool,
+    /// 浏览器捕获域名黑名单（一行一个域名，子域名同样命中）
+    #[serde(default)]
+    pub capture_domain_blacklist: Vec<String>,
+    /// 允许无效 TLS 证书（自签名场景，默认严格校验）
+    #[serde(default)]
+    pub allow_insecure_tls: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -78,6 +91,9 @@ impl Default for AppSettings {
             timeout_secs: 30,
             save_progress_interval_secs: 30,
             global_speed_limit_kbps: 0,
+            capture_enabled: true,
+            capture_domain_blacklist: Vec::new(),
+            allow_insecure_tls: false,
         }
     }
 }

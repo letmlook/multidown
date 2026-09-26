@@ -187,11 +187,13 @@ impl ScheduleManager {
         sl.active = active;
     }
 
+    #[allow(dead_code)]
     pub async fn get_speed_limit(&self) -> SpeedLimit {
         self.speed_limit.lock().await.clone()
     }
 
-    /// 合并 NetworkOptions，加入当前限速值
+    /// 合并 NetworkOptions，加入当前限速值（限速已改由 Scheduler 令牌桶实现，此方法保留占位）
+    #[allow(dead_code)]
     pub fn apply_speed_limit(_opts: &mut NetworkOptions, sl: &SpeedLimit) {
         if sl.active {
             // speed_limit_kbps 已转换为 BPS，存到 opts 的 proxy_url 字段复用
