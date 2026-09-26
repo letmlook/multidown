@@ -35,10 +35,18 @@ pub struct BatchJob {
     pub created_at: i64,
     /// 任务ID列表（已创建到调度器的下载任务）
     pub task_ids: Vec<String>,
+    /// 批次保存目录（创建时解析）
+    pub save_dir: Option<String>,
 }
 
 impl BatchJob {
-    pub fn new(name: String, urls: Vec<String>, template: String, start_index: usize) -> Self {
+    pub fn new(
+        name: String,
+        urls: Vec<String>,
+        template: String,
+        start_index: usize,
+        save_dir: Option<String>,
+    ) -> Self {
         let total_count = urls.len();
         Self {
             id: new_task_id(),
@@ -54,6 +62,7 @@ impl BatchJob {
                 .unwrap()
                 .as_secs() as i64,
             task_ids: Vec::new(),
+            save_dir,
         }
     }
 
@@ -90,6 +99,40 @@ pub struct BatchJobInfo {
     pub total_count: usize,
     pub added_count: usize,
     pub created_at: i64,
+    /// 已创建任务数（added_count 的别名，前端展示用）
+    pub task_count: usize,
+    /// 已完成任务数（与调度器任务状态联动的进度汇总）
+    pub completed_count: usize,
+    pub failed_count: usize,
+}
+
+impl BatchJobInfo {
+    /// 由 BatchJob + 调度器任务状态计算进度汇总
+    pub fn from_job_with_progress(
+        job: &BatchJob,
+        task_status: impl Fn(&str) -> Option<crate::engine::types::TaskStatus>,
+    ) -> Self {
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        for id in &job.task_ids {
+            match task_status(id) {
+                Some(crate::engine::types::TaskStatus::Completed) => completed += 1,
+                Some(crate::engine::types::TaskStatus::Failed) => failed += 1,
+                _ => {}
+            }
+        }
+        Self {
+            id: job.id.clone(),
+            name: job.name.clone(),
+            status: job.status,
+            total_count: job.total_count,
+            added_count: job.added_count,
+            created_at: job.created_at,
+            task_count: job.task_ids.len(),
+            completed_count: completed,
+            failed_count: failed,
+        }
+    }
 }
 
 impl From<&BatchJob> for BatchJobInfo {
@@ -101,6 +144,9 @@ impl From<&BatchJob> for BatchJobInfo {
             total_count: job.total_count,
             added_count: job.added_count,
             created_at: job.created_at,
+            task_count: job.task_ids.len(),
+            completed_count: 0,
+            failed_count: 0,
         }
     }
 }
@@ -139,6 +185,11 @@ impl BatchManager {
     pub async fn list_jobs(&self) -> Vec<BatchJobInfo> {
         let jobs = self.jobs.read().await;
         jobs.iter().map(BatchJobInfo::from).collect()
+    }
+
+    /// 返回完整 BatchJob（含 task_ids，供调度器汇总进度）
+    pub async fn list_jobs_full(&self) -> Vec<BatchJob> {
+        self.jobs.read().await.clone()
     }
 
     pub async fn update_job(&self, job: BatchJob) {
@@ -213,7 +264,7 @@ impl BatchScheduler {
         start_index: usize,
         _save_dir: String,
     ) -> String {
-        let job = BatchJob::new(name, urls, template, start_index);
+        let job = BatchJob::new(name, urls, template, start_index, None);
         let job_id = job.id.clone();
         self.manager.add_job(job).await;
         job_id

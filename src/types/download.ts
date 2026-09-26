@@ -141,6 +141,8 @@ export interface BatchJobInfo {
   name: string;
   task_count: number;
   created_at: number;
+  completed_count?: number;
+  failed_count?: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,8 @@ import type {
 interface OptionsModalProps {
   open: boolean;
   onClose: () => void;
+  /** 打开时定位到的 Tab（如从主界面"计划任务"菜单进入） */
+  initialTab?: string;
 }
 
 const TABS = [
@@ -123,8 +125,11 @@ function scheduleFormToRecurrence(rec: ScheduleFormRecurrence): Recurrence {
 // Main Modal
 // ──────────────────────────────────────────────────────────────────────────────
 
-export function OptionsModal({ open, onClose }: OptionsModalProps) {
-  const [tab, setTab] = useState("general");
+export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
+  const [tab, setTab] = useState(initialTab ?? "general");
+  useEffect(() => {
+    if (open && initialTab) setTab(initialTab);
+  }, [open, initialTab]);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -146,7 +151,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
   const [batches, setBatches] = useState<BatchJobInfo[]>([]);
   const [batchesLoading, setBatchesLoading] = useState(false);
   const [showBatchModal, setShowBatchModal] = useState(false);
-  const [batchForm, setBatchForm] = useState({ name: "", urls: "" });
+  const [batchForm, setBatchForm] = useState({ name: "", urls: "", saveDir: "" });
 
   // ── Schedule state ───────────────────────────────────────────────────────
   const [scheduleState, setScheduleState] = useState<ScheduleState>({ enabled: false });
@@ -398,15 +403,22 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
     const urls = batchForm.urls.split("\n").map((u) => u.trim()).filter(Boolean);
     if (!batchForm.name || urls.length === 0) return;
     try {
-      await invoke("create_batch", {
+      const batchId = await invoke<string>("create_batch", {
         name: batchForm.name,
         urls,
         template: null,
         startIndex: 0,
         queueId: null,
+        saveDir: batchForm.saveDir.trim() || null,
       });
+      // 创建即启动批次内任务
+      try {
+        await invoke("start_batch", { batchId });
+      } catch (e) {
+        console.error("启动批次失败:", e);
+      }
       setShowBatchModal(false);
-      setBatchForm({ name: "", urls: "" });
+      setBatchForm({ name: "", urls: "", saveDir: "" });
       await loadBatches();
     } catch (e) {
       console.error(e);
@@ -1071,7 +1083,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                     <button
                       type="button"
                       className="btn btn-primary"
-                      onClick={() => { setShowBatchModal(true); setBatchForm({ name: "", urls: "" }); }}
+                      onClick={() => { setShowBatchModal(true); setBatchForm({ name: "", urls: "", saveDir: "" }); }}
                     >
                       + 新建批次
                     </button>
@@ -1083,7 +1095,7 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                       <thead>
                         <tr style={{ borderBottom: "2px solid #eee" }}>
                           <th style={{ textAlign: "left", padding: "6px 8px", color: "#666" }}>名称</th>
-                          <th style={{ textAlign: "left", padding: "6px 8px", color: "#666" }}>任务数</th>
+                          <th style={{ textAlign: "left", padding: "6px 8px", color: "#666" }}>进度</th>
                           <th style={{ textAlign: "left", padding: "6px 8px", color: "#666" }}>创建时间</th>
                           <th style={{ padding: "6px 8px" }}></th>
                         </tr>
@@ -1092,11 +1104,33 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                         {batches.map((b) => (
                           <tr key={b.id} style={{ borderBottom: "1px solid #f0f0f0" }}>
                             <td style={{ padding: "8px" }}>{b.name}</td>
-                            <td style={{ padding: "8px" }}>{b.task_count}</td>
+                            <td style={{ padding: "8px" }}>
+                              {b.completed_count ?? 0}/{b.task_count}
+                              {(b.failed_count ?? 0) > 0 && (
+                                <span style={{ color: "#d00", marginLeft: 6 }}>
+                                  {b.failed_count} 失败
+                                </span>
+                              )}
+                            </td>
                             <td style={{ padding: "8px", color: "#666" }}>
                               {new Date(b.created_at * 1000).toLocaleString("zh-CN")}
                             </td>
                             <td style={{ padding: "8px", textAlign: "right" }}>
+                              <button
+                                type="button"
+                                className="btn"
+                                style={{ padding: "2px 8px", fontSize: 12, marginRight: 6 }}
+                                onClick={async () => {
+                                  try {
+                                    await invoke("start_batch", { batchId: b.id });
+                                    await loadBatches();
+                                  } catch (e) {
+                                    console.error(e);
+                                  }
+                                }}
+                              >
+                                ▶ 启动
+                              </button>
                               <button
                                 type="button"
                                 className="btn"
@@ -1546,6 +1580,16 @@ export function OptionsModal({ open, onClose }: OptionsModalProps) {
                   value={batchForm.name}
                   onChange={(e) => setBatchForm((f) => ({ ...f, name: e.target.value }))}
                   placeholder="例如 我的视频合集"
+                  style={{ marginTop: 4, width: "100%", padding: "6px 10px", boxSizing: "border-box" }}
+                />
+              </div>
+              <div className="form-group">
+                <label>保存目录（留空使用默认目录，命中分类规则时以规则为准）</label>
+                <input
+                  type="text"
+                  value={batchForm.saveDir}
+                  onChange={(e) => setBatchForm((f) => ({ ...f, saveDir: e.target.value }))}
+                  placeholder="留空使用默认目录"
                   style={{ marginTop: 4, width: "100%", padding: "6px 10px", boxSizing: "border-box" }}
                 />
               </div>

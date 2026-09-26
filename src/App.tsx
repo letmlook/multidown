@@ -668,7 +668,14 @@ function App() {
         onAdded={refreshTasks}
       />
 
-      <OptionsModal open={optionsOpen} onClose={() => setOptionsOpen(false)} />
+      <OptionsModal
+        open={optionsOpen || scheduleOpen}
+        initialTab={scheduleOpen ? "schedule" : undefined}
+        onClose={() => {
+          setOptionsOpen(false);
+          setScheduleOpen(false);
+        }}
+      />
 
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.1.0" />
 
@@ -700,22 +707,6 @@ function App() {
           refreshTasks();
         }}
       />
-
-      {scheduleOpen && (
-        <div className="modal-overlay" onClick={() => setScheduleOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ minWidth: 360 }}>
-            <div className="modal-title">计划任务</div>
-            <div className="modal-body">
-              <p style={{ color: "#666", fontSize: 13 }}>计划任务功能开发中，敬请期待。</p>
-            </div>
-            <div className="modal-footer">
-              <button type="button" className="btn btn-primary" onClick={() => setScheduleOpen(false)}>
-                确定
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {contextMenu && (
         <ContextMenu

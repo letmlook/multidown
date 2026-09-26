@@ -141,18 +141,19 @@ pub struct SpeedLimit {
 }
 
 /// 管理所有计划规则和限速状态
-#[allow(dead_code)]
 pub struct ScheduleManager {
     pub rules: Arc<Mutex<Vec<ScheduleRule>>>,
     pub speed_limit: Arc<Mutex<SpeedLimit>>,
+    /// 已触发标记 "rule_id|date HH:MM"，防止同一分钟重复触发
+    fired_keys: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
-#[allow(dead_code)]
 impl ScheduleManager {
     pub fn new() -> Self {
         Self {
             rules: Arc::new(Mutex::new(Vec::new())),
             speed_limit: Arc::new(Mutex::new(SpeedLimit::default())),
+            fired_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -202,38 +203,67 @@ impl ScheduleManager {
 
     // ─── Tick: called every minute ───────────────────────────────────────────
 
-    /// 执行一轮规则检查，返回需要通知前端的事件描述
+    /// 执行一轮规则检查（建议每 20~30 秒调用一次），返回需要调度器执行的事件。
+    /// - 动作规则（开始/暂停/恢复）：同一规则同一分钟只触发一次；Once 触发后自动禁用
+    /// - SpeedLimit 规则：取所有激活窗口中最严格的限速值，变化时才发事件；
+    ///   所有窗口结束后发 Deactivated（调度器据此恢复设置里的静态限速）
     pub async fn tick(&self, now: &DateTime<Local>) -> Vec<ScheduleEvent> {
         let mut events = Vec::new();
+        let mut active_limit: Option<u32> = None;
         let mut rules = self.rules.lock().await;
 
         for rule in rules.iter_mut() {
-            // SpeedLimit 特殊处理：结束时恢复不限速
             if rule.schedule_type == ScheduleType::SpeedLimit {
                 if rule.is_speed_limit_active(now) {
-                    let mut sl = self.speed_limit.lock().await;
-                    if sl.kbps.is_none() {
-                        sl.kbps = rule.speed_limit_kbps;
-                        sl.active = true;
-                        events.push(ScheduleEvent::SpeedLimitActivated(rule.speed_limit_kbps.unwrap_or(0)));
-                    }
-                } else if rule.start_time == now.format("%H:%M").to_string() {
-                    // 限速刚刚结束（下一个 tick 前 end_time 已过）
-                    let mut sl = self.speed_limit.lock().await;
-                    sl.kbps = None;
-                    sl.active = false;
+                    active_limit = match (active_limit, rule.speed_limit_kbps) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) => Some(a),
+                        (None, b) => b,
+                    };
+                }
+                continue;
+            }
+            if !rule.should_fire(now) {
+                continue;
+            }
+            let key = format!(
+                "{}|{}",
+                rule.id,
+                now.format("%Y-%m-%d %H:%M")
+            );
+            let first_time = self
+                .fired_keys
+                .lock()
+                .unwrap()
+                .insert(key);
+            if !first_time {
+                continue;
+            }
+            match rule.schedule_type {
+                ScheduleType::StartDownload => events.push(ScheduleEvent::StartAll),
+                ScheduleType::PauseAll => events.push(ScheduleEvent::PauseAll),
+                ScheduleType::ResumeAll => events.push(ScheduleEvent::ResumeAll),
+                ScheduleType::SpeedLimit => {}
+            }
+            // Once：触发后禁用，避免同日反复触发
+            if matches!(rule.recurrence, Recurrence::Once) {
+                rule.enabled = false;
+            }
+        }
+        drop(rules);
+
+        // 限速窗口状态变化检测
+        let mut sl = self.speed_limit.lock().await;
+        let current: Option<u32> = if sl.active { sl.kbps } else { None };
+        if active_limit != current {
+            match active_limit {
+                Some(kbps) => {
+                    *sl = SpeedLimit { kbps: Some(kbps), active: true };
+                    events.push(ScheduleEvent::SpeedLimitActivated(kbps));
+                }
+                None => {
+                    *sl = SpeedLimit::default();
                     events.push(ScheduleEvent::SpeedLimitDeactivated);
-                }
-            } else if rule.should_fire(now) {
-                match rule.schedule_type {
-                    ScheduleType::StartDownload => events.push(ScheduleEvent::StartAll),
-                    ScheduleType::PauseAll => events.push(ScheduleEvent::PauseAll),
-                    ScheduleType::ResumeAll => events.push(ScheduleEvent::ResumeAll),
-                    ScheduleType::SpeedLimit => {} // handled above
-                }
-                // Once 类型：标记为今天已触发（避免重复）
-                if matches!(rule.recurrence, Recurrence::Once) {
-                    rule.scheduled_date = Some(now.format("%Y-%m-%d").to_string());
                 }
             }
         }

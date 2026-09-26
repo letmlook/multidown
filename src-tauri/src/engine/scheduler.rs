@@ -207,7 +207,7 @@ impl Scheduler {
         filename: Option<String>,
         probe_result: Option<ProbeResult>,
     ) -> Result<TaskId, String> {
-        self.create_task_internal(url, save_dir, filename, probe_result, false, None, Vec::new())
+        self.create_task_internal(url, save_dir, filename, probe_result, false, None, Vec::new(), true)
             .await
     }
 
@@ -221,6 +221,7 @@ impl Scheduler {
         force: bool,
         auth: Option<AuthConfig>,
         extra_headers: Vec<(String, String)>,
+        auto_categorize: bool,
     ) -> Result<TaskId, String> {
         // 重复检测放在探测之前，避免多余的网络请求；重命名延后到文件名解析完成后应用
         let mut rename_needed = false;
@@ -249,6 +250,16 @@ impl Scheduler {
         let mut filename = filename.or(Some(suggested_filename));
         if rename_needed {
             self.apply_rename_dedup(&mut filename).await;
+        }
+        // 分类规则自动归类：命中规则的下载改写到规则指定的保存目录
+        let mut save_dir = save_dir;
+        if auto_categorize {
+            let rules = self.rule_manager.read().await;
+            if let Some(dir) = match_rule(&rules, &url, filename.as_deref().unwrap_or("download"), None) {
+                if !dir.is_empty() {
+                    save_dir = dir;
+                }
+            }
         }
         let input = crate::engine::types::CreateTaskInput {
             url: url.clone(),
@@ -381,6 +392,15 @@ impl Scheduler {
         for (k, v) in &task.extra_headers {
             net_opts.extra_headers.push((k.clone(), v.clone()));
         }
+        // 代理分流：按 URL 匹配域名规则，命中则覆盖全局代理
+        if let Some(app_data) = self.save_path.as_ref().and_then(|p| p.parent()) {
+            let store = crate::settings::proxy::load_proxy_store(app_data);
+            if let Some(cfg) = crate::settings::proxy::match_proxy_rule(&task.url, &store) {
+                if let Some(url) = cfg.to_authenticated_url() {
+                    net_opts.proxy_url = Some(url);
+                }
+            }
+        }
         let client = match build_client_from_options(&net_opts) {
             Ok(c) => std::sync::Arc::new(c),
             Err(e) => {
@@ -494,6 +514,64 @@ impl Scheduler {
             }
         });
         Ok(())
+    }
+
+    /// 开始所有待开始/已暂停任务（定时 StartAll / ResumeAll / 手动触发共用）
+    pub async fn start_all_pending(
+        &self,
+        app_handle: Option<tauri::AppHandle>,
+        max_connections: usize,
+        network_options: NetworkOptions,
+    ) -> usize {
+        let ids: Vec<TaskId> = {
+            let tasks = self.tasks.lock().await;
+            let mut ids = Vec::new();
+            for t in tasks.values() {
+                let st = *t.status.lock().await;
+                if st == TaskStatus::Pending || st == TaskStatus::Paused {
+                    ids.push(t.id.clone());
+                }
+            }
+            ids
+        };
+        let mut started = 0;
+        for id in ids {
+            if self
+                .start_download(
+                    &id,
+                    app_handle.clone(),
+                    None,
+                    Some(max_connections),
+                    Some(network_options.clone()),
+                )
+                .await
+                .is_ok()
+            {
+                started += 1;
+            }
+        }
+        started
+    }
+
+    /// 暂停所有下载中任务
+    pub async fn pause_all(&self) -> usize {
+        let ids: Vec<TaskId> = {
+            let tasks = self.tasks.lock().await;
+            let mut ids = Vec::new();
+            for t in tasks.values() {
+                if *t.status.lock().await == TaskStatus::Downloading {
+                    ids.push(t.id.clone());
+                }
+            }
+            ids
+        };
+        let mut n = 0;
+        for id in ids {
+            if self.pause_task(&id).await.is_ok() {
+                n += 1;
+            }
+        }
+        n
     }
 
     pub async fn pause_task(&self, task_id: &str) -> Result<(), String> {
@@ -782,12 +860,25 @@ impl Scheduler {
 
     // === Batch Management ===
 
-    /// List all batch jobs
+    /// List all batch jobs（含与任务状态联动的进度汇总）
     pub async fn list_batches(&self) -> Vec<crate::engine::batch::BatchJobInfo> {
-        self.batch_manager.list_jobs().await
+        let jobs = self.batch_manager.list_jobs_full().await;
+        let tasks = self.tasks.lock().await;
+        jobs.iter()
+            .map(|job| {
+                crate::engine::batch::BatchJobInfo::from_job_with_progress(job, |id| {
+                    tasks.get(id).and_then(|t| {
+                        match t.status.try_lock() {
+                            Ok(g) => Some(*g),
+                            Err(_) => None,
+                        }
+                    })
+                })
+            })
+            .collect()
     }
 
-    /// Create a new batch job
+    /// Create a new batch job：为每个 URL 真正创建下载任务（命中分类规则自动归类）
     pub async fn create_batch(
         &self,
         name: String,
@@ -795,16 +886,75 @@ impl Scheduler {
         template: Option<String>,
         start_index: Option<usize>,
         _queue_id: Option<String>,
+        save_dir: Option<String>,
     ) -> Result<String, String> {
-        let batch = crate::engine::batch::BatchJob::new(
+        let template = template.unwrap_or_default();
+        let mut batch = crate::engine::batch::BatchJob::new(
             name,
             urls,
-            template.unwrap_or_default(),
+            template.clone(),
             start_index.unwrap_or(1),
+            save_dir,
         );
+        let dir = batch.save_dir.clone().unwrap_or_default();
+        for (i, url) in batch.urls.clone().iter().enumerate() {
+            let filename = if template.is_empty() {
+                None
+            } else {
+                Some(crate::engine::batch::apply_filename_template(
+                    &template,
+                    url,
+                    batch.start_index + i,
+                ))
+            };
+            if let Ok(id) = self
+                .create_task_internal(url.clone(), dir.clone(), filename, None, false, None, Vec::new(), true)
+                .await
+            {
+                batch.task_ids.push(id);
+                batch.added_count += 1;
+            }
+        }
         let id = batch.id.clone();
         self.batch_manager.add_job(batch).await;
+        self.save_tasks().await;
         Ok(id)
+    }
+
+    /// 启动批次内所有待开始/已暂停任务
+    pub async fn start_batch(
+        &self,
+        batch_id: &str,
+        app_handle: Option<tauri::AppHandle>,
+        max_connections: usize,
+        network_options: NetworkOptions,
+    ) -> Result<usize, String> {
+        let job = self
+            .batch_manager
+            .get_job(batch_id)
+            .await
+            .ok_or("批次不存在")?;
+        let mut started = 0;
+        for id in &job.task_ids {
+            let st = {
+                let tasks = self.tasks.lock().await;
+                match tasks.get(id) {
+                    Some(t) => *t.status.lock().await,
+                    None => continue,
+                }
+            };
+            if st != TaskStatus::Pending && st != TaskStatus::Paused {
+                continue;
+            }
+            if self
+                .start_download(id, app_handle.clone(), None, Some(max_connections), Some(network_options.clone()))
+                .await
+                .is_ok()
+            {
+                started += 1;
+            }
+        }
+        Ok(started)
     }
 
     /// Add an existing task to a batch
@@ -937,6 +1087,11 @@ impl Scheduler {
 
     // === Schedule Tasks ===
 
+    /// 计划任务管理器访问器（供 lib.rs tick 循环与规则加载使用）
+    pub fn schedule_manager(&self) -> &ScheduleManager {
+        &self.schedule_manager
+    }
+
     /// Get global schedule on/off state
     pub async fn get_schedule_state(&self) -> bool {
         *self.schedule_enabled.lock()
@@ -993,17 +1148,8 @@ impl Scheduler {
         
         match rule.schedule_type {
             crate::engine::schedule::ScheduleType::StartDownload => {
-                // Start all pending tasks
-                let tasks = self.tasks.lock().await;
-                for t in tasks.values() {
-                    let mut st = t.status.lock().await;
-                    if *st == TaskStatus::Pending || *st == TaskStatus::Paused {
-                        // Trigger start via app_handle if available
-                        if let Some(ref app) = app_handle {
-                            let _ = app.emit("schedule-trigger-start", t.id.clone());
-                        }
-                    }
-                }
+                let _ = app_handle;
+                self.start_all_pending(app_handle, 8, NetworkOptions::default()).await;
                 Ok(())
             }
             crate::engine::schedule::ScheduleType::PauseAll => {
@@ -1247,6 +1393,7 @@ mod tests {
                 false,
                 None,
                 Vec::new(),
+                true,
             )
             .await
             .unwrap();
@@ -1259,6 +1406,7 @@ mod tests {
                 false,
                 None,
                 Vec::new(),
+                true,
             )
             .await;
         assert!(again.is_err());
@@ -1272,6 +1420,7 @@ mod tests {
                 true,
                 None,
                 Vec::new(),
+                true,
             )
             .await;
         assert!(forced.is_ok());
@@ -1299,6 +1448,7 @@ mod tests {
             false,
             None,
             Vec::new(),
+            true,
         )
         .await
         .unwrap();
@@ -1311,6 +1461,7 @@ mod tests {
                 false,
                 None,
                 Vec::new(),
+                true,
             )
             .await
             .unwrap();

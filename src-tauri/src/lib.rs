@@ -143,9 +143,34 @@ async fn create_batch(
     template: Option<String>,
     start_index: Option<usize>,
     queue_id: Option<String>,
+    save_dir: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
-    state.create_batch(name, urls, template, start_index, queue_id).await
+    // 未指定目录时使用默认下载目录
+    let save_dir = Some(save_dir.unwrap_or_else(|| default_save_dir_for_browser(&app)));
+    state
+        .create_batch(name, urls, template, start_index, queue_id, save_dir)
+        .await
+}
+
+/// 启动批次内所有待开始/已暂停任务
+#[tauri::command]
+async fn start_batch(
+    batch_id: String,
+    app_handle: tauri::AppHandle,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<usize, String> {
+    let path = app_settings_path(&app_handle)?;
+    let settings = load_settings(&path).unwrap_or_default();
+    state
+        .start_batch(
+            &batch_id,
+            Some(app_handle),
+            settings.max_connections_per_task as usize,
+            network_options_from_settings(&settings),
+        )
+        .await
 }
 
 /// 向批量任务添加任务
@@ -725,6 +750,16 @@ async fn network_options_from_app(app: &tauri::AppHandle) -> NetworkOptions {
     network_options_from_settings(&settings)
 }
 
+/// 判断是否应用自动归类：用户未指定目录（空或等于默认目录）时生效
+async fn should_auto_categorize(app: &tauri::AppHandle, save_dir: &str) -> bool {
+    let dir = save_dir.trim();
+    if dir.is_empty() || dir == "." {
+        return true;
+    }
+    let default_dir = default_save_dir_for_browser(app);
+    dir == default_dir
+}
+
 #[tauri::command]
 async fn create_download(
     url: String,
@@ -733,8 +768,10 @@ async fn create_download(
     force: Option<bool>,
     auth: Option<AuthConfig>,
     headers: Option<Vec<(String, String)>>,
+    app: tauri::AppHandle,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
+    let auto = should_auto_categorize(&app, &save_dir).await;
     state
         .create_task_internal(
             url,
@@ -744,6 +781,7 @@ async fn create_download(
             force.unwrap_or(false),
             auth,
             headers.unwrap_or_default(),
+            auto,
         )
         .await
 }
@@ -757,8 +795,10 @@ async fn create_download_with_probe(
     force: Option<bool>,
     auth: Option<AuthConfig>,
     headers: Option<Vec<(String, String)>>,
+    app: tauri::AppHandle,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<String, String> {
+    let auto = should_auto_categorize(&app, &save_dir).await;
     state
         .create_task_internal(
             url,
@@ -768,6 +808,7 @@ async fn create_download_with_probe(
             force.unwrap_or(false),
             auth,
             headers.unwrap_or_default(),
+            auto,
         )
         .await
 }
@@ -1704,7 +1745,81 @@ pub fn run() {
                     sync_autostart(&app_handle, settings.run_at_startup);
                 }
             }
+            // 加载分类规则与计划任务规则（此前从未从磁盘恢复）
+            if let Some(rules_path) = scheduler.rules_save_path() {
+                if let Err(e) = scheduler.load_rules_from(&rules_path) {
+                    debug_log(&app_handle, "加载分类规则失败", Some(&e));
+                }
+            }
+            {
+                let app_data = app.path()
+                    .app_data_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::new());
+                let sched = scheduler.clone();
+                for rule in engine::schedule::load_schedule_rules(&app_data) {
+                    tauri::async_runtime::block_on(sched.schedule_manager().add_rule(rule));
+                }
+            }
             app.manage(scheduler);
+
+            // 计划任务后台 tick：每 20 秒检查一次规则并执行事件
+            {
+                let sched_tick = sched_clone.clone();
+                let app_tick = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
+                    loop {
+                        interval.tick().await;
+                        let now = chrono::Local::now();
+                        let events = sched_tick.schedule_manager().tick(&now).await;
+                        if events.is_empty() {
+                            continue;
+                        }
+                        let schedule_on = sched_tick.get_schedule_state().await;
+                        let settings = app_settings_path(&app_tick)
+                            .ok()
+                            .and_then(|p| load_settings(&p).ok())
+                            .unwrap_or_default();
+                        for ev in events {
+                            match ev {
+                                engine::schedule::ScheduleEvent::StartAll
+                                | engine::schedule::ScheduleEvent::ResumeAll => {
+                                    if !schedule_on {
+                                        continue;
+                                    }
+                                    let net_opts = network_options_from_settings(&settings);
+                                    sched_tick
+                                        .start_all_pending(
+                                            Some(app_tick.clone()),
+                                            settings.max_connections_per_task as usize,
+                                            net_opts,
+                                        )
+                                        .await;
+                                }
+                                engine::schedule::ScheduleEvent::PauseAll => {
+                                    if !schedule_on {
+                                        continue;
+                                    }
+                                    sched_tick.pause_all().await;
+                                }
+                                engine::schedule::ScheduleEvent::SpeedLimitActivated(kbps) => {
+                                    sched_tick.set_effective_speed_limit(Some(kbps as u64)).await;
+                                }
+                                engine::schedule::ScheduleEvent::SpeedLimitDeactivated => {
+                                    // 恢复设置里的静态限速（0 = 不限速）
+                                    sched_tick
+                                        .set_effective_speed_limit(Some(
+                                            settings.global_speed_limit_kbps as u64,
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        let _ = app_tick.emit("download-progress", ());
+                        sched_tick.save_tasks().await;
+                    }
+                });
+            }
             
             // 检查是否首次运行，如果是则自动安装扩展
             let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -2083,9 +2198,10 @@ pub fn run() {
                                 continue;
                             }
 
+                            let auto_categorize = save_path.is_none();
                             let save_dir = save_path.unwrap_or_else(|| default_save_dir_for_browser(&app_worker));
                             let result = match sched_worker
-                                .create_task_internal(url.clone(), save_dir, filename, None, false, None, ext_headers)
+                                .create_task_internal(url.clone(), save_dir, filename, None, false, None, ext_headers, auto_categorize)
                                 .await
                             {
                                 Ok(id) => {
@@ -2252,6 +2368,7 @@ pub fn run() {
             // Batch commands
             list_batches,
             create_batch,
+            start_batch,
             add_task_to_batch,
             remove_task_from_batch,
             delete_batch,
