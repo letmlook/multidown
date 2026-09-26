@@ -66,6 +66,8 @@ pub struct Scheduler {
     torrent_cfg: Arc<ParkingMutex<Option<crate::torrent::engine::TorrentEngineConfig>>>,
     /// 内嵌 BitTorrent 会话（惰性初始化：只有真正用到种子时才创建）
     torrent_engine: Arc<OnceCell<Arc<crate::torrent::engine::TorrentEngine>>>,
+    /// 最近一次应用设置快照（做种策略等运行时读取）
+    settings: Arc<ParkingMutex<crate::settings::AppSettings>>,
 }
 
 /// 重复链接创建被拒绝时的错误标记；前端据此弹确认框后以 force 重试
@@ -87,6 +89,7 @@ impl Scheduler {
             speed_limit: Arc::new(TokenBucket::new(0)),
             torrent_cfg: Arc::new(ParkingMutex::new(None)),
             torrent_engine: Arc::new(OnceCell::new()),
+            settings: Arc::new(ParkingMutex::new(crate::settings::AppSettings::default())),
         }
     }
 
@@ -103,6 +106,7 @@ impl Scheduler {
             max_retries: settings.max_retries,
         };
         *self.duplicate_action.lock() = settings.duplicate_action.clone();
+        *self.settings.lock() = settings.clone();
         self.speed_limit
             .set_rate((settings.global_speed_limit_kbps as u64).saturating_mul(1024));
 
@@ -203,6 +207,7 @@ impl Scheduler {
             speed_limit: Arc::new(TokenBucket::new(0)),
             torrent_cfg: Arc::new(ParkingMutex::new(None)),
             torrent_engine: Arc::new(OnceCell::new()),
+            settings: Arc::new(ParkingMutex::new(crate::settings::AppSettings::default())),
         })
     }
 
@@ -840,11 +845,14 @@ impl Scheduler {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 做种计时起点（ratio / time 策略在完成后继续轮询，到点暂停）
+            let mut completed_at: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
 
-                // 暂停 / 取消由任务状态传递进来
-                match *task.status.lock().await {
+                let status = *task.status.lock().await;
+                // 暂停 / 取消由任务状态传递进来；Completed 说明正处于做种阶段
+                match status {
                     TaskStatus::Paused => {
                         if let Err(e) = engine.pause(&task_id).await {
                             *task.error_message.lock().await = Some(e.to_string());
@@ -856,8 +864,8 @@ impl Scheduler {
                         let _ = engine.remove(&task_id, false).await;
                         break;
                     }
-                    TaskStatus::Downloading => {}
-                    // 其它状态（完成/失败）说明已被外部终结
+                    TaskStatus::Downloading | TaskStatus::Completed => {}
+                    // 其它状态（失败）说明已被外部终结
                     _ => break,
                 }
 
@@ -885,7 +893,9 @@ impl Scheduler {
                     seeds: None,
                     files,
                 })
-                .await;                if p.state == TorrentRunState::Error {
+                .await;
+
+                if p.state == TorrentRunState::Error {
                     *task.error_message.lock().await =
                         p.error.clone().or_else(|| Some("种子下载出错".to_string()));
                     *task.status.lock().await = TaskStatus::Failed;
@@ -898,8 +908,9 @@ impl Scheduler {
                     break;
                 }
 
-                if p.is_finished() {
+                if p.is_finished() && status == TaskStatus::Downloading {
                     *task.status.lock().await = TaskStatus::Completed;
+                    completed_at.get_or_insert_with(std::time::Instant::now);
                     if let Some(app) = &app_handle_clone {
                         let _ = app.emit(
                             "download-finished",
@@ -910,7 +921,34 @@ impl Scheduler {
                             ),
                         );
                     }
-                    break;
+                    // 做种策略：stop 完成即停；forever 不再轮询（引擎继续上传）；
+                    // ratio / time 继续轮询，满足条件后暂停（见下方 Completed 分支）
+                    let s = scheduler_self.settings.lock().clone();
+                    match s.torrent_seed_mode.as_str() {
+                        "stop" => {
+                            let _ = engine.pause(&task_id).await;
+                            break;
+                        }
+                        "forever" => break,
+                        _ => {}
+                    }
+                } else if status == TaskStatus::Completed {
+                    // 已完成、正在按 ratio / time 策略做种，检查是否到点
+                    let s = scheduler_self.settings.lock().clone();
+                    let seeded_for = completed_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
+                    if seeding_pause_due(
+                        &s.torrent_seed_mode,
+                        p.uploaded_bytes,
+                        p.total_bytes,
+                        s.torrent_seed_ratio_pct,
+                        seeded_for,
+                        s.torrent_seed_time_min,
+                    ) {
+                        let _ = engine.pause(&task_id).await;
+                        break;
+                    }
                 }
 
                 if let Some(app) = &app_handle_clone {
@@ -1675,6 +1713,7 @@ impl Clone for Scheduler {
             speed_limit: self.speed_limit.clone(),
             torrent_cfg: self.torrent_cfg.clone(),
             torrent_engine: self.torrent_engine.clone(),
+            settings: self.settings.clone(),
         }
     }
 }
@@ -1726,6 +1765,32 @@ async fn task_to_info(t: &Arc<Task>) -> TaskInfo {
 fn base64_encode(bytes: &[u8]) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     STANDARD.encode(bytes)
+}
+
+/// 做种策略判定：已完成的种子任务是否应当暂停（停止做种）。
+///
+/// stop / forever 在完成瞬间由轮询器直接处理，这里只负责 ratio / time：
+/// - ratio：上传量 ≥ 下载体积 × ratio_pct/100（ratio_pct=0 即完成就停；总大小未知时按停处理）
+/// - time：已完成做种时长 ≥ seed_time_min 分钟
+fn seeding_pause_due(
+    mode: &str,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+    ratio_pct: u32,
+    seeded_for: std::time::Duration,
+    seed_time_min: u32,
+) -> bool {
+    match mode {
+        "ratio" => {
+            if total_bytes == 0 {
+                return true;
+            }
+            let target = total_bytes.saturating_mul(ratio_pct as u64) / 100;
+            uploaded_bytes >= target
+        }
+        "time" => seeded_for >= std::time::Duration::from_secs(seed_time_min as u64 * 60),
+        _ => false,
+    }
 }
 
 /// 为重复文件名生成不冲突的名称：a.zip → a (1).zip → a (2).zip
@@ -2008,5 +2073,26 @@ mod tests {
         assert_eq!(s.limits.lock().max_concurrent_tasks, 2);
         assert_eq!(s.limits.lock().max_retries, 5);
         assert_eq!(s.speed_limit.rate_bps(), 512 * 1024);
+    }
+
+    #[test]
+    fn seeding_policy_ratio_time_forever() {
+        use std::time::Duration;
+        // ratio：上传量达到 下载体积 × 百分比 后停
+        assert!(!seeding_pause_due("ratio", 50, 100, 100, Duration::ZERO, 0));
+        assert!(seeding_pause_due("ratio", 100, 100, 100, Duration::ZERO, 0));
+        assert!(seeding_pause_due("ratio", 250, 100, 100, Duration::ZERO, 0));
+        // 2.5x 分享率（250%）
+        assert!(!seeding_pause_due("ratio", 200, 100, 250, Duration::ZERO, 0));
+        assert!(seeding_pause_due("ratio", 250, 100, 250, Duration::ZERO, 0));
+        // ratio 0% = 完成即停；总大小未知也按停处理
+        assert!(seeding_pause_due("ratio", 0, 100, 0, Duration::ZERO, 0));
+        assert!(seeding_pause_due("ratio", 10, 0, 100, Duration::ZERO, 0));
+        // time：做种满 N 分钟后停
+        assert!(!seeding_pause_due("time", 0, 100, 0, Duration::from_secs(29 * 60), 30));
+        assert!(seeding_pause_due("time", 0, 100, 0, Duration::from_secs(30 * 60), 30));
+        // forever / stop 不在此判定（由轮询器直接处理）
+        assert!(!seeding_pause_due("forever", 0, 100, 0, Duration::from_secs(3600), 0));
+        assert!(!seeding_pause_due("stop", 0, 100, 0, Duration::ZERO, 0));
     }
 }

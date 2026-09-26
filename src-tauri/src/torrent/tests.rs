@@ -118,6 +118,8 @@ async fn downloads_a_locally_seeded_torrent() {
         listen_port: None,
         download_bps: None,
         upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
         client_name: "MultiDown-test".to_string(),
         initial_peers: vec![seeder_addr],
     })
@@ -208,6 +210,8 @@ async fn resolves_real_magnet() {
         listen_port: None,
         download_bps: None,
         upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
         client_name: "MultiDown-test".to_string(),
         initial_peers: Vec::new(),
     })
@@ -296,6 +300,8 @@ async fn downloads_only_selected_files() {
         listen_port: None,
         download_bps: None,
         upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
         client_name: "MultiDown-test".to_string(),
         initial_peers: vec![seeder_addr],
     })

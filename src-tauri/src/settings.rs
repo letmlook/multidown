@@ -73,6 +73,34 @@ pub struct AppSettings {
     /// 种子任务上传限速（KB/s），0 表示不限速
     #[serde(default)]
     pub torrent_upload_limit_kbps: u32,
+    /// 每个种子任务的 peer 连接数上限；0 表示使用引擎默认值
+    #[serde(default)]
+    pub torrent_peer_limit: u32,
+    /// BT 专用 SOCKS5 代理（socks5://[user:pass@]host:port；空 = 不走代理）。
+    /// BT peer 连接不支持 HTTP 代理，这里与 HTTP 下载的代理设置相互独立。
+    #[serde(default)]
+    pub torrent_socks5_proxy: String,
+    /// 做种策略：stop（完成即停，默认）| ratio（按分享率）| time（按时长）| forever（一直做种）
+    #[serde(default = "default_seed_mode")]
+    pub torrent_seed_mode: String,
+    /// 做种策略为 ratio 时的目标分享率（百分比，100 = 上传量达到下载体积）
+    #[serde(default = "default_seed_ratio")]
+    pub torrent_seed_ratio_pct: u32,
+    /// 做种策略为 time 时的做种时长（分钟）
+    #[serde(default = "default_seed_time_min")]
+    pub torrent_seed_time_min: u32,
+}
+
+fn default_seed_mode() -> String {
+    "stop".to_string()
+}
+
+fn default_seed_ratio() -> u32 {
+    100
+}
+
+fn default_seed_time_min() -> u32 {
+    30
 }
 
 fn default_true() -> bool {
@@ -108,6 +136,11 @@ impl Default for AppSettings {
             torrent_disable_lsd: true,
             torrent_listen_port: 0,
             torrent_upload_limit_kbps: 0,
+            torrent_peer_limit: 0,
+            torrent_socks5_proxy: String::new(),
+            torrent_seed_mode: default_seed_mode(),
+            torrent_seed_ratio_pct: default_seed_ratio(),
+            torrent_seed_time_min: default_seed_time_min(),
         }
     }
 }
@@ -123,6 +156,16 @@ impl AppSettings {
             return None;
         }
         Some(format!("http://{}:{}", host, self.proxy_port))
+    }
+
+    /// BT 专用 SOCKS5 代理地址。只接受 `socks5://` scheme（librqbit 的要求）；
+    /// 填了其它 scheme 视为未配置，避免静默产生无效配置。
+    pub fn torrent_proxy_url(&self) -> Option<String> {
+        let s = self.torrent_socks5_proxy.trim();
+        if s.is_empty() {
+            return None;
+        }
+        s.starts_with("socks5://").then(|| s.to_string())
     }
 }
 

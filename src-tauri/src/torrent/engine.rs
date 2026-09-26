@@ -7,9 +7,9 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerMode,
-    ListenerOptions, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
-    TorrentStatsState,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, DhtSessionConfig,
+    ListenerMode, ListenerOptions, ManagedTorrent, Session, SessionOptions,
+    SessionPersistenceConfig, TorrentStatsState,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,11 @@ pub struct TorrentEngineConfig {
     pub download_bps: Option<u32>,
     /// 上传限速（字节/秒），None 表示不限速
     pub upload_bps: Option<u32>,
+    /// 每个种子任务的 peer 连接数上限；None 使用引擎默认值
+    pub peer_limit: Option<usize>,
+    /// BT 专用 SOCKS5 代理（socks5://...）。与 HTTP 代理相互独立；
+    /// **配置后 DHT/LSD 必须强制关闭**，否则 UDP 不经代理会泄漏真实 IP。
+    pub proxy_url: Option<String>,
     /// 客户端标识，出现在 peer 握手的扩展信息里
     pub client_name: String,
     /// 直接注入的 peer 地址。正常下载为空（靠 DHT/tracker 发现）；
@@ -48,14 +53,21 @@ pub struct TorrentEngineConfig {
 impl TorrentEngineConfig {
     /// 从应用设置推导引擎配置。
     pub fn from_settings(settings: &crate::settings::AppSettings, app_data_dir: &Path) -> Self {
+        // 隐私硬约束：BT 走 SOCKS5 代理时，DHT/LSD 的 UDP 流量不经代理，
+        // 会向全网宣告"这个 IP 在下这个种子"，必须同时关闭。
+        let proxy_url = settings.torrent_proxy_url();
+        let proxy_active = proxy_url.is_some();
         Self {
             default_download_dir: default_download_dir(settings),
             state_dir: app_data_dir.join("torrent-session"),
-            enable_dht: settings.torrent_enable_dht,
-            disable_lsd: settings.torrent_disable_lsd,
+            enable_dht: settings.torrent_enable_dht && !proxy_active,
+            disable_lsd: settings.torrent_disable_lsd || proxy_active,
             listen_port: (settings.torrent_listen_port > 0).then_some(settings.torrent_listen_port),
             download_bps: kbps_to_bps(settings.global_speed_limit_kbps),
             upload_bps: kbps_to_bps(settings.torrent_upload_limit_kbps),
+            peer_limit: (settings.torrent_peer_limit > 0)
+                .then_some(settings.torrent_peer_limit as usize),
+            proxy_url,
             client_name: format!("MultiDown/{}", env!("CARGO_PKG_VERSION")),
             initial_peers: Vec::new(),
         }
@@ -127,6 +139,8 @@ impl TorrentProgress {
 
 pub struct TorrentEngine {
     session: Arc<Session>,
+    /// 创建时的配置快照（add 时读取 peer_limit 等）
+    cfg: TorrentEngineConfig,
     /// task_id → librqbit 句柄
     handles: Mutex<HashMap<TaskId, Arc<ManagedTorrent>>>,
     /// 手动注入的 peer（测试用；生产为空）
@@ -165,6 +179,11 @@ impl TorrentEngine {
                 download_bps: cfg.download_bps.and_then(NonZeroU32::new),
                 upload_bps: cfg.upload_bps.and_then(NonZeroU32::new),
             },
+            // SOCKS5 代理只作用于 BT peer 连接（uTP 会自动退化为纯 TCP）
+            connect: cfg.proxy_url.as_ref().map(|url| ConnectionOptions {
+                proxy_url: Some(url.clone()),
+                ..Default::default()
+            }),
             client_name_and_version: Some(cfg.client_name.clone()),
             ..Default::default()
         };
@@ -175,6 +194,7 @@ impl TorrentEngine {
 
         Ok(Self {
             session,
+            cfg: cfg.clone(),
             handles: Mutex::new(HashMap::new()),
             initial_peers: cfg.initial_peers.clone(),
         })
@@ -298,6 +318,7 @@ impl TorrentEngine {
             output_folder: Some(output_folder.to_string_lossy().into_owned()),
             only_files: selected_files.map(|s| s.to_vec()),
             paused,
+            peer_limit: self.cfg.peer_limit,
             initial_peers: (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone()),
             ..Default::default()
         };
@@ -600,5 +621,42 @@ mod tests {
         assert_eq!(kbps_to_bps(0), None);
         assert_eq!(kbps_to_bps(1), Some(1024));
         assert_eq!(kbps_to_bps(100), Some(102400));
+    }
+
+    #[test]
+    fn proxy_config_forces_dht_and_lsd_off() {
+        // 代理下的隐私硬约束：DHT/LSD 走 UDP 不经代理，会泄漏真实 IP
+        let mut settings = crate::settings::AppSettings {
+            torrent_enable_dht: true,
+            torrent_disable_lsd: false,
+            torrent_socks5_proxy: "socks5://127.0.0.1:1080".into(),
+            torrent_peer_limit: 80,
+            ..Default::default()
+        };
+        let cfg = TorrentEngineConfig::from_settings(&settings, Path::new("/tmp"));
+        assert_eq!(cfg.proxy_url.as_deref(), Some("socks5://127.0.0.1:1080"));
+        assert!(!cfg.enable_dht, "代理生效时必须关闭 DHT");
+        assert!(cfg.disable_lsd, "代理生效时必须关闭 LSD");
+        assert_eq!(cfg.peer_limit, Some(80));
+
+        // 非法 scheme 视为未配置代理，DHT 保持用户设置
+        settings.torrent_socks5_proxy = "http://127.0.0.1:8080".into();
+        let cfg = TorrentEngineConfig::from_settings(&settings, Path::new("/tmp"));
+        assert!(cfg.proxy_url.is_none());
+        assert!(cfg.enable_dht);
+        assert!(!cfg.disable_lsd);
+
+        // 未配置代理时尊重用户设置
+        let settings = crate::settings::AppSettings {
+            torrent_enable_dht: true,
+            torrent_disable_lsd: false,
+            torrent_socks5_proxy: String::new(),
+            ..Default::default()
+        };
+        let cfg = TorrentEngineConfig::from_settings(&settings, Path::new("/tmp"));
+        assert!(cfg.proxy_url.is_none());
+        assert!(cfg.enable_dht);
+        assert!(!cfg.disable_lsd);
+        assert_eq!(cfg.peer_limit, None, "0 表示使用引擎默认 peer 数");
     }
 }

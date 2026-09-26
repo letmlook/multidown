@@ -116,6 +116,25 @@ export interface AppSettings {
   capture_enabled?: boolean;
   /** 浏览器捕获域名黑名单 */
   capture_domain_blacklist?: string[];
+  // ── BitTorrent（磁力链接 / 种子）──
+  /** 是否启用 DHT（磁力链接靠它找 peer） */
+  torrent_enable_dht?: boolean;
+  /** 是否关闭本地服务发现（LSD 走组播，容易触发防火墙弹窗） */
+  torrent_disable_lsd?: boolean;
+  /** BT 监听端口；0 = 随机端口 */
+  torrent_listen_port?: number;
+  /** 种子任务上传限速（KB/s），0 = 不限速 */
+  torrent_upload_limit_kbps?: number;
+  /** 每个种子任务的 peer 连接数上限；0 = 引擎默认 */
+  torrent_peer_limit?: number;
+  /** BT 专用 SOCKS5 代理（socks5://...；空 = 不走代理） */
+  torrent_socks5_proxy?: string;
+  /** 做种策略：stop | ratio | time | forever */
+  torrent_seed_mode?: string;
+  /** ratio 策略的目标分享率（百分比，100 = 1.0x） */
+  torrent_seed_ratio_pct?: number;
+  /** time 策略的做种时长（分钟） */
+  torrent_seed_time_min?: number;
 }
 
 // ---------------------------------------------------------------------------

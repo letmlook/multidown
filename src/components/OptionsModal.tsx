@@ -27,6 +27,7 @@ const TABS = [
   { id: "download", label: "下载" },
   { id: "save", label: "保存至" },
   { id: "connection", label: "连接" },
+  { id: "bittorrent", label: "BitTorrent" },
   { id: "proxy", label: "代理服务器" },
   { id: "sounds", label: "通知与声音" },
   { id: "categories", label: "分类规则" },
@@ -59,6 +60,15 @@ const defaultSettings: AppSettings = {
   global_speed_limit_kbps: 0,
   capture_enabled: true,
   capture_domain_blacklist: [],
+  torrent_enable_dht: true,
+  torrent_disable_lsd: true,
+  torrent_listen_port: 0,
+  torrent_upload_limit_kbps: 0,
+  torrent_peer_limit: 0,
+  torrent_socks5_proxy: "",
+  torrent_seed_mode: "stop",
+  torrent_seed_ratio_pct: 100,
+  torrent_seed_time_min: 30,
 };
 
 function newRule(): CategoryRule {
@@ -843,6 +853,139 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                       />
                       <span style={{ color: "#666", fontSize: 12 }}>0 表示不周期保存</span>
                     </div>
+                  </div>
+                </div>
+              )}
+              {tab === "bittorrent" && (
+                <div className="options-section">
+                  <div className="options-section-title">BitTorrent（磁力链接 / 种子）</div>
+                  <label className="form-check-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.torrent_enable_dht ?? true}
+                      onChange={(e) => update({ torrent_enable_dht: e.target.checked })}
+                    />
+                    <span>启用 DHT（磁力链接没有 tracker 时靠它找 peer）</span>
+                  </label>
+                  <label className="form-check-row">
+                    <input
+                      type="checkbox"
+                      checked={settings.torrent_disable_lsd ?? true}
+                      onChange={(e) => update({ torrent_disable_lsd: e.target.checked })}
+                    />
+                    <span>关闭本地服务发现（LSD 走组播，容易触发防火墙弹窗）</span>
+                  </label>
+                  <div className="form-group">
+                    <label>BT 监听端口</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        max={65535}
+                        value={settings.torrent_listen_port ?? 0}
+                        onChange={(e) =>
+                          update({ torrent_listen_port: Number(e.target.value) || 0 })
+                        }
+                        style={{ width: 100, padding: "6px 10px" }}
+                      />
+                      <span style={{ color: "#666", fontSize: 12 }}>0 表示随机端口</span>
+                    </div>
+                  </div>
+                  <div className="form-group">
+                    <label>种子上传限速（KB/s）</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        value={settings.torrent_upload_limit_kbps ?? 0}
+                        onChange={(e) =>
+                          update({ torrent_upload_limit_kbps: Number(e.target.value) || 0 })
+                        }
+                        style={{ width: 100, padding: "6px 10px" }}
+                      />
+                      <span style={{ color: "#666", fontSize: 12 }}>0 表示不限速</span>
+                    </div>
+                    <span style={{ color: "#666", fontSize: 12, marginTop: 4, display: "block" }}>
+                      建议设一个非零值，避免做种占满上传带宽；全局下载限速同样对 BT 生效
+                    </span>
+                  </div>
+                  <div className="form-group">
+                    <label>每个种子的 peer 连接数上限</label>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                      <input
+                        type="number"
+                        min={0}
+                        value={settings.torrent_peer_limit ?? 0}
+                        onChange={(e) => update({ torrent_peer_limit: Number(e.target.value) || 0 })}
+                        style={{ width: 100, padding: "6px 10px" }}
+                      />
+                      <span style={{ color: "#666", fontSize: 12 }}>0 表示使用引擎默认值</span>
+                    </div>
+                  </div>
+                  <div className="form-group">
+                    <label>做种策略（下载完成后）</label>
+                    <select
+                      style={{ padding: "6px 10px", minWidth: 220, marginTop: 6, display: "block" }}
+                      value={settings.torrent_seed_mode ?? "stop"}
+                      onChange={(e) => update({ torrent_seed_mode: e.target.value })}
+                    >
+                      <option value="stop">完成即停止做种（推荐）</option>
+                      <option value="ratio">按分享率做种</option>
+                      <option value="time">按做种时长</option>
+                      <option value="forever">一直做种</option>
+                    </select>
+                  </div>
+                  {settings.torrent_seed_mode === "ratio" && (
+                    <div className="form-group">
+                      <label>目标分享率（%）</label>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                        <input
+                          type="number"
+                          min={0}
+                          value={settings.torrent_seed_ratio_pct ?? 100}
+                          onChange={(e) =>
+                            update({ torrent_seed_ratio_pct: Number(e.target.value) || 0 })
+                          }
+                          style={{ width: 100, padding: "6px 10px" }}
+                        />
+                        <span style={{ color: "#666", fontSize: 12 }}>100 = 上传量等于下载体积</span>
+                      </div>
+                    </div>
+                  )}
+                  {settings.torrent_seed_mode === "time" && (
+                    <div className="form-group">
+                      <label>做种时长（分钟）</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={settings.torrent_seed_time_min ?? 30}
+                        onChange={(e) =>
+                          update({ torrent_seed_time_min: Number(e.target.value) || 30 })
+                        }
+                        style={{ marginTop: 6, width: 100, padding: "6px 10px" }}
+                      />
+                    </div>
+                  )}
+                  <div className="form-group">
+                    <label>BT 专用 SOCKS5 代理</label>
+                    <input
+                      type="text"
+                      value={settings.torrent_socks5_proxy ?? ""}
+                      onChange={(e) => update({ torrent_socks5_proxy: e.target.value })}
+                      placeholder="socks5://127.0.0.1:1080（留空不使用代理）"
+                      style={{ marginTop: 6 }}
+                    />
+                    <span
+                      style={{
+                        color: settings.torrent_socks5_proxy?.trim() ? "#c47f17" : "#666",
+                        fontSize: 12,
+                        marginTop: 4,
+                        display: "block",
+                      }}
+                    >
+                      仅支持 SOCKS5；配置后将强制关闭 DHT 与本地发现，避免真实 IP 经 UDP 泄漏。
+                      监听端口 / DHT / 代理在重启应用后生效
+                    </span>
                   </div>
                 </div>
               )}
