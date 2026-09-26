@@ -86,6 +86,15 @@ export function isTorrentInput(input: string): boolean {
   return s.endsWith(".torrent");
 }
 
+/** 磁力链接 / .torrent 的系统默认程序状态（对应 Rust protocol::HandlerStatus） */
+export interface MagnetHandlerStatus {
+  magnet_is_default: boolean;
+  magnet_current: string | null;
+  torrent_is_default: boolean | null;
+  can_set_default: boolean;
+  hint: string;
+}
+
 /** HTTP 认证配置（与 Rust AuthConfig 对应） */
 export type AuthConfig =
   | { kind: "basic"; username: string; password: string }

@@ -42,7 +42,9 @@
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": "",
-      "nsis": null
+      "nsis": {
+        "installerHooks": "./nsis/hooks.nsh"
+      }
     },
     "longDescription": "MultiDown - 对标 IDM 的跨平台多线程下载工具，支持动态分段与断点续传。",
     "shortDescription": "跨平台多线程下载工具",
@@ -51,7 +53,19 @@
     },
     "category": "Utility",
     "copyright": "",
-    "license": "MIT"
+    "license": "MIT",
+    "fileAssociations": [
+      {
+        "ext": [
+          "torrent"
+        ],
+        "name": "BitTorrent Metainfo",
+        "description": "BitTorrent 种子文件",
+        "mimeType": "application/x-bittorrent",
+        "role": "Viewer",
+        "rank": "Default"
+      }
+    ]
   },
   "plugins": {
     "deep-link": {

@@ -24,8 +24,10 @@ document.getElementById('btnDownload').addEventListener('click', function() {
     showToast('请输入下载链接', 'error');
     return;
   }
-  if (!url.startsWith('http://') && !url.startsWith('https://')) {
-    showToast('链接格式无效', 'error');
+  const isTorrentUrl =
+    url.startsWith('magnet:') || url.toLowerCase().endsWith('.torrent');
+  if (!url.startsWith('http://') && !url.startsWith('https://') && !isTorrentUrl) {
+    showToast('链接格式无效（支持 http/https、magnet: 与 .torrent）', 'error');
     return;
   }
   document.getElementById('btnDownload').disabled = true;

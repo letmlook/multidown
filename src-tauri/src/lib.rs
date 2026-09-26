@@ -5,6 +5,7 @@
 
 mod engine;
 mod network;
+mod protocol;
 mod settings;
 mod torrent;
 
@@ -1398,8 +1399,14 @@ async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, Stri
 }
 
 /// 注册 Native Host
-/// 解析 multidown://add?url=<encoded> 形式的唤起链接，返回目标下载地址
+/// 解析 multidown://add?url=<encoded> 形式的唤起链接，返回目标下载地址。
+///
+/// 除 http/https 外也放行磁力链接与 .torrent URL（由调用方分流到对应下载路径）。
 fn parse_scheme_url(scheme_url: &str) -> Option<String> {
+    // 裸磁力链接也可能直接作为 scheme URL 到达（macOS 声明 magnet scheme 后）
+    if torrent::detect::sniff(scheme_url) == torrent::detect::InputProtocol::Magnet {
+        return Some(scheme_url.to_string());
+    }
     let rest = scheme_url.strip_prefix("multidown://")?;
     // 形如 add?url=... 或 ?url=...
     let query = rest.split_once('?').map(|(_, q)| q).unwrap_or(rest);
@@ -1407,7 +1414,10 @@ fn parse_scheme_url(scheme_url: &str) -> Option<String> {
         if let Some((k, v)) = pair.split_once('=') {
             if k == "url" {
                 let decoded = urlencoding::decode(v).ok()?.into_owned();
-                if decoded.starts_with("http://") || decoded.starts_with("https://") {
+                if decoded.starts_with("http://")
+                    || decoded.starts_with("https://")
+                    || torrent::detect::sniff(&decoded).is_torrent()
+                {
                     return Some(decoded);
                 }
                 return None;
@@ -1415,6 +1425,75 @@ fn parse_scheme_url(scheme_url: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── 外部输入统一处理（argv / 单实例 / 深链 / 打开文件 / 拖拽）────────────────
+
+/// 待处理的外部下载输入队列：前端就绪前到达的输入先入队，
+/// 前端挂载后调用 take_external_inputs 一次性取走，消除丢事件竞态。
+static PENDING_EXTERNAL_INPUTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 判定外部输入（命令行参数 / 深链 / 打开文件）是否是下载意图。
+///
+/// 忽略 `-` 开头的 CLI 开关与 autostart 参数；`magnet:` 没有 `://`，单独判断。
+fn is_external_input(arg: &str) -> bool {
+    if arg.trim_start().starts_with('-') {
+        return false;
+    }
+    let lower = arg.to_lowercase();
+    lower.contains("://") || lower.starts_with("magnet:") || lower.ends_with(".torrent")
+}
+
+/// 规范化外部输入：`file://` URL → 本地路径（macOS 的 RunEvent::Opened 给的是 file URL）。
+fn normalize_external_input(arg: &str) -> Option<String> {
+    let s = arg.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(path) = torrent::detect::file_url_to_path(s) {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    Some(s.to_string())
+}
+
+/// 统一处理外部下载输入：入队 + 通知前端。
+///
+/// 前端监听 `external-input` 事件；早于监听注册到达的输入由
+/// `take_external_inputs` 命令补发。torrent 类输入前端会打开"新建任务"，
+/// http 类输入沿用"下载文件信息"确认框。
+fn handle_external_input(app: &tauri::AppHandle, raw: &str) {
+    let Some(input) = normalize_external_input(raw) else {
+        return;
+    };
+    if !is_external_input(&input) {
+        return;
+    }
+    debug_log(app, "收到外部下载输入", Some(&input));
+    PENDING_EXTERNAL_INPUTS
+        .lock()
+        .unwrap()
+        .push(input.clone());
+    let _ = app.emit("external-input", serde_json::json!({ "input": input }));
+}
+
+/// 取走全部待处理的外部下载输入（前端挂载时调用，队列清空）。
+#[tauri::command]
+fn take_external_inputs() -> Vec<String> {
+    std::mem::take(&mut *PENDING_EXTERNAL_INPUTS.lock().unwrap())
+}
+
+// ── 磁力链接默认程序（系统关联）────────────────────────────────────────────
+
+/// 查询磁力链接 / .torrent 的系统默认处理程序状态。
+#[tauri::command]
+fn get_magnet_handler_status(app: tauri::AppHandle) -> Result<protocol::HandlerStatus, String> {
+    Ok(protocol::status(app.config().identifier.trim()))
+}
+
+/// 设置 / 注销磁力链接默认处理程序（各平台语义见 protocol 模块文档）。
+#[tauri::command]
+fn set_magnet_handler(app: tauri::AppHandle, enable: bool) -> Result<(), String> {
+    protocol::set_magnet_default(app.config().identifier.trim(), enable)
 }
 
 /// Firefox Native Messaging manifest（要求 allowed_extensions 精确匹配扩展 ID）
@@ -1854,7 +1933,9 @@ async fn import_tasks(
             .into_iter()
             .filter(|t| {
                 let u = t.url.trim();
-                u.starts_with("http://") || u.starts_with("https://")
+                u.starts_with("http://")
+                    || u.starts_with("https://")
+                    || crate::torrent::detect::sniff(u).is_torrent()
             })
             .map(|t| {
                 let dir = if t.save_path.is_empty() {
@@ -1881,7 +1962,9 @@ async fn import_tasks(
             .map(|s| s.trim())
             .filter(|s| {
                 !s.is_empty()
-                    && (s.starts_with("http://") || s.starts_with("https://"))
+                    && (s.starts_with("http://")
+                        || s.starts_with("https://")
+                        || crate::torrent::detect::sniff(s).is_torrent())
             })
             .map(|u| (u.to_string(), save_dir.clone(), None))
             .collect()
@@ -1889,7 +1972,15 @@ async fn import_tasks(
 
     let mut count = 0u32;
     for (url, dir, filename) in urls {
-        if state.create_task(url, dir, filename, None).await.is_ok() {
+        // 磁力 / .torrent 走种子任务路径（占位任务，元数据下载时解析）
+        let created = if crate::torrent::detect::sniff(&url).is_torrent() {
+            state
+                .create_torrent_task(url, dir, filename, None, None, None, false)
+                .await
+        } else {
+            state.create_task(url, dir, filename, None).await
+        };
+        if created.is_ok() {
             count += 1;
         }
     }
@@ -1950,12 +2041,17 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // 二次启动时唤起主窗口（deep-link 也依赖单实例语义）
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
                 let _ = window.set_focus();
+            }
+            // 二次启动的 argv 可能带磁力链接 / .torrent 文件路径（Windows/Linux
+            // 的文件关联与深链都表现为"新进程 + 参数"），统一解析后交给前端
+            for arg in args {
+                handle_external_input(app, arg.as_str());
             }
         }))
         .plugin(tauri_plugin_deep_link::init())
@@ -1993,7 +2089,8 @@ pub fn run() {
             }
             app.manage(scheduler);
 
-            // URL Scheme：multidown://add?url=... 直接唤起下载
+            // URL Scheme：multidown://add?url=... 直接唤起下载；
+            // macOS 声明 magnet scheme 后，裸磁力链接也会路由到这里
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let sched_deep = sched_clone.clone();
@@ -2001,9 +2098,22 @@ pub fn run() {
                 app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
                         let url_str = url.to_string();
+
+                        // 裸磁力链接：统一走外部输入路径（前端弹"新建任务"）
+                        if torrent::detect::sniff(&url_str) == torrent::detect::InputProtocol::Magnet
+                        {
+                            handle_external_input(&app_deep, &url_str);
+                            continue;
+                        }
+
                         let Some(task_url) = parse_scheme_url(&url_str) else {
                             continue;
                         };
+                        // scheme 参数里也可能携带种子输入
+                        if torrent::detect::sniff(&task_url).is_torrent() {
+                            handle_external_input(&app_deep, &task_url);
+                            continue;
+                        }
                         let sched = sched_deep.clone();
                         let app = app_deep.clone();
                         tauri::async_runtime::spawn(async move {
@@ -2040,6 +2150,12 @@ pub fn run() {
                         });
                     }
                 });
+            }
+
+            // 首次启动的 argv：Windows/Linux 上双击 .torrent / 点击磁力链接
+            // （应用未运行时）表现为"带参数启动"，统一解析
+            for arg in std::env::args().skip(1) {
+                handle_external_input(&app_handle, &arg);
             }
 
             // 计划任务后台 tick：每 20 秒检查一次规则并执行事件
@@ -2309,10 +2425,16 @@ pub fn run() {
                             let _ = writer.shutdown().await;
                         }
                         "download" => {
+                            // 放行 http(s)、磁力链接与 .torrent URL（种子由任务创建路径分流）
                             let url = msg
                                 .get("url")
                                 .and_then(|v| v.as_str())
-                                .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
+                                .filter(|s| {
+                                    s.starts_with("http://")
+                                        || s.starts_with("https://")
+                                        || s.starts_with("magnet:")
+                                        || crate::torrent::detect::sniff(s).is_torrent()
+                                });
                             
                             let url = match url {
                                 Some(u) => {
@@ -2494,6 +2616,49 @@ pub fn run() {
                                 }
                             };
 
+                            // ── 种子输入（磁力 / .torrent）分流：占位任务立即创建，
+                            // 元数据在下载路径里解析，不阻塞扩展应答 ──
+                            if crate::torrent::detect::sniff(&url).is_torrent() {
+                                if settings.show_start_dialog {
+                                    if open_window {
+                                        show_main(&app_worker);
+                                    }
+                                    let _ = app_worker.emit(
+                                        "extension-download-request",
+                                        serde_json::json!({ "url": url, "filename": filename }),
+                                    );
+                                    let _ = responder.send(Ok(()));
+                                    continue;
+                                }
+                                if open_window {
+                                    show_main(&app_worker);
+                                }
+                                let save_dir =
+                                    save_path.unwrap_or_else(|| default_save_dir_for_browser(&app_worker));
+                                let result = match sched_worker
+                                    .create_torrent_task(
+                                        url.clone(),
+                                        save_dir,
+                                        filename,
+                                        None,
+                                        None,
+                                        None,
+                                        false,
+                                    )
+                                    .await
+                                {
+                                    Ok(id) => sched_worker
+                                        .start_download(&id, Some(app_worker.clone()), Some(sched_worker.clone()), None, None)
+                                        .await
+                                        .and(Ok(())),
+                                    // 重复链接且策略为 ask：非交互路径视为已存在，不报错
+                                    Err(e) if e == engine::scheduler::ERR_DUPLICATE_ASK => Ok(()),
+                                    Err(e) => Err(e),
+                                };
+                                let _ = responder.send(result);
+                                continue;
+                            }
+
                             // 开启"显示开始下载对话框"时：不自动创建任务，
                             // 改为通知前端弹出下载信息确认框
                             if settings.show_start_dialog {
@@ -2561,8 +2726,24 @@ pub fn run() {
                                 let _ = window.set_focus();
                             }
                             
-                            // 如果提供了URL，自动添加到下载
-                            if !url.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) {
+                            // 如果提供了URL，自动添加到下载（磁力/种子分流到种子任务）
+                            if crate::torrent::detect::sniff(&url).is_torrent() {
+                                let save_dir = default_save_dir_for_browser(&app_worker);
+                                let result = match sched_worker
+                                    .create_torrent_task(url, save_dir, None, None, None, None, false)
+                                    .await
+                                {
+                                    Ok(id) => sched_worker
+                                        .start_download(&id, Some(app_worker.clone()), Some(sched_worker.clone()), None, None)
+                                        .await
+                                        .and(Ok(())),
+                                    Err(e) if e == engine::scheduler::ERR_DUPLICATE_ASK => Ok(()),
+                                    Err(e) => Err(e),
+                                };
+                                let _ = responder.send(result);
+                            } else if !url.is_empty()
+                                && (url.starts_with("http://") || url.starts_with("https://"))
+                            {
                                 let save_dir = default_save_dir_for_browser(&app_worker);
                                 let result = match sched_worker.create_task(url, save_dir, None, None).await {
                                     Ok(id) => {
@@ -2640,6 +2821,9 @@ pub fn run() {
             resolve_torrent,
             create_torrent_download,
             set_torrent_files,
+            take_external_inputs,
+            get_magnet_handler_status,
+            set_magnet_handler,
             create_download,
             create_download_with_probe,
             start_download,
@@ -2713,6 +2897,20 @@ pub fn run() {
             update_proxy_rule,
             delete_proxy_rule,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // macOS：双击 .torrent 文件（file:// URL）经 LaunchServices 到达这里。
+            // 该变体仅在 macOS/iOS/Android 编译，其它平台直接忽略事件。
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    handle_external_input(app, url.as_str());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app, event);
+            }
+        });
 }

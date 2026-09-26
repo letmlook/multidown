@@ -140,7 +140,12 @@ fn handle_download_message(msg: &serde_json::Value, stdout: &mut impl Write) -> 
     let url = msg
         .get("url")
         .and_then(|v| v.as_str())
-        .filter(|s| s.starts_with("http://") || s.starts_with("https://"));
+        .filter(|s| {
+            s.starts_with("http://")
+                || s.starts_with("https://")
+                || s.starts_with("magnet:")
+                || s.to_lowercase().ends_with(".torrent")
+        });
 
     let url = match url {
         Some(u) => {

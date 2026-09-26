@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState, useEffect } from "react";
 import type { ProbeResult } from "../types/download";
+import { isTorrentInput } from "../types/download";
 
 const CATEGORIES = [
   { id: "program", label: "程序" },
@@ -48,6 +49,18 @@ export function DownloadFileInfo({
       setError(null);
       setProbeResult(null);
       setSavePath("");
+      // 磁力链接 / .torrent 不做 HTTP 探测（magnet: 无法 HEAD），
+      // 元数据在提交时经 resolve_torrent 解析
+      if (isTorrentInput(initialUrl.trim())) {
+        invoke<string>("get_default_download_dir")
+          .then((dir) => {
+            const catLabel = CATEGORIES.find((c) => c.id === category)?.label || "其他";
+            const base = dir.replace(/\\/g, "/");
+            setSavePath(`${base}/${catLabel}/`);
+          })
+          .catch(() => {});
+        return;
+      }
       if (initialUrl.trim()) {
         setLoading(true);
         Promise.all([
@@ -90,8 +103,21 @@ export function DownloadFileInfo({
     saveDir: string,
     filename: string | undefined
   ): Promise<string | null> => {
+    // 磁力链接 / .torrent 走种子任务路径（这里下载全部文件；
+    // 需要挑选文件时请用「新建任务」，那里有文件列表）
+    if (isTorrentInput(url)) {
+      const createArgs = { input: url, saveDir, filename };
+      try {
+        return await invoke<string>("create_torrent_download", createArgs);
+      } catch (err) {
+        if (String(err) !== DUPLICATE_ASK) throw err;
+        if (!window.confirm("已存在相同种子的任务，仍然重新下载吗？")) return null;
+        return invoke<string>("create_torrent_download", { ...createArgs, force: true });
+      }
+    }
+    const createArgs = { url, saveDir, filename };
     try {
-      return await invoke<string>("create_download", { url, saveDir, filename });
+      return await invoke<string>("create_download", createArgs);
     } catch (err) {
       if (String(err) !== DUPLICATE_ASK) throw err;
       if (!window.confirm("已存在相同地址的任务，仍然重新下载吗？")) return null;
@@ -106,6 +132,7 @@ export function DownloadFileInfo({
     setLoading(true);
     try {
       const { saveDir, filename } = parseSavePath();
+      // 磁力 / .torrent 直接创建占位任务，元数据在下载路径里解析（任务立即可见）
       const taskId = await createTaskWithDuplicateCheck(url.trim(), saveDir, filename || undefined);
       if (taskId == null) return;
       await invoke("start_download", { taskId });
@@ -153,14 +180,22 @@ export function DownloadFileInfo({
           <div className="modal-body download-file-info-body">
             <div className="dfi-row">
               <label className="dfi-label">URL</label>
+              {/* 不用 type="url"：magnet: 链接通不过浏览器的 url 校验 */}
               <input
-                type="url"
+                type="text"
                 className="dfi-url-input"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="https://..."
+                placeholder="https://... 或 magnet:?xt=urn:btih:..."
               />
             </div>
+
+            {isTorrentInput(url.trim()) && (
+              <div className="dfi-row" style={{ fontSize: 12, color: "#666" }}>
+                已识别为磁力链接 / 种子文件：开始下载会解析元数据并下载全部文件；
+                如需挑选文件，请使用「新建任务」
+              </div>
+            )}
 
             <div className="dfi-row">
               <label className="dfi-label">分类</label>

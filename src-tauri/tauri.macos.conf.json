@@ -3,5 +3,15 @@
     "resources": {
       "../integration/native-host/target/release/multidown-native-host": "native-host/multidown-native-host"
     }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "multidown",
+          "magnet"
+        ]
+      }
+    }
   }
 }

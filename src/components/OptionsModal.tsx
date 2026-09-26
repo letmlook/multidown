@@ -13,6 +13,7 @@ import type {
   ProxyTestResult,
   CategoryRule,
   CategoryMatchType,
+  MagnetHandlerStatus,
 } from "../types/download";
 
 interface OptionsModalProps {
@@ -196,6 +197,9 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
   });
   const [testingProxyId, setTestingProxyId] = useState<string | null>(null);
 
+  // ── 磁力链接系统关联状态 ─────────────────────────────────────────────────
+  const [magnetStatus, setMagnetStatus] = useState<MagnetHandlerStatus | null>(null);
+
   useEffect(() => {
     if (open) {
       setLoading(true);
@@ -213,7 +217,26 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
     if (tab === "batches") loadBatches();
     if (tab === "schedule") loadSchedule();
     if (tab === "proxies") loadProxies();
+    if (tab === "bittorrent") loadMagnetStatus();
   }, [open, tab]);
+
+  const loadMagnetStatus = async () => {
+    try {
+      setMagnetStatus(await invoke<MagnetHandlerStatus>("get_magnet_handler_status"));
+    } catch (e) {
+      console.error(e);
+      setMagnetStatus(null);
+    }
+  };
+
+  const handleSetMagnetHandler = async (enable: boolean) => {
+    try {
+      await invoke("set_magnet_handler", { enable });
+    } catch (e) {
+      alert(`操作未完成：${e}`);
+    }
+    await loadMagnetStatus();
+  };
 
   // ── Category Rules ────────────────────────────────────────────────────────
 
@@ -986,6 +1009,39 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                       仅支持 SOCKS5；配置后将强制关闭 DHT 与本地发现，避免真实 IP 经 UDP 泄漏。
                       监听端口 / DHT / 代理在重启应用后生效
                     </span>
+                  </div>
+                  <div className="options-section" style={{ marginTop: 16 }}>
+                    <div className="options-section-title">磁力链接关联</div>
+                    <div style={{ fontSize: 13, marginBottom: 4 }}>
+                      当前默认程序：
+                      <code style={{ wordBreak: "break-all" }}>
+                        {magnetStatus?.magnet_current || "未注册"}
+                      </code>
+                      {magnetStatus?.magnet_is_default && "（就是 MultiDown）"}
+                    </div>
+                    {magnetStatus?.hint && (
+                      <div style={{ color: "#666", fontSize: 12, marginBottom: 8 }}>
+                        {magnetStatus.hint}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={magnetStatus?.magnet_is_default}
+                        onClick={() => handleSetMagnetHandler(true)}
+                      >
+                        设为磁力链接默认程序
+                      </button>
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={!magnetStatus?.magnet_is_default}
+                        onClick={() => handleSetMagnetHandler(false)}
+                      >
+                        取消注册
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}

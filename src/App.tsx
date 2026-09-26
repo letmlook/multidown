@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
 import {
@@ -9,6 +10,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { TaskInfo } from "./types/download";
+import { isTorrentInput } from "./types/download";
 import { TaskList } from "./components/TaskList";
 import { AddTask } from "./components/AddTask";
 import { Toolbar } from "./components/Toolbar";
@@ -56,6 +58,8 @@ function App() {
   const [propertiesTask, setPropertiesTask] = useState<TaskInfo | null>(null);
   const [moveRenameTask, setMoveRenameTask] = useState<TaskInfo | null>(null);
   const [batchAddInitialUrls, setBatchAddInitialUrls] = useState("");
+  /** 外部输入预填给「新建任务」的地址（磁力 / .torrent） */
+  const [addTaskInitialUrl, setAddTaskInitialUrl] = useState("");
   const { toast, showToast, hideToast } = useToast();
 
   const refreshTasks = useCallback(async () => {
@@ -111,6 +115,21 @@ function App() {
     } catch {}
   }, [darkMode]);
 
+  // ── 外部输入统一路由（浏览器扩展抓链 / 深链 / argv / 打开文件 / 拖拽）──
+  // 磁力链接与 .torrent 走「新建任务」（含元数据解析与文件选择流程）；
+  // 普通 http(s) 走「下载文件信息」确认框。
+  const openDownloadForInput = useCallback((input: string) => {
+    const url = input.trim();
+    if (!url) return;
+    if (isTorrentInput(url)) {
+      setAddTaskInitialUrl(url);
+      setAddTaskOpen(true);
+    } else if (isHttpUrl(url)) {
+      setDownloadFileInfoUrl(url);
+      setDownloadFileInfoOpen(true);
+    }
+  }, []);
+
   // 浏览器扩展抓链：后端开启"显示开始下载对话框"时不再自动建任务，
   // 改为发事件让前端弹出下载信息确认框
   useEffect(() => {
@@ -118,14 +137,47 @@ function App() {
       "extension-download-request",
       (e) => {
         if (!e.payload?.url) return;
-        setDownloadFileInfoUrl(e.payload.url);
-        setDownloadFileInfoOpen(true);
+        openDownloadForInput(e.payload.url);
       }
     );
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [openDownloadForInput]);
+
+  // 外部下载输入（argv / 单实例 / 深链 / RunEvent::Opened）：
+  // 实时事件 + 挂载时补发队列（后端就绪早于前端监听时输入会先入队）
+  useEffect(() => {
+    const unlisten = listen<{ input: string }>("external-input", (e) => {
+      if (!e.payload?.input) return;
+      openDownloadForInput(e.payload.input);
+    });
+    invoke<string[]>("take_external_inputs")
+      .then((inputs) => {
+        for (const input of inputs) openDownloadForInput(input);
+      })
+      .catch((e) => console.error(e));
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [openDownloadForInput]);
+
+  // 窗口拖拽 .torrent 文件（体验最好、也最不依赖系统关联的入口）
+  useEffect(() => {
+    const win = getCurrentWebviewWindow();
+    const unlisten = win.onDragDropEvent((e) => {
+      if (e.payload.type !== "drop") return;
+      for (const path of e.payload.paths) {
+        if (path.toLowerCase().endsWith(".torrent")) {
+          openDownloadForInput(path);
+          break;
+        }
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [openDownloadForInput]);
 
   const lastClipboardUrlRef = useRef<string | null>(null);
 
@@ -137,13 +189,13 @@ function App() {
           if (!settings.clipboard_monitor) return;
           const text = await invoke<string>("read_clipboard_text");
           const url = text.trim();
-          if (!isHttpUrl(url)) return;
+          // 剪贴板同时支持 http(s) 与磁力链接
+          if (!isHttpUrl(url) && !isTorrentInput(url)) return;
           // 先更新 ref 再判断，避免多次 focus 或同一 URL 重复弹窗
           const prev = lastClipboardUrlRef.current;
           lastClipboardUrlRef.current = url;
           if (prev !== url) {
-            setDownloadFileInfoUrl(url);
-            setDownloadFileInfoOpen(true);
+            openDownloadForInput(url);
             void invoke("clear_clipboard_text"); // 清空剪贴板，防止再次切回时重复弹窗
           }
         } catch (_) {
@@ -153,7 +205,7 @@ function App() {
       window.addEventListener("focus", onFocus);
       return () => window.removeEventListener("focus", onFocus);
     }
-  }, [downloadFileInfoOpen, addTaskOpen, batchAddOpen, optionsOpen]);
+  }, [downloadFileInfoOpen, addTaskOpen, batchAddOpen, optionsOpen, openDownloadForInput]);
 
   const selectedTask = useMemo(
     () => tasks.find((t) => t.id === selectedId) ?? null,
@@ -573,9 +625,8 @@ function App() {
             try {
               const text = await invoke<string>("read_clipboard_text");
               const url = text.trim();
-              if (isHttpUrl(url)) {
-                setDownloadFileInfoUrl(url);
-                setDownloadFileInfoOpen(true);
+              if (isHttpUrl(url) || isTorrentInput(url)) {
+                openDownloadForInput(url);
               }
             } catch (_) {
               alert("无法读取剪贴板");
@@ -650,7 +701,11 @@ function App() {
 
       <AddTask
         open={addTaskOpen}
-        onClose={() => setAddTaskOpen(false)}
+        initialUrl={addTaskInitialUrl || undefined}
+        onClose={() => {
+          setAddTaskOpen(false);
+          setAddTaskInitialUrl("");
+        }}
         onAdded={refreshTasks}
       />
 

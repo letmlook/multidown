@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useState, useEffect } from "react";
 import type {
   AppSettings,
@@ -12,6 +13,8 @@ interface AddTaskProps {
   open: boolean;
   onClose: () => void;
   onAdded: () => void;
+  /** 外部门入（磁力链接 / .torrent 文件）预填的地址 */
+  initialUrl?: string;
 }
 
 const LAST_SAVE_DIR_KEY = "multidown-last-save-dir";
@@ -24,7 +27,7 @@ function formatBytes(bytes: number): string {
   return `${bytes} B`;
 }
 
-export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
+export function AddTask({ open, onClose, onAdded, initialUrl }: AddTaskProps) {
   const [url, setUrl] = useState("");
   const [saveDir, setSaveDir] = useState("");
   const [filename, setFilename] = useState("");
@@ -46,6 +49,8 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
 
   useEffect(() => {
     if (!open) return;
+    // 外部门入（磁力 / .torrent）预填地址
+    if (initialUrl) setUrl(initialUrl);
     // "使用上次的保存路径"开启时优先取上次目录，否则用系统默认下载目录
     (async () => {
       try {
@@ -62,7 +67,7 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
         .then(setSaveDir)
         .catch(() => {});
     })();
-  }, [open]);
+  }, [open, initialUrl]);
 
   // 输入内容变了就丢弃上一次的解析结果，避免张冠李戴
   useEffect(() => {
@@ -112,6 +117,20 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
       setProbeResult(null);
     } finally {
       setLoading(false);
+    }
+  };
+
+  /** 选择本地 .torrent 文件（磁力/种子流程的入口之一） */
+  const handlePickTorrentFile = async () => {
+    try {
+      const path = await openDialog({
+        multiple: false,
+        title: "选择种子文件",
+        filters: [{ name: "BitTorrent 种子", extensions: ["torrent"] }],
+      });
+      if (typeof path === "string" && path) setUrl(path);
+    } catch (e) {
+      console.error(e);
     }
   };
 
@@ -254,6 +273,14 @@ export function AddTask({ open, onClose, onAdded }: AddTaskProps) {
                 </button>
               </div>
               <div className="add-task-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={handlePickTorrentFile}
+                  title="选择本地 .torrent 种子文件"
+                >
+                  种子文件…
+                </button>
                 <button
                   type="submit"
                   className="btn btn-primary"

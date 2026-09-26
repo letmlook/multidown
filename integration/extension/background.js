@@ -124,6 +124,13 @@ chrome.runtime.onInstalled.addListener(() => {
     contexts: ['link']
   });
   chrome.contextMenus.create({
+    id: 'multidown-magnet',
+    title: '使用 Multidown 下载磁力链接',
+    contexts: ['link'],
+    // 仅磁力链接显示该项（普通链接用上面的通用项）
+    targetUrlPatterns: ['magnet:*']
+  });
+  chrome.contextMenus.create({
     id: 'multidown-page',
     title: '使用 Multidown 下载此页面',
     contexts: ['page']
@@ -142,7 +149,12 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   let url = '', filename = '';
-  if (info.menuItemId === 'multidown-link' && info.linkUrl) {
+  if (info.menuItemId === 'multidown-magnet' && info.linkUrl) {
+    // 磁力链接：显示名取 dn 参数（若有）
+    url = info.linkUrl;
+    const dn = new URLSearchParams(url.replace(/^magnet:\?/, '')).get('dn');
+    filename = dn || 'magnet-download';
+  } else if (info.menuItemId === 'multidown-link' && info.linkUrl) {
     url = info.linkUrl;
     filename = info.linkUrl.split('/').pop() || 'download';
   } else if (info.menuItemId === 'multidown-page' && tab?.url) {
@@ -156,7 +168,9 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     filename = 'audio_' + Date.now() + '.mp3';
   }
 
-  if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) {
+  const isTorrentUrl =
+    url.startsWith('magnet:') || url.toLowerCase().endsWith('.torrent');
+  if (!url || (!url.startsWith('http://') && !url.startsWith('https://') && !isTorrentUrl)) {
     debugLog('无效URL，跳过', { url });
     return;
   }
