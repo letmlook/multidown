@@ -26,12 +26,12 @@
 
 ## 我想理解架构
 
-- [ ] 架构总览
-- [ ] HTTP 下载引擎
-- [ ] BitTorrent 子系统
-- [ ] 浏览器集成
-- [ ] 数据持久化
-- [ ] 安全模型
+- [架构总览](./architecture/overview.md)
+- [HTTP 下载引擎](./architecture/download-engine.md)
+- [BitTorrent 子系统](./architecture/bittorrent.md)
+- [浏览器集成](./architecture/browser-integration.md)
+- [数据持久化](./architecture/persistence.md)
+- [安全模型](./architecture/security.md)
 
 ## 我负责发布维护
 
