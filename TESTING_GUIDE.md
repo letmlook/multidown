@@ -7,5 +7,6 @@
 - 磁力链接、种子文件与做种策略验收：[`docs/user-guide/bittorrent.md`](./docs/user-guide/bittorrent.md)
 - 浏览器扩展安装与交互验收：[`docs/user-guide/browser-extension.md`](./docs/user-guide/browser-extension.md)
 - 按症状排查连接、代理、权限和平台集成：[`docs/user-guide/troubleshooting.md`](./docs/user-guide/troubleshooting.md)
+- 所有常用命令及工作目录：[`docs/reference/commands.md`](./docs/reference/commands.md)
 
 文档总入口见 [`docs/README.md`](./docs/README.md)。

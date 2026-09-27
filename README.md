@@ -22,7 +22,7 @@ Multidown 是一款面向桌面端的跨平台多协议下载工具，使用 Tau
 
 项目面向 Windows、macOS 和 Linux。实际可用安装包以 [v0.3.0 发布页](https://github.com/letmlook/multidown/releases/tag/v0.3.0) 为准。
 
-当前 BitTorrent 不支持 web seed、MSE/PE 连接加密或顺序下载；浏览器扩展需要安装桌面应用及对应 Native Messaging Host。完整限制和平台差异将在[文档中心](./docs/README.md)持续维护。
+当前 BitTorrent 不支持 web seed、MSE/PE 连接加密或顺序下载；浏览器扩展需要安装桌面应用及对应 Native Messaging Host。完整边界见[已知限制](./docs/reference/known-limitations.md)。
 
 ## 快速开始
 
@@ -51,6 +51,7 @@ npm run tauri:dev
 - [更新日志](./CHANGELOG.md)：稳定版本的重要变化与已知限制。
 - [贡献指南](./CONTRIBUTING.md)：开发流程、测试门禁和提交要求。
 - [安全策略](./SECURITY.md)：支持范围、安全边界和漏洞报告方式。
+- [命令速查](./docs/reference/commands.md)：开发、验证和构建命令索引。
 
 ## 参与贡献
 

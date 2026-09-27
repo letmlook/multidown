@@ -12,7 +12,8 @@
 - 用户安装与验证：[浏览器扩展指南](../docs/user-guide/browser-extension.md)
 - 常见连接问题：[故障排查](../docs/user-guide/troubleshooting.md#浏览器提示无法连接或-native-host-不可用)
 - 源码构建：[构建指南](../docs/development/building.md#浏览器扩展与-native-host)
-- 通信边界：[浏览器集成架构](../docs/README.md#我想理解架构)
+- 通信边界：[浏览器集成架构](../docs/architecture/browser-integration.md)
+- 各平台数据与清单位置：[平台路径](../docs/reference/platform-paths.md)
 
 ## 开发检查
 

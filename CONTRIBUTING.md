@@ -9,7 +9,7 @@
 - 当前平台所需的 Tauri 2 系统依赖，参见 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)。
 - Git。
 
-克隆仓库后运行 `npm install` 安装前端依赖。桌面开发还需要先构建 Native Messaging Host，并确保前端 `dist/` 已生成；完整顺序在[文档中心](./docs/README.md)的开发路线中维护。
+克隆仓库后运行 `npm install` 安装前端依赖。桌面开发还需要先构建 Native Messaging Host，并确保前端 `dist/` 已生成；完整顺序见[开发环境搭建](./docs/development/setup.md)。
 
 ## 分支与提交
 
@@ -20,7 +20,7 @@
 
 ## 本地验证
 
-按变更范围运行相应检查；提交前至少运行文档校验和受影响测试。
+按变更范围运行相应检查；提交前至少运行文档校验和受影响测试。命令用途与工作目录见[命令速查](./docs/reference/commands.md)。
 
 ```bash
 npm run docs:check

@@ -36,9 +36,9 @@
 ## 我负责发布维护
 
 - [发布流程](./development/release.md)
-- [ ] 命令速查
-- [ ] 平台路径
-- [ ] 已知限制
+- [命令速查](./reference/commands.md)
+- [平台路径](./reference/platform-paths.md)
+- [已知限制](./reference/known-limitations.md)
 - [安全策略](../SECURITY.md)
 
 ## 设计与历史资料
@@ -49,5 +49,3 @@
 - [v0.3.0 前功能模块设计](./archive/功能模块设计-v0.3.0前.md)
 - [IDM 核心原理与功能模块分析](./archive/research/IDM核心原理与功能模块分析.md)
 - [技术栈选型分析](./archive/research/技术栈选型分析.md)
-
-> 带复选框的条目将在本轮文档整理中逐项补齐；为避免产生失效链接，完成前暂不链接占位文件。
