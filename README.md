@@ -30,6 +30,8 @@ Multidown 是一款面向桌面端的跨平台多协议下载工具，使用 Tau
 2. 打开应用，粘贴 HTTP(S)、磁力链接，或选择本地 `.torrent` 文件创建任务。
 3. 如需浏览器接管，按照文档中心的浏览器扩展指南构建或安装扩展并完成 Native Host 注册。
 
+详细步骤见[安装指南](./docs/user-guide/installation.md)和[快速上手](./docs/user-guide/getting-started.md)。
+
 ## 本地开发
 
 需要 Node.js 20 或 22、Rust 1.88+，以及当前平台的 Tauri 2 系统依赖。

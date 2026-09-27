@@ -9,12 +9,12 @@
 
 ## 我想安装和使用
 
-- [ ] 安装指南
-- [ ] 快速上手
-- [ ] BitTorrent 使用指南
-- [ ] 浏览器扩展配置
-- [ ] 设置说明
-- [ ] 故障排查
+- [安装指南](./user-guide/installation.md)
+- [快速上手](./user-guide/getting-started.md)
+- [BitTorrent 使用指南](./user-guide/bittorrent.md)
+- [浏览器扩展配置](./user-guide/browser-extension.md)
+- [设置说明](./user-guide/settings.md)
+- [故障排查](./user-guide/troubleshooting.md)
 
 ## 我想参与开发
 
