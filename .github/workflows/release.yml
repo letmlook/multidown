@@ -42,6 +42,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: clippy
           targets: ${{ matrix.target }}
 
       - name: Setup Rust cache
@@ -58,8 +59,29 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run frontend tests
+        run: npm run test:run
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build
+
       - name: Build browser extension
         run: npm run build:extension
+
+      - name: Check native messaging host
+        working-directory: integration/native-host
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run app unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Run strict app Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build native messaging host
         working-directory: integration/native-host
@@ -90,24 +112,21 @@ jobs:
 
             ### Windows
             - `MultiDown___VERSION___x64-setup.exe` - Windows 安装程序
-            - `MultiDown___VERSION___x64.msi` - Windows MSI 安装包
-            - `MultiDown___VERSION___x64_en-US.msi.zip` - 便携版
+            - `MultiDown___VERSION___x64_en-US.msi` - Windows MSI 安装包
 
             ### macOS
             - `MultiDown___VERSION___aarch64.dmg` - Apple Silicon (M1/M2/M3)
             - `MultiDown___VERSION___x64.dmg` - Intel Mac
-            - `MultiDown___VERSION___universal.dmg` - 通用版 (推荐)
+            - `MultiDown_aarch64.app.tar.gz` / `MultiDown_x64.app.tar.gz` - 应用归档
 
             ### Linux
             - `MultiDown___VERSION___amd64.deb` - Debian/Ubuntu
-            - `MultiDown___VERSION___x86_64.rpm` - Fedora/RHEL
-            - `multi-down___VERSION___amd64.AppImage` - AppImage 通用版
+            - `MultiDown-__VERSION__-1.x86_64.rpm` - Fedora/RHEL
+            - `MultiDown___VERSION___amd64.AppImage` - AppImage 通用版
 
             ## 更新内容
             查看 [CHANGELOG.md](../../CHANGELOG.md) 了解详细更新内容。
 
-            ## 校验文件
-            每个安装包都有对应的 `.sig` 签名文件，可用于验证软件包完整性。
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
