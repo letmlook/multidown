@@ -59,6 +59,7 @@ copyDir(unpackedDir, firefoxDir);
 const ffManifestPath = path.join(firefoxDir, 'manifest.json');
 try {
   const ffManifest = JSON.parse(fs.readFileSync(ffManifestPath, 'utf-8'));
+  delete ffManifest.key;
   delete ffManifest.background.service_worker;
   ffManifest.background = { scripts: ['background.js'] };
   ffManifest.browser_specific_settings = {

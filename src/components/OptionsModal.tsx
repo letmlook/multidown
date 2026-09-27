@@ -220,6 +220,8 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
     if (tab === "schedule") loadSchedule();
     if (tab === "proxies") loadProxies();
     if (tab === "bittorrent") loadMagnetStatus();
+    // Loaders intentionally run only when the modal opens or the selected tab changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, tab]);
 
   const loadMagnetStatus = async () => {

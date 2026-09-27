@@ -204,8 +204,7 @@ fn platform_candidates() -> Vec<BrowserCandidate> {
 #[cfg(test)]
 mod tests {
     use super::{
-        open_extension_installers_with, validate_extension_directory, BrowserCandidate,
-        CommandLauncher,
+        open_extension_installers_with, BrowserCandidate, CommandLauncher,
     };
     use std::path::{Path, PathBuf};
 
@@ -229,10 +228,17 @@ mod tests {
     fn missing_extension_directory_is_actionable() {
         let path = unique_temp_dir("missing-extension");
         let _ = std::fs::remove_dir_all(&path);
+        let mut launcher = RecordingLauncher::default();
 
-        let error = validate_extension_directory(&path).unwrap_err();
+        let error = open_extension_installers_with(
+            &path,
+            Vec::<BrowserCandidate>::new(),
+            &mut launcher,
+        )
+        .unwrap_err();
 
         assert_eq!(error, format!("扩展目录不存在: {}", path.display()));
+        assert!(launcher.calls.is_empty());
     }
 
     #[test]
@@ -240,13 +246,20 @@ mod tests {
         let path = unique_temp_dir("missing-manifest");
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
+        let mut launcher = RecordingLauncher::default();
 
-        let error = validate_extension_directory(&path).unwrap_err();
+        let error = open_extension_installers_with(
+            &path,
+            Vec::<BrowserCandidate>::new(),
+            &mut launcher,
+        )
+        .unwrap_err();
 
         assert_eq!(
             error,
             format!("扩展目录缺少 manifest.json: {}", path.display())
         );
+        assert!(launcher.calls.is_empty());
         std::fs::remove_dir_all(path).unwrap();
     }
 

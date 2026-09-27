@@ -13,6 +13,7 @@
 ### 改进
 
 - 浏览器扩展安装改为安全引导：只打开扩展管理或调试页面，不再终止浏览器进程；无法自动打开时返回可执行的手动步骤。
+- Chromium 扩展使用稳定 ID，并以精确 origin 注册 Native Messaging；三平台安装包均显式携带 Native Host。
 - 修复队列重排失败时丢失队列、跨午夜限速窗口判断错误，以及过小分片继续拆分的问题。
 - 恢复 macOS、Linux、Windows 的 push / pull request CI，并启用前端测试、lint、Rust 测试和严格 clippy。
 - 统一应用、Tauri、Native Host 与浏览器扩展版本号，移除重复且未验证的自定义 NSIS 构建脚本。

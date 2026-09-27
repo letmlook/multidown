@@ -54,9 +54,16 @@ jobs:
       - name: Build browser extension
         run: npm run build:extension
 
+      - name: Verify browser extension identity
+        run: npm run test:extension
+
       - name: Check native messaging host
         working-directory: integration/native-host
         run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build native messaging host resource
+        working-directory: integration/native-host
+        run: cargo build --release
 
       - name: Run unit tests
         working-directory: src-tauri

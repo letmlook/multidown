@@ -1483,6 +1483,20 @@ fn set_magnet_handler(app: tauri::AppHandle, enable: bool) -> Result<(), String>
     protocol::set_magnet_default(app.config().identifier.trim(), enable)
 }
 
+/// Chromium Native Messaging 只接受精确扩展 ID；此 ID 由 manifest.json 的固定公钥生成。
+const CHROMIUM_EXTENSION_ID: &str = "bceackgdejcgphcbhinfgejepgoeiail";
+
+fn chromium_manifest_content(native_host_path: &str) -> String {
+    serde_json::json!({
+        "name": "com.multidown.app",
+        "description": "Multidown Native Messaging Host",
+        "path": native_host_path,
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")]
+    })
+    .to_string()
+}
+
 /// Firefox Native Messaging manifest（要求 allowed_extensions 精确匹配扩展 ID）
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn firefox_manifest_content(native_host_path: &str) -> String {
@@ -1525,22 +1539,14 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
             }
         }
         
-        // 更新配置文件中的路径和扩展ID
+        // 写入当前安装路径与固定的 Chromium 扩展 ID。
         let manifest_path = native_host_dir.join("com.multidown.app.json");
-        if manifest_path.exists() {
-            let mut manifest_content = std::fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
-            let native_host_exe_path = native_host_dir.join("multidown-native-host.exe");
-            manifest_content = manifest_content.replace(
-                "MULTIDOWN_NATIVE_HOST_PATH",
-                &native_host_exe_path.to_string_lossy().to_string()
-            );
-            // 使用通配符支持所有扩展ID，更加灵活
-            manifest_content = manifest_content.replace(
-                "EXTENSION_ID_PLACEHOLDER",
-                "*"
-            );
-            std::fs::write(&manifest_path, manifest_content).map_err(|e| e.to_string())?;
-        }
+        let native_host_exe_path = native_host_dir.join("multidown-native-host.exe");
+        std::fs::write(
+            &manifest_path,
+            chromium_manifest_content(&native_host_exe_path.to_string_lossy()),
+        )
+        .map_err(|e| e.to_string())?;
         
         // 注册 Chrome Native Host
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -1578,15 +1584,7 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         let native_host_path = res_dir.join("native-host").join("multidown-native-host");
         
         // 创建 manifest 文件
-        let manifest = serde_json::json!({
-            "name": "com.multidown.app",
-            "description": "Multidown Native Messaging Host",
-            "path": native_host_path.to_string_lossy().to_string(),
-            "type": "stdio",
-            "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
-        });
-
-        let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        let manifest_str = chromium_manifest_content(&native_host_path.to_string_lossy());
 
         std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
         std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
@@ -1621,15 +1619,7 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         let native_host_path = res_dir.join("native-host").join("multidown-native-host");
         
         // 创建 manifest 文件
-        let manifest = serde_json::json!({
-            "name": "com.multidown.app",
-            "description": "Multidown Native Messaging Host",
-            "path": native_host_path.to_string_lossy().to_string(),
-            "type": "stdio",
-            "allowed_origins": ["chrome-extension://*", "moz-extension://*"]
-        });
-
-        let manifest_str = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        let manifest_str = chromium_manifest_content(&native_host_path.to_string_lossy());
 
         std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
         std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
@@ -1647,6 +1637,37 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         std::fs::write(mozilla_dir.join("com.multidown.app.json"), ff_str.as_bytes()).map_err(|e| e.to_string())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_messaging_manifest_tests {
+    use super::{chromium_manifest_content, firefox_manifest_content, CHROMIUM_EXTENSION_ID};
+
+    #[test]
+    fn chromium_manifest_uses_exact_stable_extension_id() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&chromium_manifest_content("/tmp/native-host")).unwrap();
+        let template: serde_json::Value = serde_json::from_str(include_str!(
+            "../../integration/extension/com.multidown.app.json"
+        ))
+        .unwrap();
+        assert_eq!(manifest["path"], "/tmp/native-host");
+        assert_eq!(
+            manifest["allowed_origins"],
+            serde_json::json!([format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")])
+        );
+        assert_eq!(manifest["allowed_origins"], template["allowed_origins"]);
+    }
+
+    #[test]
+    fn firefox_manifest_keeps_its_explicit_addon_id() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&firefox_manifest_content("/tmp/native-host")).unwrap();
+        assert_eq!(
+            manifest["allowed_extensions"],
+            serde_json::json!(["multidown@letmlook"])
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 //! 计划任务（Scheduled Downloads）：定时下载、限速、队列计划
 
-use chrono::{DateTime, Local, Weekday};
+use chrono::{DateTime, Datelike, Duration, Local, Weekday};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -65,50 +65,36 @@ impl ScheduleRule {
         }
     }
 
+    fn matches_recurrence(&self, date: &DateTime<Local>) -> bool {
+        match &self.recurrence {
+            Recurrence::Once => self
+                .scheduled_date
+                .as_deref()
+                .is_some_and(|scheduled| scheduled == date.format("%Y-%m-%d").to_string()),
+            Recurrence::Daily => true,
+            Recurrence::Weekdays => matches!(
+                date.weekday(),
+                Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+            ),
+            Recurrence::Weekends => matches!(date.weekday(), Weekday::Sat | Weekday::Sun),
+            Recurrence::Weekly(days) => days.contains(&date.weekday()),
+        }
+    }
+
     /// 判断此刻是否应该触发此规则（按本地时间）
     pub fn should_fire(&self, now: &DateTime<Local>) -> bool {
         if !self.enabled {
             return false;
         }
 
-        let today = now.format("%Y-%m-%d").to_string();
         let current_time = now.format("%H:%M").to_string();
-        let weekday_str = now.format("%A").to_string();
 
         // 时间必须匹配
         if self.start_time != current_time {
             return false;
         }
 
-        match &self.recurrence {
-            Recurrence::Once => {
-                if let Some(date) = &self.scheduled_date {
-                    return date == &today;
-                }
-                false
-            }
-            Recurrence::Daily => true,
-            Recurrence::Weekdays => {
-                weekday_str != "Saturday" && weekday_str != "Sunday"
-            }
-            Recurrence::Weekends => {
-                weekday_str == "Saturday" || weekday_str == "Sunday"
-            }
-            Recurrence::Weekly(days) => {
-                days.iter().any(|d| {
-                    let day_name = match d {
-                        chrono::Weekday::Mon => "Monday",
-                        chrono::Weekday::Tue => "Tuesday",
-                        chrono::Weekday::Wed => "Wednesday",
-                        chrono::Weekday::Thu => "Thursday",
-                        chrono::Weekday::Fri => "Friday",
-                        chrono::Weekday::Sat => "Saturday",
-                        chrono::Weekday::Sun => "Sunday",
-                    };
-                    weekday_str == day_name
-                })
-            }
-        }
+        self.matches_recurrence(now)
     }
 
     /// SpeedLimit 规则是否仍在生效（end_time 判断）
@@ -122,12 +108,19 @@ impl ScheduleRule {
         let current_time = now.format("%H:%M").to_string();
         if let Some(end) = &self.end_time {
             if self.start_time <= *end {
-                current_time >= self.start_time && current_time <= *end
+                current_time >= self.start_time
+                    && current_time <= *end
+                    && self.matches_recurrence(now)
+            } else if current_time >= self.start_time {
+                self.matches_recurrence(now)
+            } else if current_time <= *end {
+                now.checked_sub_signed(Duration::days(1))
+                    .is_some_and(|start_date| self.matches_recurrence(&start_date))
             } else {
-                current_time >= self.start_time || current_time <= *end
+                false
             }
         } else {
-            self.start_time == current_time
+            self.start_time == current_time && self.matches_recurrence(now)
         }
     }
 }
@@ -341,6 +334,33 @@ mod tests {
         assert!(overnight.is_speed_limit_active(&local_time(2026, 9, 28, 23, 30)));
         assert!(overnight.is_speed_limit_active(&local_time(2026, 9, 29, 0, 30)));
         assert!(!overnight.is_speed_limit_active(&local_time(2026, 9, 29, 2, 0)));
+    }
+
+    #[test]
+    fn overnight_speed_limit_uses_the_start_days_recurrence() {
+        let mut weekdays = ScheduleRule::new(
+            "weeknights".into(),
+            ScheduleType::SpeedLimit,
+            Recurrence::Weekdays,
+            "23:00".into(),
+        );
+        weekdays.end_time = Some("01:00".into());
+
+        assert!(weekdays.is_speed_limit_active(&local_time(2026, 9, 25, 23, 30)));
+        assert!(weekdays.is_speed_limit_active(&local_time(2026, 9, 26, 0, 30)));
+        assert!(!weekdays.is_speed_limit_active(&local_time(2026, 9, 26, 23, 30)));
+        assert!(!weekdays.is_speed_limit_active(&local_time(2026, 9, 27, 0, 30)));
+
+        let mut once = ScheduleRule::new(
+            "one night".into(),
+            ScheduleType::SpeedLimit,
+            Recurrence::Once,
+            "23:00".into(),
+        );
+        once.scheduled_date = Some("2026-09-28".into());
+        once.end_time = Some("01:00".into());
+        assert!(once.is_speed_limit_active(&local_time(2026, 9, 29, 0, 30)));
+        assert!(!once.is_speed_limit_active(&local_time(2026, 9, 29, 23, 30)));
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
@@ -303,6 +303,10 @@ impl QueueManager {
 
     /// Reorder queues
     pub fn reorder_queues(&mut self, queue_ids: Vec<String>) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        if let Some(duplicate) = queue_ids.iter().find(|id| !seen.insert((*id).clone())) {
+            return Err(format!("Queue {} appears more than once", duplicate));
+        }
         if let Some(missing) = queue_ids.iter().find(|id| !self.queues.contains_key(*id)) {
             return Err(format!("Queue {} not found", missing));
         }
@@ -382,6 +386,20 @@ mod tests {
         let original_count = manager.queues.len();
 
         assert!(manager.reorder_queues(vec![first.clone(), "missing".into()]).is_err());
+        assert_eq!(manager.queues.len(), original_count);
+        assert!(manager.queues.contains_key(&first));
+        assert!(manager.queues.contains_key(&manager.default_queue_id));
+    }
+
+    #[test]
+    fn reorder_rejects_duplicate_id_without_panicking_or_losing_queues() {
+        let mut manager = QueueManager::new();
+        let first = manager.create_queue("first".into(), 2, Some(1));
+        let original_count = manager.queues.len();
+
+        assert!(manager
+            .reorder_queues(vec![first.clone(), first.clone()])
+            .is_err());
         assert_eq!(manager.queues.len(), original_count);
         assert!(manager.queues.contains_key(&first));
         assert!(manager.queues.contains_key(&manager.default_queue_id));

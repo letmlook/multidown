@@ -40,6 +40,7 @@ npm run tauri:build
 
 ```bash
 npm run test:run
+npm run test:extension
 npm run lint
 npm run build
 cd src-tauri && cargo test --lib && cargo clippy --all-targets -- -D warnings
@@ -69,7 +70,7 @@ cd ../integration/native-host && cargo clippy --all-targets -- -D warnings
    - 选择目录：`dist-extension/unpacked`
 
 4. **验证安装**：
-   - 扩展应该显示在扩展列表中
+   - 扩展应该显示在扩展列表中，Chromium 扩展 ID 为 `bceackgdejcgphcbhinfgejepgoeiail`
    - 浏览器右上角应该出现 Multidown 扩展图标
 
 ### 步骤 3：注册本地消息主机
@@ -260,7 +261,7 @@ cd ../integration/native-host && cargo clippy --all-targets -- -D warnings
 ### 软件要求
 
 - **操作系统**：Windows 10/11、macOS 10.15+、Linux
-- **浏览器**：Chrome 90+、Edge 90+、Firefox 109+
+- **浏览器**：Chrome 90+、Edge 90+、Firefox 115+
 - **Node.js**：20 或 22
 - **Rust**：1.88+
 - **网络连接**：稳定的互联网连接

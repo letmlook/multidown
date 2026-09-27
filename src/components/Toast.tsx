@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useEffect } from "react";
 
 interface ToastProps {
   message: string;
@@ -22,25 +22,4 @@ export function Toast({ message, duration = 2000, onClose }: ToastProps) {
       </div>
     </div>
   );
-}
-
-export function useToast() {
-  const [toast, setToast] = useState<{ message: string; id: number } | null>(null);
-  const [idCounter, setIdCounter] = useState(0);
-
-  const showToast = (message: string) => {
-    const newId = idCounter + 1;
-    setIdCounter(newId);
-    setToast({ message, id: newId });
-  };
-
-  const hideToast = () => {
-    setToast(null);
-  };
-
-  return {
-    toast,
-    showToast,
-    hideToast,
-  };
 }

@@ -71,6 +71,9 @@ jobs:
       - name: Build browser extension
         run: npm run build:extension
 
+      - name: Verify browser extension identity
+        run: npm run test:extension
+
       - name: Check native messaging host
         working-directory: integration/native-host
         run: cargo clippy --all-targets -- -D warnings
@@ -90,11 +93,17 @@ jobs:
           ARGS=""
           if [ -n "$NATIVE_TARGET" ]; then ARGS="--target $NATIVE_TARGET"; fi
           cargo build --release $ARGS
-          BIN="target/release/multidown-native-host"
-          if [ -n "$NATIVE_TARGET" ]; then BIN="target/$NATIVE_TARGET/release/multidown-native-host"; fi
-          # 统一复制到 tauri 资源声明期望的路径
+          BIN="target/$NATIVE_TARGET/release/multidown-native-host"
+          DEST="target/release/multidown-native-host"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN="${BIN}.exe"
+            DEST="${DEST}.exe"
+          fi
+          # 统一复制到各平台 Tauri 配置声明的资源路径
           mkdir -p target/release
-          cp "$BIN" target/release/multidown-native-host
+          test -f "$BIN"
+          cp "$BIN" "$DEST"
+          test -f "$DEST"
         env:
           NATIVE_TARGET: ${{ matrix.target }}
 

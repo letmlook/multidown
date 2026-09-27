@@ -25,7 +25,8 @@ import { TorrentFilesModal } from "./components/TorrentFilesModal";
 import { PropertiesModal } from "./components/PropertiesModal";
 import { MoveRenameModal } from "./components/MoveRenameModal";
 import { AboutModal } from "./components/AboutModal";
-import { Toast, useToast } from "./components/Toast";
+import { Toast } from "./components/Toast";
+import { useToast } from "./hooks/useToast";
 import type { AppSettings } from "./types/download";
 import "./index.css";
 

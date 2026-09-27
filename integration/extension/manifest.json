@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "Multidown 下载助手",
   "version": "0.3.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArA1XkYBlitq6nOvT8BhdKoBjY6v5D7oCa2eQajmWxpmALgCSCywOb/QnXQf7L2CnIfgx/eEwjkUaQmHaqwdEP+okxhT3rOTeNgcKTuvcYcYA8lALFLNjYd+ATtZUX7msKfzH/M3tRfxbiP0RcjGj910Km4ITtLJrMPsk9zDy9lXfmHhUdhABO1wtlWxS8B9aMhH2Dti2miW+c9JAElZIPo9hvxmu+dBc1AQMftXbrSn+NA/dSE0gI16n0JXcvKTVOIQKkSiAe2nAEdklu+KRHpMXBwe29x0g2mEjHbN63pH2QKIPlJyG59KLQNyXfgbsCzCttjaPTrMjAbnrmkG+6QIDAQAB",
   "description": "使用 Multidown 下载链接与文件",
   "permissions": [
     "contextMenus",
