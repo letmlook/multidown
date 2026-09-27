@@ -97,6 +97,7 @@ fn detect_windows() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::*;
 
     #[cfg(target_os = "macos")]
