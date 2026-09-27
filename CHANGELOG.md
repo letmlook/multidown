@@ -4,6 +4,8 @@
 
 ## [0.3.0] - 2026-09-27
 
+[发布页与安装包](https://github.com/letmlook/multidown/releases/tag/v0.3.0)
+
 ### 新增
 
 - 完整 BitTorrent 工作流：磁力链接、`.torrent` 文件、文件选择、做种策略、代理与系统关联。
