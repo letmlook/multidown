@@ -6,13 +6,22 @@
 
 1. 确认默认分支的 Pull Request CI 在 macOS、Ubuntu 和 Windows 全部通过。
 2. 运行[完整测试门禁](./testing.md)，审阅 `CHANGELOG.md` 和已知限制。
-3. 同步以下版本来源：`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`integration/native-host/Cargo.toml`、`integration/extension/manifest.json`，并更新相关 Cargo lockfile。
+3. 同步以下版本来源：`package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`integration/native-host/Cargo.toml`、`integration/extension/manifest.json`，并更新 `src-tauri/Cargo.lock` 与 `integration/native-host/Cargo.lock` 中的本项目包版本。
 4. 运行 `npm run test:extension`，确认固定扩展身份未意外变化。
 5. 确认发布提交已经合入默认分支，工作区干净。
 
 ## 2. 创建标签
 
-为发布提交创建带注释的 `vX.Y.Z` 标签并推送。`Release` 工作流由 `v*` 标签触发，也可手工触发。标签必须指向已审阅且通过 CI 的确切提交，不要在失败构建上移动已公开标签。
+在默认分支上确认 `HEAD` 是计划发布的提交，再创建并推送带注释的标签：
+
+```bash
+git status --short
+git log -1 --oneline
+git tag -a vX.Y.Z -m "MultiDown vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+前两个命令的预期结果是工作区无输出、最新提交与已审阅提交一致。`Release` 工作流由 `v*` 标签触发，也可手工触发。标签必须指向已通过 CI 的确切提交，不要在失败构建上移动已公开标签。
 
 ## 3. 自动构建
 

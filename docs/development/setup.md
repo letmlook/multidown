@@ -29,7 +29,7 @@ npm run build
 npm run tauri:dev
 ```
 
-后续前端热更新由 Vite 处理；修改 Native Host 后需重新构建它。平台配置读取 `integration/native-host/target/release/` 中的可执行文件，跳过该步骤可能导致 Tauri 上下文或打包失败。
+预期结果：Vite 在本机开发地址启动，随后打开标题为 MultiDown 的桌面窗口；终端继续保留开发进程和编译日志。后续前端热更新由 Vite 处理；修改 Native Host 后需重新构建它。平台配置读取 `integration/native-host/target/release/` 中的可执行文件，跳过该步骤可能导致 Tauri 上下文或打包失败。
 
 ## 推荐工作流
 
