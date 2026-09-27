@@ -21,7 +21,8 @@ cd integration/native-host && cargo build --release
 ```
 
 生成文件：
-- `integration/native-host/target/release/multidown-native-host.exe` - 本地消息主机可执行文件
+- Windows：`integration/native-host/target/release/multidown-native-host.exe`
+- macOS / Linux：`integration/native-host/target/release/multidown-native-host`
 
 ### 3. 编译主程序
 
@@ -34,6 +35,16 @@ npm run tauri:build
 - `src-tauri/target/release/bundle/` - 安装包文件
 
 ## 二、完整安装流程
+
+发布前先运行自动化门禁：
+
+```bash
+npm run test:run
+npm run lint
+npm run build
+cd src-tauri && cargo test --lib && cargo clippy --all-targets -- -D warnings
+cd ../integration/native-host && cargo clippy --all-targets -- -D warnings
+```
 
 ### 步骤 1：安装主程序
 
@@ -249,9 +260,9 @@ npm run tauri:build
 ### 软件要求
 
 - **操作系统**：Windows 10/11、macOS 10.15+、Linux
-- **浏览器**：Chrome 90+、Edge 90+
-- **Node.js**：18+
-- **Rust**：1.70+
+- **浏览器**：Chrome 90+、Edge 90+、Firefox 109+
+- **Node.js**：20 或 22
+- **Rust**：1.88+
 - **网络连接**：稳定的互联网连接
 
 ### 硬件要求

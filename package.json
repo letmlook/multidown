@@ -1,7 +1,7 @@
 {
   "name": "multidown",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,7 +15,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run build:all && tauri build --bundles nsis",
+    "tauri:build": "tauri build",
     "icons": "node scripts/icons-from-svg.mjs && tauri icon src-tauri/icons/icon-1024.png"
   },
   "dependencies": {

@@ -11,7 +11,7 @@ const GITHUB_URL = "https://github.com/letmlook/multidown.git";
 const AUTHOR = "letmlook";
 const FEATURE_INTRO = "对标 IDM 的跨平台多线程下载工具。支持多连接、动态分段、断点续传；任务列表、新建任务、暂停/继续、进度持久化与恢复；代理与超时设置、下载完成通知等。";
 
-export function AboutModal({ open, onClose, version = "0.1.0" }: AboutModalProps) {
+export function AboutModal({ open, onClose, version = "0.3.0" }: AboutModalProps) {
   if (!open) return null;
 
   return (

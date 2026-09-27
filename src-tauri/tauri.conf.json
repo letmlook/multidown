@@ -1,6 +1,6 @@
 {
   "productName": "MultiDown",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.multidown.app",
   "build": {
     "beforeDevCommand": "npm run dev",

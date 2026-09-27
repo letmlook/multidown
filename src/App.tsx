@@ -756,7 +756,7 @@ function App() {
         }}
       />
 
-      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.2.0" />
+      <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.3.0" />
 
       {toast && (
         <Toast

@@ -1,6 +1,6 @@
 [package]
 name = "multidown"
-version = "0.2.0"
+version = "0.3.0"
 description = "Multidown - 对标 IDM 的跨平台下载工具"
 edition = "2021"
 # 真实下限由依赖决定：tauri 2.x 要求 >= 1.77.2，librqbit 9.x（edition 2024 + let chains）
