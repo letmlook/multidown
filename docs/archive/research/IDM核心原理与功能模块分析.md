@@ -83,7 +83,7 @@ IDM 的加速本质是：**在服务器支持的前提下，用多连接 + 动�
 
 ## 四、功能模块拆解（对标产品可照此划分）
 
-> **独立文档**：功能模块的完整整理、子模块职责、接口建议与实现优先级见 **[功能模块](./功能模块.md)**。
+> **独立文档**：功能模块的完整整理、子模块职责、接口建议与实现优先级见 **[v0.3.0 前功能模块设计](../功能模块设计-v0.3.0前.md)**。
 
 ### 4.1 下载引擎（Core）
 
@@ -176,4 +176,4 @@ IDM 的加速本质是：**在服务器支持的前提下，用多连接 + 动�
 - [RFC 7233 - Range Requests](https://httpwg.org/specs/rfc7233.html)
 - [MDN - HTTP range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests)
 - [IDM 官方 - Dynamic Segmentation and Performance](https://www.internetdownloadmanager.com/support/segmentation.html)
-- 本地文档：`docs/IDM核心原理与功能模块分析.md`（本文档）
+- 本地文档：`docs/archive/research/IDM核心原理与功能模块分析.md`（本文档）
