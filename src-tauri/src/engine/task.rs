@@ -197,7 +197,7 @@ impl Task {
             }
         }
         let (start, end) = segs.remove(max_idx).unwrap();
-        if max_len > MIN_SEGMENT_SIZE {
+        if max_len >= MIN_SEGMENT_SIZE.saturating_mul(2) {
             let mid = start + (max_len / 2) - 1;
             segs.push_back((start, mid));
             Some((mid + 1, end))
@@ -261,5 +261,46 @@ impl Task {
         if lm.is_none() {
             *lm = last_modified;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ranged_task(total_bytes: u64) -> Task {
+        Task::new(
+            CreateTaskInput {
+                url: "https://example.com/file.bin".into(),
+                save_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                filename: Some("file.bin".into()),
+                auth: None,
+                extra_headers: Vec::new(),
+            },
+            true,
+            Some(total_bytes),
+        )
+    }
+
+    #[test]
+    fn segment_smaller_than_two_minimum_chunks_is_not_split() {
+        let total = MIN_SEGMENT_SIZE * 2 - 1;
+        let task = ranged_task(total);
+
+        assert_eq!(task.take_next_segment(), Some((0, total - 1)));
+        assert_eq!(task.pending_segments.try_lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn returned_unfinished_segment_becomes_available_again() {
+        let total = MIN_SEGMENT_SIZE * 4;
+        let task = ranged_task(total);
+        let segment = task.take_next_segment().unwrap();
+
+        task.return_segment(segment.0, segment.1).await;
+
+        let pending = task.pending_segments.lock().await;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&segment));
     }
 }

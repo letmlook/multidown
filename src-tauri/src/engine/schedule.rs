@@ -121,7 +121,11 @@ impl ScheduleRule {
         }
         let current_time = now.format("%H:%M").to_string();
         if let Some(end) = &self.end_time {
-            current_time <= end.clone()
+            if self.start_time <= *end {
+                current_time >= self.start_time && current_time <= *end
+            } else {
+                current_time >= self.start_time || current_time <= *end
+            }
         } else {
             self.start_time == current_time
         }
@@ -299,4 +303,61 @@ fn save_schedule_rules(app_data_dir: &std::path::Path, rules: &[ScheduleRule]) -
     let json = serde_json::to_string_pretty(rules)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     tokio::fs::write(&path, json).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn local_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn speed_limit_window_respects_start_and_overnight_end() {
+        let mut daytime = ScheduleRule::new(
+            "daytime".into(),
+            ScheduleType::SpeedLimit,
+            Recurrence::Daily,
+            "08:00".into(),
+        );
+        daytime.end_time = Some("17:00".into());
+        assert!(!daytime.is_speed_limit_active(&local_time(2026, 9, 28, 7, 59)));
+        assert!(daytime.is_speed_limit_active(&local_time(2026, 9, 28, 8, 0)));
+        assert!(daytime.is_speed_limit_active(&local_time(2026, 9, 28, 17, 0)));
+        assert!(!daytime.is_speed_limit_active(&local_time(2026, 9, 28, 17, 1)));
+
+        let mut overnight = ScheduleRule::new(
+            "overnight".into(),
+            ScheduleType::SpeedLimit,
+            Recurrence::Daily,
+            "23:00".into(),
+        );
+        overnight.end_time = Some("01:00".into());
+        assert!(overnight.is_speed_limit_active(&local_time(2026, 9, 28, 23, 30)));
+        assert!(overnight.is_speed_limit_active(&local_time(2026, 9, 29, 0, 30)));
+        assert!(!overnight.is_speed_limit_active(&local_time(2026, 9, 29, 2, 0)));
+    }
+
+    #[tokio::test]
+    async fn once_rule_fires_once_and_disables_itself() {
+        let now = local_time(2026, 9, 28, 8, 0);
+        let mut rule = ScheduleRule::new(
+            "once".into(),
+            ScheduleType::StartDownload,
+            Recurrence::Once,
+            "08:00".into(),
+        );
+        rule.scheduled_date = Some("2026-09-28".into());
+        let manager = ScheduleManager::new();
+        manager.add_rule(rule).await;
+
+        assert!(matches!(manager.tick(&now).await.as_slice(), [ScheduleEvent::StartAll]));
+        assert!(manager.tick(&now).await.is_empty());
+        assert!(!manager.get_rules().await[0].enabled);
+    }
 }

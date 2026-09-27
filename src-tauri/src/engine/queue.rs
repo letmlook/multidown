@@ -281,6 +281,7 @@ impl QueueManager {
             let task_count = q.lock().task_ids.len();
             summaries.push(QueueSummary::from(((*q).clone(), task_count)));
         }
+        summaries.sort_by_key(|queue| queue.priority);
         summaries
     }
 
@@ -302,17 +303,23 @@ impl QueueManager {
 
     /// Reorder queues
     pub fn reorder_queues(&mut self, queue_ids: Vec<String>) -> Result<(), String> {
+        if let Some(missing) = queue_ids.iter().find(|id| !self.queues.contains_key(*id)) {
+            return Err(format!("Queue {} not found", missing));
+        }
         let mut queues = std::mem::take(&mut self.queues);
         let mut new_order = HashMap::new();
+        let mut next_priority = 0u32;
         for id in queue_ids {
-            if let Some(q) = queues.remove(&id) {
-                new_order.insert(id, q);
-            } else {
-                return Err(format!("Queue {} not found", id));
-            }
+            let q = queues.remove(&id).expect("queue IDs were validated");
+            q.lock().priority = next_priority;
+            next_priority += 1;
+            new_order.insert(id, q);
         }
-        // Add any remaining queues not in the list
-        for (id, q) in queues {
+        let mut remaining: Vec<_> = queues.into_iter().collect();
+        remaining.sort_by_key(|(_, queue)| queue.lock().priority);
+        for (id, q) in remaining {
+            q.lock().priority = next_priority;
+            next_priority += 1;
             new_order.insert(id, q);
         }
         self.queues = new_order;
@@ -332,4 +339,51 @@ pub type GlobalQueueManager = Arc<TokioMutex<QueueManager>>;
 #[allow(dead_code)]
 pub fn new_queue_manager() -> GlobalQueueManager {
     Arc::new(TokioMutex::new(QueueManager::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reorder_queues_updates_priority_to_match_requested_order() {
+        let mut manager = QueueManager::new();
+        let first = manager.create_queue("first".into(), 2, Some(40));
+        let second = manager.create_queue("second".into(), 2, Some(30));
+        let default_id = manager.default_queue_id.clone();
+
+        manager
+            .reorder_queues(vec![second.clone(), first.clone(), default_id.clone()])
+            .unwrap();
+
+        assert_eq!(manager.queues[&second].lock().priority, 0);
+        assert_eq!(manager.queues[&first].lock().priority, 1);
+        assert_eq!(manager.queues[&default_id].lock().priority, 2);
+    }
+
+    #[test]
+    fn paused_queue_is_inactive_until_resumed() {
+        let mut queue = DownloadQueue::new("nightly".into(), 2, 0);
+        queue.active_hours = Some(TimeRange::new(23, 0, 1, 0));
+
+        queue.is_paused = true;
+        assert!(!queue.is_active_at(chrono::Weekday::Mon, 23, 30));
+
+        queue.is_paused = false;
+        assert!(queue.is_active_at(chrono::Weekday::Mon, 23, 30));
+        assert!(queue.is_active_at(chrono::Weekday::Tue, 0, 30));
+        assert!(!queue.is_active_at(chrono::Weekday::Tue, 2, 0));
+    }
+
+    #[test]
+    fn reorder_rejects_unknown_id_without_losing_existing_queues() {
+        let mut manager = QueueManager::new();
+        let first = manager.create_queue("first".into(), 2, Some(1));
+        let original_count = manager.queues.len();
+
+        assert!(manager.reorder_queues(vec![first.clone(), "missing".into()]).is_err());
+        assert_eq!(manager.queues.len(), original_count);
+        assert!(manager.queues.contains_key(&first));
+        assert!(manager.queues.contains_key(&manager.default_queue_id));
+    }
 }
