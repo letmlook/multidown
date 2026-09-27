@@ -38,7 +38,7 @@ npm run tauri:build
 ### 步骤 1：安装主程序
 
 1. **运行安装包**：
-   - 执行 `src-tauri/target/release/bundle/nsis/MultiDown_0.1.0_x64-setup.exe`
+   - 执行 Tauri 生成的 `src-tauri/target/release/bundle/nsis/MultiDown_*_x64-setup.exe`
    - 按照安装向导完成安装
 
 2. **或直接运行可执行文件**：

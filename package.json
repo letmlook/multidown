@@ -15,8 +15,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run build:all && tauri build:nsis",
-    "build:nsis": "node scripts/build-nsis.mjs",
+    "tauri:build": "npm run build:all && tauri build --bundles nsis",
     "icons": "node scripts/icons-from-svg.mjs && tauri icon src-tauri/icons/icon-1024.png"
   },
   "dependencies": {
