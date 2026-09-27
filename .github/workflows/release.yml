@@ -78,14 +78,6 @@ jobs:
         working-directory: integration/native-host
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run app unit tests
-        working-directory: src-tauri
-        run: cargo test --lib
-
-      - name: Run strict app Clippy
-        working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Build native messaging host
         working-directory: integration/native-host
         shell: bash
@@ -106,6 +98,14 @@ jobs:
           test -f "$DEST"
         env:
           NATIVE_TARGET: ${{ matrix.target }}
+
+      - name: Run app unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Run strict app Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
