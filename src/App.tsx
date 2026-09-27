@@ -9,8 +9,9 @@ import {
   sendNotification,
 } from "@tauri-apps/plugin-notification";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
-import type { TaskInfo } from "./types/download";
+import type { BrowserInstallOutcome, TaskInfo } from "./types/download";
 import { isTorrentInput } from "./types/download";
+import { formatBrowserInstallOutcome } from "./utils/browserInstall";
 import { TaskList } from "./components/TaskList";
 import { AddTask } from "./components/AddTask";
 import { Toolbar } from "./components/Toolbar";
@@ -653,7 +654,8 @@ function App() {
           onOpenAbout={() => setAboutOpen(true)}
           onInstallExtension={async () => {
             try {
-              await invoke("install_browser_extension");
+              const outcome = await invoke<BrowserInstallOutcome>("install_browser_extension");
+              alert(formatBrowserInstallOutcome(outcome));
             } catch (e) {
               console.error("安装浏览器扩展失败:", e);
               alert(`安装浏览器扩展失败: ${e}`);

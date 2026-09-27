@@ -95,6 +95,12 @@ export interface MagnetHandlerStatus {
   hint: string;
 }
 
+/** 安全浏览器安装引导结果（对应 Rust BrowserInstallOutcome） */
+export interface BrowserInstallOutcome {
+  opened: string[];
+  manual_steps: string[];
+}
+
 /** HTTP 认证配置（与 Rust AuthConfig 对应） */
 export type AuthConfig =
   | { kind: "basic"; username: string; password: string }
