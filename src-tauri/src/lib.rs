@@ -4,11 +4,13 @@
 )]
 
 mod engine;
+mod browser_integration;
 mod network;
 mod protocol;
 mod settings;
 mod torrent;
 
+use browser_integration::BrowserInstallOutcome;
 use engine::scheduler::Scheduler;
 use network::{AuthConfig, NetworkOptions, ProbeResult};
 use settings::proxy::{
@@ -1224,27 +1226,12 @@ fn get_browser_extension_path(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn install_browser_extension(app: tauri::AppHandle) -> Result<(), String> {
-    // 尝试注册 Native Host
+async fn install_browser_extension(
+    app: tauri::AppHandle,
+) -> Result<BrowserInstallOutcome, String> {
     register_native_host(app.clone())?;
-    
-    // 首先尝试使用解压后的扩展目录安装（更可靠）
-    let ext_dir_result = get_extension_directory(app.clone());
-    if let Ok(ext_dir) = ext_dir_result {
-        // 尝试安装到 Chrome/Edge
-        let chrome_result = install_to_chrome(&ext_dir);
-        
-        // 尝试安装到 Firefox
-        let firefox_result = install_to_firefox(&ext_dir);
-        
-        // 如果至少有一个浏览器安装成功，则返回成功
-        if chrome_result.is_ok() || firefox_result.is_ok() {
-            return Ok(());
-        }
-    }
-    
-    // 所有安装方法都失败
-    Err("无法安装扩展到浏览器，请手动安装。\n提示：请在浏览器扩展管理页面启用开发者模式，然后加载解压后的扩展目录。".to_string())
+    let ext_dir = get_extension_directory(app)?;
+    browser_integration::open_extension_installers(std::path::Path::new(&ext_dir))
 }
 
 /// 获取扩展目录（解压后的扩展文件）
@@ -1660,200 +1647,6 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
         std::fs::write(mozilla_dir.join("com.multidown.app.json"), ff_str.as_bytes()).map_err(|e| e.to_string())?;
 
         Ok(())
-    }
-}
-
-/// 安装扩展到 Chrome/Edge
-fn install_to_chrome(ext_path: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]{
-        // 尝试查找 Chrome
-        let chrome_paths = [
-            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
-        ];
-        
-        for chrome_path in &chrome_paths {
-            if std::path::Path::new(chrome_path).exists() {
-                // 检查扩展目录是否存在
-                if !std::path::Path::new(ext_path).exists() {
-                    return Err(format!("扩展目录不存在: {}", ext_path));
-                }
-                
-                // 检查扩展目录是否包含manifest.json
-                if !std::path::Path::new(ext_path).join("manifest.json").exists() {
-                    return Err(format!("扩展目录缺少manifest.json文件: {}", ext_path));
-                }
-                
-                // // 尝试关闭所有正在运行的浏览器实例
-                // let _ = std::process::Command::new("taskkill")
-                //     .arg("/F")
-                //     .arg("/IM")
-                //     .arg("chrome.exe")
-                //     .spawn();
-                // let _ = std::process::Command::new("taskkill")
-                //     .arg("/F")
-                //     .arg("/IM")
-                //     .arg("msedge.exe")
-                //     .spawn();
-                
-                // 等待浏览器关闭
-                // std::thread::sleep(std::time::Duration::from_millis(1000));
-                
-                // 启动 Chrome 并加载扩展，添加开发者模式相关参数
-                // 调整参数顺序，确保--load-extension在其他参数之前
-                let result = std::process::Command::new(chrome_path)
-                    .arg(format!("--load-extension={}", ext_path))
-                    .arg("--enable-extensions")
-                    .arg("--enable-dev-tools")
-                    .arg("--no-sandbox")
-                    .arg("--disable-background-timer-throttling")
-                    .arg("--disable-backgrounding-occluded-windows")
-                    .arg("--disable-renderer-backgrounding")
-                    .arg("chrome://extensions/")
-                    .spawn()
-                    .map_err(|e| format!("无法启动浏览器: {}", e))?;
-                return Ok(());
-            }
-        }
-        Err("未找到 Chrome 或 Edge 浏览器".to_string())
-    }
-    #[cfg(target_os = "macos")]{
-        // 尝试查找 Chrome
-        let chrome_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-        ];
-        
-        for chrome_path in &chrome_paths {
-            if std::path::Path::new(chrome_path).exists() {
-                // 检查扩展目录是否存在
-                if !std::path::Path::new(ext_path).exists() {
-                    return Err(format!("扩展目录不存在: {}", ext_path));
-                }
-                
-                // 检查扩展目录是否包含manifest.json
-                if !std::path::Path::new(ext_path).join("manifest.json").exists() {
-                    return Err(format!("扩展目录缺少manifest.json文件: {}", ext_path));
-                }
-                
-                // 尝试关闭所有正在运行的浏览器实例
-                let _ = std::process::Command::new("pkill")
-                    .arg("-f")
-                    .arg("Google Chrome")
-                    .spawn();
-                let _ = std::process::Command::new("pkill")
-                    .arg("-f")
-                    .arg("Microsoft Edge")
-                    .spawn();
-                
-                // 等待浏览器关闭
-                std::thread::sleep(std::time::Duration::from_millis(1000));
-                
-                // 启动 Chrome 并加载扩展
-                std::process::Command::new(chrome_path)
-                    .arg(format!("--load-extension={}", ext_path))
-                    .arg("--enable-extensions")
-                    .arg("--enable-dev-tools")
-                    .arg("chrome://extensions/")
-                    .spawn()
-                    .map_err(|e| format!("无法启动浏览器: {}", e))?;
-                return Ok(());
-            }
-        }
-        Err("未找到 Chrome 或 Edge 浏览器".to_string())
-    }
-    #[cfg(target_os = "linux")]{
-        // 尝试查找 Chrome
-        let chrome_commands = ["google-chrome", "chromium", "microsoft-edge"];
-        
-        for cmd in &chrome_commands {
-            if let Ok(output) = std::process::Command::new("which").arg(cmd).output() {
-                if output.status.success() {
-                    // 检查扩展目录是否存在
-                    if !std::path::Path::new(ext_path).exists() {
-                        return Err(format!("扩展目录不存在: {}", ext_path));
-                    }
-                    
-                    // 检查扩展目录是否包含manifest.json
-                    if !std::path::Path::new(ext_path).join("manifest.json").exists() {
-                        return Err(format!("扩展目录缺少manifest.json文件: {}", ext_path));
-                    }
-                    
-                    // 尝试关闭所有正在运行的浏览器实例
-                    let _ = std::process::Command::new("pkill")
-                        .arg("-f")
-                        .arg(cmd)
-                        .spawn();
-                    
-                    // 等待浏览器关闭
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                    
-                    // 启动 Chrome 并加载扩展
-                    std::process::Command::new(cmd)
-                        .arg(format!("--load-extension={}", ext_path))
-                        .arg("--enable-extensions")
-                        .arg("--enable-dev-tools")
-                        .arg("chrome://extensions/")
-                        .spawn()
-                        .map_err(|e| format!("无法启动浏览器: {}", e))?;
-                    return Ok(());
-                }
-            }
-        }
-        Err("未找到 Chrome 或 Edge 浏览器".to_string())
-    }
-}
-
-/// 安装扩展到 Firefox
-fn install_to_firefox(_ext_path: &str) -> Result<(), String> {
-    #[cfg(target_os = "windows")]{
-        // 尝试查找 Firefox
-        let firefox_paths = [
-            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
-            "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe"
-        ];
-        
-        for firefox_path in &firefox_paths {
-            if std::path::Path::new(firefox_path).exists() {
-                // 启动 Firefox 并打开调试页面
-                std::process::Command::new(firefox_path)
-                    .arg("about:debugging#/runtime/this-firefox")
-                    .spawn()
-                    .map_err(|e| e.to_string())?;
-                return Ok(());
-            }
-        }
-        Err("未找到 Firefox 浏览器".to_string())
-    }
-    #[cfg(target_os = "macos")]{
-        // 尝试查找 Firefox
-        let firefox_path = "/Applications/Firefox.app/Contents/MacOS/firefox";
-        
-        if std::path::Path::new(firefox_path).exists() {
-            // 启动 Firefox 并打开调试页面
-            std::process::Command::new(firefox_path)
-                .arg("about:debugging#/runtime/this-firefox")
-                .spawn()
-                .map_err(|e| e.to_string())?;
-            return Ok(());
-        }
-        Err("未找到 Firefox 浏览器".to_string())
-    }
-    #[cfg(target_os = "linux")]{
-        // 尝试查找 Firefox
-        if let Ok(output) = std::process::Command::new("which").arg("firefox").output() {
-            if output.status.success() {
-                // 启动 Firefox 并打开调试页面
-                std::process::Command::new("firefox")
-                    .arg("about:debugging#/runtime/this-firefox")
-                    .spawn()
-                    .map_err(|e| e.to_string())?;
-                return Ok(());
-            }
-        }
-        Err("未找到 Firefox 浏览器".to_string())
     }
 }
 
