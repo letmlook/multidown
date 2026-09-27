@@ -1,5 +1,6 @@
 {
   "bundle": {
+    "fileAssociations": [],
     "resources": {
       "../integration/native-host/target/release/multidown-native-host.exe": "native-host/multidown-native-host.exe"
     }

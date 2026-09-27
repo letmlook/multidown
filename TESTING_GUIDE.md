@@ -21,7 +21,8 @@ cd integration/native-host && cargo build --release
 ```
 
 生成文件：
-- `integration/native-host/target/release/multidown-native-host.exe` - 本地消息主机可执行文件
+- Windows：`integration/native-host/target/release/multidown-native-host.exe`
+- macOS / Linux：`integration/native-host/target/release/multidown-native-host`
 
 ### 3. 编译主程序
 
@@ -35,10 +36,21 @@ npm run tauri:build
 
 ## 二、完整安装流程
 
+发布前先运行自动化门禁：
+
+```bash
+npm run test:run
+npm run test:extension
+npm run lint
+npm run build
+cd src-tauri && cargo test --lib && cargo clippy --all-targets -- -D warnings
+cd ../integration/native-host && cargo clippy --all-targets -- -D warnings
+```
+
 ### 步骤 1：安装主程序
 
 1. **运行安装包**：
-   - 执行 `src-tauri/target/release/bundle/nsis/MultiDown_0.1.0_x64-setup.exe`
+   - 执行 Tauri 生成的 `src-tauri/target/release/bundle/nsis/MultiDown_*_x64-setup.exe`
    - 按照安装向导完成安装
 
 2. **或直接运行可执行文件**：
@@ -58,7 +70,7 @@ npm run tauri:build
    - 选择目录：`dist-extension/unpacked`
 
 4. **验证安装**：
-   - 扩展应该显示在扩展列表中
+   - 扩展应该显示在扩展列表中，Chromium 扩展 ID 为 `bceackgdejcgphcbhinfgejepgoeiail`
    - 浏览器右上角应该出现 Multidown 扩展图标
 
 ### 步骤 3：注册本地消息主机
@@ -249,9 +261,9 @@ npm run tauri:build
 ### 软件要求
 
 - **操作系统**：Windows 10/11、macOS 10.15+、Linux
-- **浏览器**：Chrome 90+、Edge 90+
-- **Node.js**：18+
-- **Rust**：1.70+
+- **浏览器**：Chrome 90+、Edge 90+、Firefox 115+
+- **Node.js**：20 或 22
+- **Rust**：1.88+
 - **网络连接**：稳定的互联网连接
 
 ### 硬件要求

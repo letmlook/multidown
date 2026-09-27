@@ -10,8 +10,6 @@ use std::net::TcpStream;
 use std::fs::OpenOptions;
 use std::io::BufWriter;
 
-const APP_ID: &str = "com.multidown.app";
-
 // 调试日志函数
 fn debug_log(message: &str, data: Option<&str>) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -45,11 +43,6 @@ fn debug_log(message: &str, data: Option<&str>) {
         // 无法获取日志文件路径时，输出错误信息
         eprintln!("无法获取日志文件路径");
     }
-}
-
-// 详细日志函数（用于更详细的调试信息）
-fn debug_log_detailed(message: &str, details: &str) {
-    debug_log(message, Some(details));
 }
 
 // 日志文件路径
@@ -415,7 +408,7 @@ fn handle_open_window_message(msg: &serde_json::Value, stdout: &mut impl Write) 
         "action": "open_window",
         "url": url
     });
-    let line = format!("{}\n", body.to_string());
+    let line = format!("{body}\n");
     if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
         send_response(stdout, false, "发送失败");
         return false;

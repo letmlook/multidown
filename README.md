@@ -3,7 +3,7 @@
 对标 IDM 的跨平台多线程下载工具，基于 **Tauri 2 + React + TypeScript**。
 
 - **体积小**：使用系统 WebView，安装包约 3–8 MB
-- **运行快**：Rust 核心，多连接 + 动态分段（规划中）
+- **运行快**：Rust 核心，多连接 + 动态分段
 - **跨平台**：Windows / macOS / Linux
 
 ## 环境要求
@@ -12,7 +12,7 @@
   > ⚠️ **不要用 Node 24 构建**：`rollup` 的原生模块是 adhoc 签名的，Node 24 的代码签名校验会直接
   > 抛出 `ERR_DLOPEN_FAILED ... have different Team IDs`，导致 `npm run build` / `vite build` 失败。
   > CI 使用的是 Node 20，本地请对齐。若遇到该报错，`nvm use 22` 后重试即可。
-- **Rust** 1.70+（[安装 Rust](https://www.rust-lang.org/tools/install)）
+- **Rust** 1.88+（[安装 Rust](https://www.rust-lang.org/tools/install)）
 - **Windows**：需安装 [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)（Win10/11 通常已带）
 - **macOS**：系统 WebKit
 - **Linux**：`webkit2gtk` 等（见 [Tauri 文档](https://v2.tauri.app/start/prerequisites/)）
@@ -77,7 +77,7 @@ multidown/
 ├── integration/                 # 浏览器集成
 │   ├── extension/               # 扩展源码（Chromium + Firefox）
 │   └── native-host/             # Native Messaging Host (Rust)
-├── scripts/                     # 扩展打包 / CRX 签名 / NSIS / 图标生成
+├── scripts/                     # 扩展打包 / CRX 签名 / 图标生成
 ├── index.html
 ├── package.json
 └── vite.config.ts
@@ -103,7 +103,7 @@ npm run icons
 - [IDM 核心原理与功能模块分析](./docs/IDM核心原理与功能模块分析.md)
 - [技术栈选型分析](./docs/技术栈选型分析.md)
 
-## 功能现状（v0.2.0）
+## 功能现状（v0.3.0）
 
 ### 下载引擎
 
@@ -157,7 +157,7 @@ npm run icons
 - Chromium（Chrome / Edge）+ Firefox 双扩展：右键菜单、链接/媒体嗅探、下载接管
 - 与 IDM 对齐的 Native Messaging 通信协议；三平台（Windows / macOS / Linux）注册脚本
 - 捕获规则：总开关 + 域名黑名单，经 native host 下发到扩展端三处过滤
-- 扩展安装引导界面（主程序内一键打包 / 安装）
+- 安全的扩展安装引导：打开浏览器管理页并给出手动加载步骤，不会关闭或终止浏览器进程
 
 ## 开发路线
 
@@ -166,7 +166,7 @@ npm run icons
 3. ~~**阶段三**：浏览器扩展、通知与托盘、批量下载~~ ✅
 4. ~~**阶段四**：分类规则/定时/代理/批次与引擎深度接线~~ ✅
 5. ~~**阶段五**：磁力链接 / 种子文件下载（librqbit 引擎、占位任务、文件选择、做种策略、系统集成）~~ ✅
-6. **阶段六（收尾中）**：工程化与发布——`v0.2.0` 打包、测试补全、文档同步，详见 [开发计划](./docs/开发计划.md)
+6. ~~**阶段六**：工程化与发布——`v0.3.0` 测试补全、三平台 CI、版本与文档同步~~ ✅，详见 [开发计划](./docs/开发计划.md)
 
 ## 浏览器扩展安装
 

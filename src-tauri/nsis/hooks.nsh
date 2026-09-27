@@ -12,10 +12,17 @@
   WriteRegStr SHCTX "Software\Classes\MultiDown.magnet\DefaultIcon" "" '"$INSTDIR\MultiDown.exe",0'
   WriteRegStr SHCTX "Software\Classes\MultiDown.magnet\shell\open\command" "" '"$INSTDIR\MultiDown.exe" "%1"'
 
+  ; ProgID：.torrent 文件的打开方式
+  WriteRegStr SHCTX "Software\Classes\MultiDown.torrent" "" "BitTorrent 种子文件"
+  WriteRegStr SHCTX "Software\Classes\MultiDown.torrent" "Content Type" "application/x-bittorrent"
+  WriteRegStr SHCTX "Software\Classes\MultiDown.torrent\DefaultIcon" "" '"$INSTDIR\MultiDown.exe",0'
+  WriteRegStr SHCTX "Software\Classes\MultiDown.torrent\shell\open\command" "" '"$INSTDIR\MultiDown.exe" "%1"'
+
   ; 候选应用声明（"默认应用"设置页据此列出 MultiDown）
   WriteRegStr SHCTX "Software\com.multidown.app\Capabilities" "ApplicationName" "MultiDown"
   WriteRegStr SHCTX "Software\com.multidown.app\Capabilities" "ApplicationDescription" "MultiDown 跨平台多线程下载工具（支持磁力链接与种子文件）"
   WriteRegStr SHCTX "Software\com.multidown.app\Capabilities\URLAssociations" "magnet" "MultiDown.magnet"
+  WriteRegStr SHCTX "Software\com.multidown.app\Capabilities\FileAssociations" ".torrent" "MultiDown.torrent"
 
   ; 登记为已注册应用
   WriteRegStr SHCTX "Software\RegisteredApplications" "MultiDown" "Software\com.multidown.app\Capabilities"
@@ -28,6 +35,8 @@
   ; 只删除独属于本程序的键（MultiDown.magnet / com.multidown.app），不触碰共享的
   ; magnet 键或其它应用的登记，保证卸载后系统里不留残渣、也不破坏既有关联
   DeleteRegKey SHCTX "Software\Classes\MultiDown.magnet"
+  DeleteRegKey SHCTX "Software\Classes\MultiDown.torrent"
+  DeleteRegKey /ifempty SHCTX "Software\com.multidown.app\Capabilities\FileAssociations"
   DeleteRegKey /ifempty SHCTX "Software\com.multidown.app\Capabilities\URLAssociations"
   DeleteRegKey /ifempty SHCTX "Software\com.multidown.app\Capabilities"
   DeleteRegKey /ifempty SHCTX "Software\com.multidown.app"

@@ -86,7 +86,7 @@ export function DownloadFileInfo({
           .catch(() => {});
       }
     }
-  }, [open, initialUrl]);
+  }, [open, initialUrl, category]);
 
 
   const parseSavePath = (): { saveDir: string; filename: string } => {

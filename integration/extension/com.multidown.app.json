@@ -1,9 +1,9 @@
 {
   "name": "com.multidown.app",
   "description": "Multidown Native Messaging Host",
-  "path": "multidown-native-host",
+  "path": "MULTIDOWN_NATIVE_HOST_PATH",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://*/"
+    "chrome-extension://bceackgdejcgphcbhinfgejepgoeiail/"
   ]
 }

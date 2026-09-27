@@ -1,13 +1,10 @@
 name: Test Build
 
-# 暂不自动触发：需手动到 Actions 页 run workflow，或在本地跑
-#   cargo test --lib && cargo clippy --all-targets && npx tsc --noEmit && npm run build
-# 恢复自动触发：把下面的注释去掉，并删除 workflow_dispatch。
 on:
-  # push:
-  #   branches: [main]
-  # pull_request:
-  #   branches: [main]
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -45,16 +42,26 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run frontend tests
+        run: npm run test:run
+
+      - name: Lint frontend
+        run: npm run lint
+
       - name: Build frontend
         run: npm run build
 
       - name: Build browser extension
         run: npm run build:extension
 
-      - name: Type check
-        run: npx tsc --noEmit
+      - name: Verify browser extension identity
+        run: npm run test:extension
 
-      - name: Build native messaging host
+      - name: Check native messaging host
+        working-directory: integration/native-host
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build native messaging host resource
         working-directory: integration/native-host
         run: cargo build --release
 
@@ -62,9 +69,9 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
-      - name: Clippy（正确性检查，风格告警不阻断）
+      - name: Run strict app Clippy
         working-directory: src-tauri
-        run: cargo clippy -- -D clippy::correctness -D clippy::suspicious
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build Tauri
-        run: npm run tauri build
+        run: npm run tauri -- build
