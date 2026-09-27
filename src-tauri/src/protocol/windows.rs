@@ -5,6 +5,7 @@
 //!   1. ProgID `Software\Classes\MultiDown.magnet`（URL Protocol + open 命令）
 //!   2. `Software\com.multidown.app\Capabilities\URLAssociations`
 //!   3. `Software\RegisteredApplications` 登记应用
+//!
 //! 卸载时的清理由 NSIS 钩子完成（只删仍指向本程序的键，见 nsis/hooks.nsh）。
 
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
@@ -17,7 +18,7 @@ const CAPABILITIES_PATH: &str = r"Software\com.multidown.app\Capabilities";
 const REGISTERED_APP_NAME: &str = "MultiDown";
 const SETTINGS_DEEPLINK: &str = "ms-settings:defaultapps?registeredAppUser=MultiDown";
 
-/// SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL)：文件关联变化后刷新壳
+// SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL)：文件关联变化后刷新壳
 extern "system" {
     fn SHChangeNotify(w_event_id: u32, u_flags: u32, dw_item1: *mut std::ffi::c_void, dw_item2: *mut std::ffi::c_void);
 }
