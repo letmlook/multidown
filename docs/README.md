@@ -18,10 +18,10 @@
 
 ## 我想参与开发
 
-- [ ] 开发环境搭建
-- [ ] 项目结构
-- [ ] 测试指南
-- [ ] 构建指南
+- [开发环境搭建](./development/setup.md)
+- [项目结构](./development/project-structure.md)
+- [测试指南](./development/testing.md)
+- [构建指南](./development/building.md)
 - [贡献指南](../CONTRIBUTING.md)
 
 ## 我想理解架构
@@ -35,7 +35,7 @@
 
 ## 我负责发布维护
 
-- [ ] 发布流程
+- [发布流程](./development/release.md)
 - [ ] 命令速查
 - [ ] 平台路径
 - [ ] 已知限制
