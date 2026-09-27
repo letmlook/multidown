@@ -1,22 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-
-const CHROMIUM_EXTENSION_ID = 'bceackgdejcgphcbhinfgejepgoeiail';
-const FIREFOX_EXTENSION_ID = 'multidown@letmlook';
-const CURRENT_VERSION = 'v0.3.0';
-const RELEASE_ASSETS = [
-  'MultiDown-0.3.0-1.x86_64.rpm',
-  'MultiDown_0.3.0_aarch64.dmg',
-  'MultiDown_0.3.0_amd64.AppImage',
-  'MultiDown_0.3.0_amd64.deb',
-  'MultiDown_0.3.0_x64-setup.exe',
-  'MultiDown_0.3.0_x64.dmg',
-  'MultiDown_0.3.0_x64_en-US.msi',
-  'MultiDown_aarch64.app.tar.gz',
-  'MultiDown_x64.app.tar.gz',
-];
 
 function withoutFencedCode(markdown) {
   let fence = null;
@@ -42,8 +28,10 @@ function githubSlug(text) {
     .toLowerCase()
     .trim()
     .replace(/<[^>]+>/gu, '')
-    .replace(/[\p{P}\p{S}]/gu, '')
-    .replace(/\s+/gu, '-');
+    .replace(/\[([^\]]+)\]\([^)]+\)/gu, '$1')
+    .replace(/[`*_~]/gu, '')
+    .replace(/[^\p{L}\p{N}\s_-]/gu, '')
+    .replace(/\s/gu, '-');
 }
 
 function collectAnchors(markdown) {
@@ -88,36 +76,56 @@ function safeDecode(value) {
   }
 }
 
-function explicitFactErrors(relativePath, markdown) {
+function isCurrentStatePath(relativePath) {
+  return [
+    'README.md',
+    'CONTRIBUTING.md',
+    'SECURITY.md',
+    'TESTING_GUIDE.md',
+    'integration/README.md',
+    'docs/README.md',
+  ].includes(relativePath)
+    || /^docs\/(?:user-guide|development|architecture|reference)\//u.test(relativePath);
+}
+
+function explicitFactErrors(relativePath, markdown, facts) {
   const errors = [];
   const chromium = markdown.match(/Chromium\s*扩展\s*ID\s*[：:]\s*`([^`]+)`/iu)?.[1];
-  if (chromium && chromium !== CHROMIUM_EXTENSION_ID) {
+  if (chromium && chromium !== facts.chromiumExtensionId) {
     errors.push(
-      `${relativePath}: Chromium extension ID must be ${CHROMIUM_EXTENSION_ID}`,
+      `${relativePath}: Chromium extension ID must be ${facts.chromiumExtensionId}`,
     );
   }
   const firefox = markdown.match(/Firefox\s*扩展\s*ID\s*[：:]\s*`([^`]+)`/iu)?.[1];
-  if (firefox && firefox !== FIREFOX_EXTENSION_ID) {
-    errors.push(`${relativePath}: Firefox extension ID must be ${FIREFOX_EXTENSION_ID}`);
+  if (firefox && firefox !== facts.firefoxExtensionId) {
+    errors.push(`${relativePath}: Firefox extension ID must be ${facts.firefoxExtensionId}`);
   }
-  const version = markdown.match(/(?:当前稳定版本|当前版本|稳定版本)\s*[：:]\s*`?(v\d+\.\d+\.\d+)`?/iu)?.[1];
-  if (version && version !== CURRENT_VERSION) {
-    errors.push(`${relativePath}: current stable version must be ${CURRENT_VERSION}`);
+  if (isCurrentStatePath(relativePath)) {
+    for (const match of markdown.matchAll(/\bv\d+\.\d+\.\d+\b/gu)) {
+      if (match[0] !== facts.version) {
+        errors.push(
+          `${relativePath}: current documentation version must be ${facts.version} (found ${match[0]})`,
+        );
+      }
+    }
   }
-  if (relativePath === 'README.md' && !markdown.startsWith('# Multidown\n')) {
-    errors.push('README.md: first heading must be # Multidown');
+  if (relativePath === 'README.md' && !markdown.startsWith(`# ${facts.projectName}\n`)) {
+    errors.push(`README.md: first heading must be # ${facts.projectName}`);
+  }
+  if (relativePath === 'docs/README.md' && !markdown.startsWith(`# ${facts.projectName} 文档中心\n`)) {
+    errors.push(`docs/README.md: first heading must be # ${facts.projectName} 文档中心`);
   }
   if (relativePath === 'docs/development/release.md') {
-    for (const asset of RELEASE_ASSETS) {
+    for (const asset of facts.releaseAssets) {
       if (!markdown.includes(`\`${asset}\``)) {
-        errors.push(`${relativePath}: missing v0.3.0 release asset: ${asset}`);
+        errors.push(`${relativePath}: missing ${facts.version} release asset: ${asset}`);
       }
     }
   }
   return errors;
 }
 
-export async function validateDocumentation({ rootDir, markdownFiles, packageJson }) {
+export async function validateDocumentation({ rootDir, markdownFiles, packageJson, canonicalFacts }) {
   const errors = [];
   const scripts = packageJson.scripts ?? {};
 
@@ -125,7 +133,7 @@ export async function validateDocumentation({ rootDir, markdownFiles, packageJso
     const absolutePath = path.resolve(rootDir, relativePath);
     const markdown = await readFile(absolutePath, 'utf8');
 
-    errors.push(...explicitFactErrors(relativePath, markdown));
+    errors.push(...explicitFactErrors(relativePath, markdown, canonicalFacts));
 
     for (const match of markdown.matchAll(/\bnpm\s+run\s+([A-Za-z0-9:_-]+)/gu)) {
       const script = match[1];
@@ -162,6 +170,81 @@ export async function validateDocumentation({ rootDir, markdownFiles, packageJso
   return [...new Set(errors)].sort();
 }
 
+function chromiumIdFromKey(key) {
+  const digest = crypto
+    .createHash('sha256')
+    .update(Buffer.from(key, 'base64'))
+    .digest()
+    .subarray(0, 16);
+  return [...digest]
+    .flatMap((byte) => [byte >> 4, byte & 15])
+    .map((nibble) => 'abcdefghijklmnop'[nibble])
+    .join('');
+}
+
+function releaseAssets(productName, version) {
+  const number = version.replace(/^v/u, '');
+  return [
+    `${productName}-${number}-1.x86_64.rpm`,
+    `${productName}_${number}_aarch64.dmg`,
+    `${productName}_${number}_amd64.AppImage`,
+    `${productName}_${number}_amd64.deb`,
+    `${productName}_${number}_x64-setup.exe`,
+    `${productName}_${number}_x64.dmg`,
+    `${productName}_${number}_x64_en-US.msi`,
+    `${productName}_aarch64.app.tar.gz`,
+    `${productName}_x64.app.tar.gz`,
+  ];
+}
+
+function cargoPackageVersion(toml) {
+  return toml.match(/^version\s*=\s*"([^"]+)"/mu)?.[1];
+}
+
+export async function readCanonicalFacts(rootDir, packageJson) {
+  const [tauriConfig, extensionManifest, nativeHostManifest, buildExtension, appCargo, hostCargo] =
+    await Promise.all([
+      readFile(path.join(rootDir, 'src-tauri/tauri.conf.json'), 'utf8').then(JSON.parse),
+      readFile(path.join(rootDir, 'integration/extension/manifest.json'), 'utf8').then(JSON.parse),
+      readFile(path.join(rootDir, 'integration/extension/com.multidown.app.json'), 'utf8').then(JSON.parse),
+      readFile(path.join(rootDir, 'scripts/build-extension.mjs'), 'utf8'),
+      readFile(path.join(rootDir, 'src-tauri/Cargo.toml'), 'utf8'),
+      readFile(path.join(rootDir, 'integration/native-host/Cargo.toml'), 'utf8'),
+    ]);
+  const version = packageJson.version;
+  const sourceVersions = {
+    'src-tauri/tauri.conf.json': tauriConfig.version,
+    'integration/extension/manifest.json': extensionManifest.version,
+    'src-tauri/Cargo.toml': cargoPackageVersion(appCargo),
+    'integration/native-host/Cargo.toml': cargoPackageVersion(hostCargo),
+  };
+  const errors = Object.entries(sourceVersions)
+    .filter(([, sourceVersion]) => sourceVersion !== version)
+    .map(([file, sourceVersion]) => `${file}: version ${sourceVersion} does not match package.json ${version}`);
+  const chromiumExtensionId = chromiumIdFromKey(extensionManifest.key);
+  const allowedOrigin = `chrome-extension://${chromiumExtensionId}/`;
+  if (JSON.stringify(nativeHostManifest.allowed_origins) !== JSON.stringify([allowedOrigin])) {
+    errors.push(`integration/extension/com.multidown.app.json: allowed_origins must be ${allowedOrigin}`);
+  }
+  const firefoxExtensionId = buildExtension.match(/\bid\s*:\s*['"]([^'"]+)['"]/u)?.[1];
+  if (!firefoxExtensionId) {
+    errors.push('scripts/build-extension.mjs: Firefox extension ID not found');
+  }
+  const projectName = packageJson.name.charAt(0).toUpperCase() + packageJson.name.slice(1);
+  const productName = tauriConfig.productName;
+  return {
+    facts: {
+      projectName,
+      productName,
+      version: `v${version}`,
+      chromiumExtensionId,
+      firefoxExtensionId,
+      releaseAssets: releaseAssets(productName, `v${version}`),
+    },
+    errors,
+  };
+}
+
 export async function listMarkdownFiles(rootDir) {
   return execFileSync(
     'git',
@@ -177,7 +260,16 @@ async function main() {
   const rootDir = process.cwd();
   const markdownFiles = await listMarkdownFiles(rootDir);
   const packageJson = JSON.parse(await readFile(path.join(rootDir, 'package.json'), 'utf8'));
-  const errors = await validateDocumentation({ rootDir, markdownFiles, packageJson });
+  const canonical = await readCanonicalFacts(rootDir, packageJson);
+  const errors = [
+    ...canonical.errors,
+    ...(await validateDocumentation({
+      rootDir,
+      markdownFiles,
+      packageJson,
+      canonicalFacts: canonical.facts,
+    })),
+  ];
   if (errors.length > 0) {
     for (const error of errors) console.error(`- ${error}`);
     process.exitCode = 1;

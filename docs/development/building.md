@@ -22,11 +22,11 @@ cargo build --release --manifest-path integration/native-host/Cargo.toml
 
 - `dist-extension/unpacked/`：Chromium 开发模式目录。
 - `dist-extension/firefox-unpacked/`：带 Firefox manifest 变体的目录。
-- `dist-extension/multidown-extension.zip`：Chromium ZIP。
+- `dist-extension/multidown-extension.zip`：Chromium ZIP；只有系统可调用 `python3` 时生成，缺失时构建会保留 unpacked 目录并跳过 ZIP。
 
 Native Host 输出位于 `integration/native-host/target/release/`，Windows 文件带 `.exe`。应用平台配置会从该位置捆绑 Host。
 
-`npm run build:all` 会构建前端、扩展并尝试签名 CRX，但不会构建 Native Host；因此打包桌面应用前必须先完成上面的 Cargo 构建。
+`npm run build:all` 会构建前端与扩展，然后打印 Chrome 手工打包 CRX 的操作指南；脚本本身不会签名或生成 CRX。它也不会构建 Native Host，因此打包桌面应用前必须先完成上面的 Cargo 构建。
 
 ## 开发运行
 
@@ -55,4 +55,4 @@ npm run tauri:build
 - Native Host 资源不存在：先运行 Cargo release 构建。
 - Node.js 24 报 Rollup 原生模块 Team ID 不一致：切换到 Node.js 20 或 22，重新安装依赖。
 - Linux 找不到 WebKitGTK/GTK：补齐 Tauri 系统依赖。
-- CRX 签名失败：开发验证可使用 unpacked 目录；不要提交私钥。
+- 需要 CRX：`npm run sign:crx` 只显示 Chrome 手工“打包扩展程序”的步骤；开发验证可直接使用 unpacked 目录，不要提交 Chrome 生成的私钥。

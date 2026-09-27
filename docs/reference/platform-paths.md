@@ -53,7 +53,8 @@ Linux 上应用目录由 Tauri `app_data_dir` 动态解析，而 Host 当前使�
 - 前端：`dist/`
 - Chromium 扩展：`dist-extension/unpacked/`
 - Firefox 扩展：`dist-extension/firefox-unpacked/`
-- 扩展 ZIP/CRX：`dist-extension/`
+- 扩展 ZIP（系统存在 `python3` 时）：`dist-extension/multidown-extension.zip`
+- CRX：仓库脚本不直接生成；按 `npm run sign:crx` 输出的 Chrome 手工步骤创建，位置由 Chrome 选择。
 - Native Host：`integration/native-host/target/release/`
 - Tauri 可执行文件：`src-tauri/target/release/`
 - Tauri 安装包：`src-tauri/target/release/bundle/`

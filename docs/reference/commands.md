@@ -35,8 +35,8 @@
 | --- | --- | --- |
 | 前端生产构建 | `npm run build` | `dist/` |
 | 浏览器扩展 | `npm run build:extension` | `dist-extension/` |
-| 扩展 CRX 签名 | `npm run sign:crx` | `dist-extension/` |
-| 前端 + 扩展 + CRX | `npm run build:all` | `dist/`、`dist-extension/` |
+| 显示手工 CRX 打包指南 | `npm run sign:crx` | 终端说明（不生成 CRX） |
+| 前端 + 扩展 + 打包指南 | `npm run build:all` | `dist/`、`dist-extension/` |
 | Native Host release | `cargo build --release --manifest-path integration/native-host/Cargo.toml` | `integration/native-host/target/release/` |
 | 当前平台桌面包 | `npm run tauri:build` | `src-tauri/target/release/bundle/` |
 | 直接调用 Tauri CLI | `npm run tauri -- build` | `src-tauri/target/release/bundle/` |
