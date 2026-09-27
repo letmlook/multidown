@@ -90,13 +90,13 @@ function isCurrentStatePath(relativePath) {
 
 function explicitFactErrors(relativePath, markdown, facts) {
   const errors = [];
-  const chromium = markdown.match(/Chromium\s*扩展\s*ID\s*[：:]\s*`([^`]+)`/iu)?.[1];
+  const chromium = markdown.match(/Chromium(?:\s*扩展)?\s*ID\s*[：:]\s*`([^`]+)`/iu)?.[1];
   if (chromium && chromium !== facts.chromiumExtensionId) {
     errors.push(
       `${relativePath}: Chromium extension ID must be ${facts.chromiumExtensionId}`,
     );
   }
-  const firefox = markdown.match(/Firefox\s*扩展\s*ID\s*[：:]\s*`([^`]+)`/iu)?.[1];
+  const firefox = markdown.match(/Firefox(?:\s*扩展)?\s*ID\s*[：:]\s*`([^`]+)`/iu)?.[1];
   if (firefox && firefox !== facts.firefoxExtensionId) {
     errors.push(`${relativePath}: Firefox extension ID must be ${facts.firefoxExtensionId}`);
   }
@@ -114,6 +114,22 @@ function explicitFactErrors(relativePath, markdown, facts) {
   }
   if (relativePath === 'docs/README.md' && !markdown.startsWith(`# ${facts.projectName} 文档中心\n`)) {
     errors.push(`docs/README.md: first heading must be # ${facts.projectName} 文档中心`);
+  }
+  if (relativePath === 'docs/README.md') {
+    const namingContract = `命名约定：仓库和项目使用 \`${facts.projectName}\`；应用窗口、发布标题和安装包使用 \`${facts.productName}\`。`;
+    if (!markdown.includes(namingContract)) {
+      errors.push('docs/README.md: missing canonical project/product naming contract');
+    }
+  }
+  if (relativePath === 'docs/user-guide/browser-extension.md') {
+    if (!markdown.includes(`Chromium 扩展 ID：\`${facts.chromiumExtensionId}\``)) {
+      errors.push(
+        `${relativePath}: Chromium extension ID must be ${facts.chromiumExtensionId}`,
+      );
+    }
+    if (!markdown.includes(`Firefox 扩展 ID：\`${facts.firefoxExtensionId}\``)) {
+      errors.push(`${relativePath}: Firefox extension ID must be ${facts.firefoxExtensionId}`);
+    }
   }
   if (relativePath === 'docs/development/release.md') {
     for (const asset of facts.releaseAssets) {

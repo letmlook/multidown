@@ -105,6 +105,32 @@ describe('validateDocumentation', () => {
     );
   });
 
+  test('rejects alternate identity labels and a missing canonical naming contract', async () => {
+    const input = await fixture({
+      'README.md': '# Multidown\n',
+      'docs/README.md': '# Multidown 文档中心\n\n项目叫 `MultiDown`。\n',
+      'docs/user-guide/browser-extension.md': [
+        '# Browser',
+        '',
+        'Chromium ID：`wrong-chromium-id`',
+        '',
+        'Firefox ID：`wrong-firefox-id`',
+      ].join('\n'),
+    });
+
+    const errors = await validateDocumentation(input);
+
+    expect(errors).toContain(
+      'docs/user-guide/browser-extension.md: Chromium extension ID must be aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    );
+    expect(errors).toContain(
+      'docs/user-guide/browser-extension.md: Firefox extension ID must be multidown@example.test',
+    );
+    expect(errors).toContain(
+      'docs/README.md: missing canonical project/product naming contract',
+    );
+  });
+
   test('rejects stale versions anywhere in current-state documentation', async () => {
     const input = await fixture({
       'README.md': '# Multidown\n',
