@@ -108,7 +108,7 @@ interface ScheduleFormData {
 function scheduleRuleToForm(rule: ScheduleRule): ScheduleFormData {
   const rec: ScheduleFormRecurrence =
     rule.recurrence.type === "once"
-      ? { type: "once", date: rule.recurrence.date ?? "" }
+      ? { type: "once", date: rule.scheduled_date ?? rule.recurrence.date ?? "" }
       : rule.recurrence.type === "daily"
       ? { type: "daily" }
       : rule.recurrence.type === "weekdays"
@@ -532,6 +532,7 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
       start_time: scheduleForm.start_time,
       end_time: scheduleForm.end_time || undefined,
       speed_limit_kbps: scheduleForm.speed_limit_kbps ? parseInt(scheduleForm.speed_limit_kbps) : undefined,
+      scheduled_date: rec.type === "once" ? rec.date || undefined : undefined,
     };
     try {
       if (editingSchedule) {
@@ -541,6 +542,7 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
           name: rule.name,
           scheduleType: rule.schedule_type,
           recurrence: rec,
+          scheduledDate: rule.scheduled_date,
           startTime: rule.start_time,
           endTime: rule.end_time,
           speedLimitKbps: rule.speed_limit_kbps,

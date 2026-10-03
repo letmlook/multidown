@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Datelike, Duration, Local, Weekday};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -82,6 +82,38 @@ pub struct ScheduleRule {
     /// 仅执行一次的日期（YYYY-MM-DD），由 last_fired 推导
     #[serde(default)]
     pub scheduled_date: Option<String>,
+}
+
+/// Persisted scheduling state that is not part of an individual rule.
+/// `last_fired` uses a stable rule ID and minute key so a restart cannot fire
+/// the same action again during its scheduled minute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleStateRecord {
+    #[serde(default = "default_schedule_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub last_fired: HashMap<String, String>,
+}
+
+fn default_schedule_enabled() -> bool {
+    true
+}
+
+impl Default for ScheduleStateRecord {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            last_fired: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScheduleStore {
+    #[serde(default)]
+    pub state: ScheduleStateRecord,
+    #[serde(default)]
+    pub rules: Vec<ScheduleRule>,
 }
 
 impl ScheduleRule {
@@ -179,6 +211,8 @@ pub struct SpeedLimit {
 pub struct ScheduleManager {
     pub rules: Arc<Mutex<Vec<ScheduleRule>>>,
     pub speed_limit: Arc<Mutex<SpeedLimit>>,
+    state: Arc<Mutex<ScheduleStateRecord>>,
+    store_path: Option<PathBuf>,
     /// 已触发标记 "rule_id|date HH:MM"，防止同一分钟重复触发
     fired_keys: std::sync::Mutex<std::collections::HashSet<String>>,
 }
@@ -188,8 +222,35 @@ impl ScheduleManager {
         Self {
             rules: Arc::new(Mutex::new(Vec::new())),
             speed_limit: Arc::new(Mutex::new(SpeedLimit::default())),
+            state: Arc::new(Mutex::new(ScheduleStateRecord::default())),
+            store_path: None,
             fired_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    pub fn with_store_path(path: PathBuf, state: ScheduleStateRecord) -> Self {
+        Self {
+            store_path: Some(path),
+            state: Arc::new(Mutex::new(state)),
+            ..Self::new()
+        }
+    }
+
+    fn save_candidate(
+        &self,
+        rules: &[ScheduleRule],
+        state: &ScheduleStateRecord,
+    ) -> Result<(), String> {
+        self.store_path.as_ref().map_or(Ok(()), |path| {
+            save_schedule_store(
+                path,
+                &ScheduleStore {
+                    state: state.clone(),
+                    rules: rules.to_vec(),
+                },
+            )
+            .map_err(|error| format!("schedule persistence failed ({}): {error}", path.display()))
+        })
     }
 
     // ─── Rule CRUD ───────────────────────────────────────────────────────────
@@ -198,20 +259,62 @@ impl ScheduleManager {
         self.rules.lock().await.clone()
     }
 
-    pub async fn add_rule(&self, rule: ScheduleRule) {
-        self.rules.lock().await.push(rule);
+    pub async fn add_rule(&self, rule: ScheduleRule) -> Result<(), String> {
+        let mut rules = self.rules.lock().await;
+        let state = self.state.lock().await;
+        let mut candidate = rules.clone();
+        candidate.push(rule);
+        self.save_candidate(&candidate, &state)?;
+        *rules = candidate;
+        Ok(())
     }
 
-    pub async fn update_rule(&self, rule: ScheduleRule) {
+    pub async fn update_rule(&self, rule: ScheduleRule) -> Result<(), String> {
         let mut rules = self.rules.lock().await;
+        let state = self.state.lock().await;
         if let Some(pos) = rules.iter().position(|r| r.id == rule.id) {
-            rules[pos] = rule;
+            let mut candidate = rules.clone();
+            candidate[pos] = rule;
+            self.save_candidate(&candidate, &state)?;
+            *rules = candidate;
+            Ok(())
+        } else {
+            Err("计划任务不存在".to_string())
         }
     }
 
-    pub async fn remove_rule(&self, id: &str) {
+    pub async fn remove_rule(&self, id: &str) -> Result<(), String> {
         let mut rules = self.rules.lock().await;
-        rules.retain(|r| r.id != id);
+        let state = self.state.lock().await;
+        let mut candidate = rules.clone();
+        let before = candidate.len();
+        candidate.retain(|r| r.id != id);
+        if candidate.len() == before {
+            return Err("计划任务不存在".to_string());
+        }
+        self.save_candidate(&candidate, &state)?;
+        *rules = candidate;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn replace_rules(&self, rules: Vec<ScheduleRule>) {
+        *self.rules.lock().await = rules;
+    }
+
+    #[cfg(test)]
+    pub async fn state(&self) -> ScheduleStateRecord {
+        self.state.lock().await.clone()
+    }
+
+    pub async fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        let rules = self.rules.lock().await;
+        let mut state = self.state.lock().await;
+        let mut candidate = state.clone();
+        candidate.enabled = enabled;
+        self.save_candidate(&rules, &candidate)?;
+        *state = candidate;
+        Ok(())
     }
 
     // ─── Speed limit ─────────────────────────────────────────────────────────
@@ -228,12 +331,20 @@ impl ScheduleManager {
     /// - 动作规则（开始/暂停/恢复）：同一规则同一分钟只触发一次；Once 触发后自动禁用
     /// - SpeedLimit 规则：取所有激活窗口中最严格的限速值，变化时才发事件；
     ///   所有窗口结束后发 Deactivated（调度器据此恢复设置里的静态限速）
-    pub async fn tick(&self, now: &DateTime<Local>) -> Vec<ScheduleEvent> {
+    pub async fn tick(&self, now: &DateTime<Local>) -> Result<Vec<ScheduleEvent>, String> {
         let mut events = Vec::new();
         let mut active_limit: Option<u32> = None;
         let mut rules = self.rules.lock().await;
+        let mut state = self.state.lock().await;
+        if !state.enabled {
+            return Ok(events);
+        }
+        let mut candidate_rules = rules.clone();
+        let mut candidate_state = state.clone();
+        let mut state_changed = false;
+        let mut fired_keys = Vec::new();
 
-        for rule in rules.iter_mut() {
+        for rule in candidate_rules.iter_mut() {
             if rule.schedule_type == ScheduleType::SpeedLimit {
                 if rule.is_speed_limit_active(now) {
                     active_limit = match (active_limit, rule.speed_limit_kbps) {
@@ -247,9 +358,12 @@ impl ScheduleManager {
             if !rule.should_fire(now) {
                 continue;
             }
-            let key = format!("{}|{}", rule.id, now.format("%Y-%m-%d %H:%M"));
-            let first_time = self.fired_keys.lock().unwrap().insert(key);
-            if !first_time {
+            let minute = now.format("%Y-%m-%d %H:%M").to_string();
+            if candidate_state.last_fired.get(&rule.id) == Some(&minute) {
+                continue;
+            }
+            let key = format!("{}|{minute}", rule.id);
+            if self.fired_keys.lock().unwrap().contains(&key) {
                 continue;
             }
             match rule.schedule_type {
@@ -262,8 +376,18 @@ impl ScheduleManager {
             if matches!(rule.recurrence, Recurrence::Once) {
                 rule.enabled = false;
             }
+            candidate_state.last_fired.insert(rule.id.clone(), minute);
+            fired_keys.push(key);
+            state_changed = true;
+        }
+        if state_changed {
+            self.save_candidate(&candidate_rules, &candidate_state)?;
+            *rules = candidate_rules;
+            *state = candidate_state;
+            self.fired_keys.lock().unwrap().extend(fired_keys);
         }
         drop(rules);
+        drop(state);
 
         // 限速窗口状态变化检测
         let mut sl = self.speed_limit.lock().await;
@@ -283,7 +407,7 @@ impl ScheduleManager {
                 }
             }
         }
-        events
+        Ok(events)
     }
 }
 
@@ -309,37 +433,134 @@ pub fn schedule_rules_path(app_data_dir: &std::path::Path) -> std::path::PathBuf
 #[allow(dead_code)]
 pub fn load_schedule_rules(app_data_dir: &std::path::Path) -> Vec<ScheduleRule> {
     let path = schedule_rules_path(app_data_dir);
-    load_schedule_rules_report(&path)
-        .map(|report| report.data)
+    load_schedule_store_report(&path)
+        .map(|report| report.data.rules)
         .unwrap_or_default()
 }
 
+/// Load the current store shape while accepting the legacy bare rule array.
+/// A legacy source is rewritten as a versioned `ScheduleStore` by `load_store`.
+pub fn load_schedule_store_report(
+    path: &std::path::Path,
+) -> Result<crate::storage::LoadReport<ScheduleStore>, crate::storage::StoreError> {
+    crate::storage::load_store(path, "schedules", |version, data| {
+        if version > 1 {
+            return Err(crate::storage::StoreError::UnsupportedVersion(version));
+        }
+        let (state, records) = if let Some(records) = data.as_array() {
+            (ScheduleStateRecord::default(), records.clone())
+        } else {
+            let object = data.as_object().ok_or_else(|| {
+                crate::storage::StoreError::InvalidEnvelope(
+                    "schedules data must be an array or object".into(),
+                )
+            })?;
+            let state = object
+                .get("state")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(crate::storage::StoreError::Json)?
+                .unwrap_or_default();
+            let records = object
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::storage::StoreError::InvalidEnvelope(
+                        "schedules data.rules must be an array".into(),
+                    )
+                })?;
+            (state, records)
+        };
+        let mut rules = Vec::new();
+        let mut warnings = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (index, mut value) in records.into_iter().enumerate() {
+            let key = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned);
+            let parsed = (|| {
+                let id = key.as_deref().ok_or("missing or empty record ID")?;
+                if !seen.insert(id.to_owned()) {
+                    return Err("duplicate record ID".to_string());
+                }
+                normalize_legacy_recurrence(&mut value);
+                let rule: ScheduleRule =
+                    serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                let valid_time = |time: &str| {
+                    chrono::NaiveTime::parse_from_str(time, "%H:%M")
+                        .is_ok_and(|parsed| parsed.format("%H:%M").to_string() == time)
+                };
+                if !valid_time(&rule.start_time)
+                    || rule
+                        .end_time
+                        .as_deref()
+                        .is_some_and(|time| !valid_time(time))
+                {
+                    return Err("schedule time must be HH:MM within 00:00..23:59".into());
+                }
+                Ok(rule)
+            })();
+            match parsed {
+                Ok(rule) => rules.push(rule),
+                Err(message) => warnings.push(crate::storage::RecoveryWarning {
+                    id: format!("schedules-record-{index}"),
+                    domain: "schedules".into(),
+                    message,
+                    recovery_path: None,
+                    record_key: key.or_else(|| Some(index.to_string())),
+                    rejected_value: Some(value),
+                }),
+            }
+        }
+        Ok((ScheduleStore { state, rules }, warnings))
+    })
+}
+
+fn normalize_legacy_recurrence(value: &mut serde_json::Value) {
+    let Some(recurrence) = value.get_mut("recurrence") else {
+        return;
+    };
+    if let Some(kind) = recurrence.as_str() {
+        *recurrence = serde_json::json!({"type": kind});
+        return;
+    }
+    let Some(object) = recurrence.as_object() else {
+        return;
+    };
+    for key in ["weekly", "Weekly"] {
+        if let Some(days) = object.get(key).cloned() {
+            *recurrence = serde_json::json!({"type": "weekly", "days": days});
+            return;
+        }
+    }
+    for (legacy, tagged) in [
+        ("Once", "once"),
+        ("Daily", "daily"),
+        ("Weekdays", "weekdays"),
+        ("Weekends", "weekends"),
+    ] {
+        if object.contains_key(legacy) {
+            *recurrence = serde_json::json!({"type": tagged});
+            return;
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn load_schedule_rules_report(
     path: &std::path::Path,
 ) -> Result<crate::storage::LoadReport<Vec<ScheduleRule>>, crate::storage::StoreError> {
-    super::rules_persistence::load_records(path, "schedules", |mut value| {
-        if let Some(recurrence) = value.get_mut("recurrence") {
-            if let Some(kind) = recurrence.as_str() {
-                *recurrence = serde_json::json!({"type": kind});
-            } else if let Some(days) = recurrence.get("weekly").cloned() {
-                *recurrence = serde_json::json!({"type": "weekly", "days": days});
-            }
-        }
-        let rule: ScheduleRule =
-            serde_json::from_value(value).map_err(|error| error.to_string())?;
-        let valid_time = |time: &str| {
-            chrono::NaiveTime::parse_from_str(time, "%H:%M")
-                .is_ok_and(|parsed| parsed.format("%H:%M").to_string() == time)
-        };
-        if !valid_time(&rule.start_time)
-            || rule
-                .end_time
-                .as_deref()
-                .is_some_and(|time| !valid_time(time))
-        {
-            return Err("schedule time must be HH:MM within 00:00..23:59".into());
-        }
-        Ok(rule)
+    let report = load_schedule_store_report(path)?;
+    Ok(crate::storage::LoadReport {
+        data: report.data.rules,
+        warnings: report.warnings,
+        schema_version: report.schema_version,
+        migrated: report.migrated,
+        recovery_path: report.recovery_path,
     })
 }
 
@@ -349,7 +570,21 @@ pub async fn save_schedule_rules(
     rules: &[ScheduleRule],
 ) -> std::io::Result<()> {
     let path = schedule_rules_path(app_data_dir);
-    crate::storage::save_store(&path, 1, &rules).map_err(std::io::Error::other)
+    save_schedule_store(
+        &path,
+        &ScheduleStore {
+            state: ScheduleStateRecord::default(),
+            rules: rules.to_vec(),
+        },
+    )
+    .map_err(std::io::Error::other)
+}
+
+pub fn save_schedule_store(
+    path: &std::path::Path,
+    store: &ScheduleStore,
+) -> Result<(), crate::storage::StoreError> {
+    crate::storage::save_store(path, 1, store)
 }
 
 #[cfg(test)]
@@ -387,11 +622,127 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
         assert_eq!(
-            disk["data"][1]["recurrence"],
+            disk["data"]["rules"][1]["recurrence"],
             serde_json::json!({"type":"weekly","days":["Mon","Fri"]})
         );
         assert_eq!(load_schedule_rules(&dir).len(), 4);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn external_tagged_weekly_recurrence_migrates_to_ipc_shape() {
+        let dir = std::env::temp_dir().join(format!("schedules-external-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = schedule_rules_path(&dir);
+        std::fs::write(
+            &path,
+            r#"[{"id":"weekly","name":"Weekly","enabled":true,"schedule_type":"pause_all","recurrence":{"Weekly":["Mon","Fri"]},"start_time":"23:00","end_time":null,"speed_limit_kbps":null}]"#,
+        )
+        .unwrap();
+
+        let report = load_schedule_store_report(&path).unwrap();
+
+        assert_eq!(report.data.rules.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&report.data.rules[0].recurrence).unwrap(),
+            serde_json::json!({"type":"weekly","days":["Mon","Fri"]})
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recurrence_json_matches_daily_and_weekly_ipc_contract() {
+        assert_eq!(
+            serde_json::to_value(Recurrence::Daily).unwrap(),
+            serde_json::json!({"type":"daily"})
+        );
+        assert_eq!(
+            serde_json::to_value(Recurrence::Weekly(vec![Weekday::Mon, Weekday::Wed])).unwrap(),
+            serde_json::json!({"type":"weekly","days":["Mon","Wed"]})
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_state_and_one_shot_firing_survive_reconstruction() {
+        let dir = std::env::temp_dir().join(format!("schedules-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = schedule_rules_path(&dir);
+        let now = local_time(2026, 9, 28, 8, 0);
+        let mut rule = ScheduleRule::new(
+            "once".into(),
+            ScheduleType::StartDownload,
+            Recurrence::Once,
+            "08:00".into(),
+        );
+        rule.id = "once".into();
+        rule.scheduled_date = Some("2026-09-28".into());
+        let manager =
+            ScheduleManager::with_store_path(path.clone(), ScheduleStateRecord::default());
+        manager.add_rule(rule).await.unwrap();
+        manager.set_enabled(false).await.unwrap();
+        manager.set_enabled(true).await.unwrap();
+
+        assert!(matches!(
+            manager.tick(&now).await.unwrap().as_slice(),
+            [ScheduleEvent::StartAll]
+        ));
+
+        let reloaded = load_schedule_store_report(&path).unwrap().data;
+        assert!(reloaded.state.enabled);
+        assert_eq!(
+            reloaded.state.last_fired.get("once").map(String::as_str),
+            Some("2026-09-28 08:00")
+        );
+        assert!(!reloaded.rules[0].enabled);
+        let restored = ScheduleManager::with_store_path(path, reloaded.state);
+        restored.replace_rules(reloaded.rules).await;
+        assert!(restored.tick(&now).await.unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_tick_persistence_does_not_publish_or_mutate_one_shot_state() {
+        let dir = std::env::temp_dir().join(format!("schedules-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, "blocker").unwrap();
+        let mut rule = ScheduleRule::new(
+            "once".into(),
+            ScheduleType::StartDownload,
+            Recurrence::Once,
+            "08:00".into(),
+        );
+        rule.id = "once".into();
+        rule.scheduled_date = Some("2026-09-28".into());
+        let manager = ScheduleManager::with_store_path(
+            blocker.join("schedules.json"),
+            ScheduleStateRecord::default(),
+        );
+        manager.replace_rules(vec![rule]).await;
+
+        assert!(manager.tick(&local_time(2026, 9, 28, 8, 0)).await.is_err());
+        assert!(manager.get_rules().await[0].enabled);
+        assert!(manager.state().await.last_fired.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_schedule_does_not_fire_or_mark_one_shot_rule() {
+        let now = local_time(2026, 9, 28, 8, 0);
+        let mut rule = ScheduleRule::new(
+            "once".into(),
+            ScheduleType::StartDownload,
+            Recurrence::Once,
+            "08:00".into(),
+        );
+        rule.scheduled_date = Some("2026-09-28".into());
+        let manager = ScheduleManager::new();
+        manager.add_rule(rule).await.unwrap();
+        manager.set_enabled(false).await.unwrap();
+
+        assert!(manager.tick(&now).await.unwrap().is_empty());
+        assert!(manager.get_rules().await[0].enabled);
+        assert!(manager.state().await.last_fired.is_empty());
     }
     use chrono::TimeZone;
 
@@ -466,13 +817,13 @@ mod tests {
         );
         rule.scheduled_date = Some("2026-09-28".into());
         let manager = ScheduleManager::new();
-        manager.add_rule(rule).await;
+        manager.add_rule(rule).await.unwrap();
 
         assert!(matches!(
-            manager.tick(&now).await.as_slice(),
+            manager.tick(&now).await.unwrap().as_slice(),
             [ScheduleEvent::StartAll]
         ));
-        assert!(manager.tick(&now).await.is_empty());
+        assert!(manager.tick(&now).await.unwrap().is_empty());
         assert!(!manager.get_rules().await[0].enabled);
     }
 }

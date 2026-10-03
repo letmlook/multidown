@@ -273,6 +273,7 @@ export interface ScheduleRule {
   start_time: string;
   end_time?: string;
   speed_limit_kbps?: number;
+  scheduled_date?: string;
 }
 
 export interface ScheduleState {

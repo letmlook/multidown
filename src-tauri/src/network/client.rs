@@ -106,6 +106,9 @@ pub struct ProbeResult {
     pub etag: Option<String>,
     #[serde(default)]
     pub last_modified: Option<String>,
+    /// Normalized response Content-Type for post-probe category rules.
+    #[serde(default)]
+    pub mime: Option<String>,
 }
 
 fn default_client() -> Client {
@@ -151,6 +154,7 @@ pub async fn probe_with_client(
         .get("last-modified")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let mut mime = mime_from_headers(&headers);
 
     // 无 Content-Length 时部分服务器 HEAD 不返回，需 GET Range: bytes=0-0
     let mut total_bytes = headers
@@ -171,6 +175,9 @@ pub async fn probe_with_client(
         )
         .send()
         .await?;
+        if mime.is_none() {
+            mime = mime_from_headers(get_resp.headers());
+        }
         if get_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
             supports_range = true;
             if let Some(v) = get_resp.headers().get("content-range") {
@@ -218,7 +225,24 @@ pub async fn probe_with_client(
         final_url,
         etag,
         last_modified,
+        mime,
     })
+}
+
+fn mime_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    normalized_mime(
+        headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn normalized_mime(value: Option<&str>) -> Option<String> {
+    value
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 /// `.torrent` 响应的判定（抽成纯函数便于单测）。
@@ -372,6 +396,16 @@ mod tests {
             h.insert(reqwest::header::CONTENT_TYPE, ct.parse().unwrap());
         }
         h
+    }
+
+    #[test]
+    fn normalizes_content_type_for_category_matching() {
+        assert_eq!(
+            normalized_mime(Some(" Video/MP4 ; charset=UTF-8 ")),
+            Some("video/mp4".into())
+        );
+        assert_eq!(normalized_mime(Some("   ")), None);
+        assert_eq!(normalized_mime(None), None);
     }
 
     #[test]

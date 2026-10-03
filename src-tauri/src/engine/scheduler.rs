@@ -6,7 +6,7 @@ use crate::engine::persistence::{save_tasks_to_file, PersistedTask};
 use crate::engine::queue::{GlobalQueueManager, QueueSummary};
 use crate::engine::rules::{match_rule, CategoryRule};
 use crate::engine::rules_persistence::{load_rules, save_rules};
-use crate::engine::schedule::{ScheduleManager, ScheduleRule};
+use crate::engine::schedule::{load_schedule_store_report, ScheduleManager, ScheduleRule};
 use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskInfo, TaskStatus, TorrentMeta, TorrentStatsSnapshot};
 use crate::engine::writer::{run_file_writer, WriterMessage};
@@ -344,14 +344,15 @@ impl Scheduler {
             crate::engine::rules_persistence::load_rules_report(&paths.rules),
             &mut warnings,
         )?;
-        let schedules = recover_load(
+        let schedule_store = recover_load(
             "schedules",
             &paths.schedules,
-            crate::engine::schedule::load_schedule_rules_report(&paths.schedules),
+            load_schedule_store_report(&paths.schedules),
             &mut warnings,
         )?;
-        let mut schedule_manager = ScheduleManager::new();
-        schedule_manager.rules = Arc::new(AsyncMutex::new(schedules));
+        let mut schedule_manager =
+            ScheduleManager::with_store_path(paths.schedules.clone(), schedule_store.state.clone());
+        schedule_manager.rules = Arc::new(AsyncMutex::new(schedule_store.rules));
 
         let known_task_ids = tasks.keys().cloned().collect();
         let mut scheduler = Self::new(Some(paths.tasks));
@@ -364,6 +365,7 @@ impl Scheduler {
         scheduler.batch_manager = Arc::new(batch_manager);
         scheduler.rule_manager = Arc::new(RwLock::new(rules));
         scheduler.schedule_manager = Arc::new(schedule_manager);
+        scheduler.schedule_enabled = Arc::new(ParkingMutex::new(schedule_store.state.enabled));
         scheduler.update_from_settings(&settings);
         Ok((scheduler, warnings))
     }
@@ -871,12 +873,14 @@ impl Scheduler {
         extra_headers: Vec<(String, String)>,
         auto_categorize: bool,
     ) -> Result<Task, String> {
-        let (supports_range, total_bytes, suggested_filename, validation) = match probe_result {
+        let (supports_range, total_bytes, suggested_filename, validation, mime) = match probe_result
+        {
             Some(p) => (
                 p.supports_range,
                 p.total_bytes,
                 p.suggested_filename.clone(),
                 Some((p.etag.clone(), p.last_modified.clone())),
+                p.mime.clone(),
             ),
             None => {
                 let p = probe(&url).await.map_err(|e| e.to_string())?;
@@ -885,6 +889,7 @@ impl Scheduler {
                     p.total_bytes,
                     p.suggested_filename.clone(),
                     Some((p.etag.clone(), p.last_modified.clone())),
+                    p.mime.clone(),
                 )
             }
         };
@@ -900,7 +905,7 @@ impl Scheduler {
                 &rules,
                 &url,
                 filename.as_deref().unwrap_or("download"),
-                None,
+                mime.as_deref(),
             ) {
                 if !dir.is_empty() {
                     save_dir = dir;
@@ -2325,11 +2330,14 @@ impl Scheduler {
     /// Create a new rule
     pub async fn create_rule(&self, rule: CategoryRule) -> Result<CategoryRule, String> {
         let mut rules = self.rule_manager.write().await;
-        rules.push(rule.clone());
-        // persist
+        let mut candidate = rules.clone();
+        candidate.push(rule.clone());
         if let Some(path) = self.rules_save_path() {
-            let _ = save_rules(&path, &rules).await;
+            save_rules(&path, &candidate).await.map_err(|error| {
+                format!("rule persistence failed ({}): {error}", path.display())
+            })?;
         }
+        *rules = candidate;
         Ok(rule)
     }
 
@@ -2337,10 +2345,14 @@ impl Scheduler {
     pub async fn update_rule(&self, rule: CategoryRule) -> Result<CategoryRule, String> {
         let mut rules = self.rule_manager.write().await;
         if let Some(pos) = rules.iter().position(|r| r.id == rule.id) {
-            rules[pos] = rule.clone();
+            let mut candidate = rules.clone();
+            candidate[pos] = rule.clone();
             if let Some(path) = self.rules_save_path() {
-                let _ = save_rules(&path, &rules).await;
+                save_rules(&path, &candidate).await.map_err(|error| {
+                    format!("rule persistence failed ({}): {error}", path.display())
+                })?;
             }
+            *rules = candidate;
             Ok(rule)
         } else {
             Err("规则不存在".to_string())
@@ -2351,13 +2363,17 @@ impl Scheduler {
     pub async fn delete_rule(&self, rule_id: &str) -> Result<(), String> {
         let mut rules = self.rule_manager.write().await;
         let len_before = rules.len();
-        rules.retain(|r| r.id != rule_id);
-        if rules.len() == len_before {
+        let mut candidate = rules.clone();
+        candidate.retain(|r| r.id != rule_id);
+        if candidate.len() == len_before {
             return Err("规则不存在".to_string());
         }
         if let Some(path) = self.rules_save_path() {
-            let _ = save_rules(&path, &rules).await;
+            save_rules(&path, &candidate).await.map_err(|error| {
+                format!("rule persistence failed ({}): {error}", path.display())
+            })?;
         }
+        *rules = candidate;
         Ok(())
     }
 
@@ -2365,20 +2381,26 @@ impl Scheduler {
     pub async fn reorder_rules(&self, rule_ids: Vec<String>) -> Result<(), String> {
         let mut rules = self.rule_manager.write().await;
         // Build new ordered list
+        let mut remaining = rules.clone();
         let mut new_rules = Vec::new();
         for id in rule_ids {
-            if let Some(pos) = rules.iter().position(|r| r.id == id) {
-                new_rules.push(rules.remove(pos));
+            if let Some(pos) = remaining.iter().position(|r| r.id == id) {
+                new_rules.push(remaining.remove(pos));
             } else {
                 return Err(format!("规则 {} 不存在", id));
             }
         }
         // Append any remaining rules not in the list
-        new_rules.extend(rules.drain(..));
-        *rules = new_rules;
-        if let Some(path) = self.rules_save_path() {
-            let _ = save_rules(&path, &rules).await;
+        new_rules.extend(remaining);
+        for (priority, rule) in new_rules.iter_mut().enumerate() {
+            rule.priority = priority;
         }
+        if let Some(path) = self.rules_save_path() {
+            save_rules(&path, &new_rules).await.map_err(|error| {
+                format!("rule persistence failed ({}): {error}", path.display())
+            })?;
+        }
+        *rules = new_rules;
         Ok(())
     }
 
@@ -2409,8 +2431,10 @@ impl Scheduler {
     }
 
     /// Set global schedule on/off
-    pub async fn set_schedule_enabled(&self, enabled: bool) {
+    pub async fn set_schedule_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.schedule_manager.set_enabled(enabled).await?;
         *self.schedule_enabled.lock() = enabled;
+        Ok(())
     }
 
     /// Get all schedule tasks
@@ -2420,36 +2444,19 @@ impl Scheduler {
 
     /// Create a new schedule task
     pub async fn create_schedule_task(&self, rule: ScheduleRule) -> Result<ScheduleRule, String> {
-        self.schedule_manager.add_rule(rule.clone()).await;
-        // persist
-        if let Some(ref path) = self.save_path {
-            let app_data = path.parent().unwrap_or(std::path::Path::new("."));
-            let rules = self.schedule_manager.get_rules().await;
-            let _ = crate::engine::schedule::save_schedule_rules(app_data, &rules).await;
-        }
+        self.schedule_manager.add_rule(rule.clone()).await?;
         Ok(rule)
     }
 
     /// Update a schedule task
     pub async fn update_schedule_task(&self, rule: ScheduleRule) -> Result<ScheduleRule, String> {
-        self.schedule_manager.update_rule(rule.clone()).await;
-        if let Some(ref path) = self.save_path {
-            let app_data = path.parent().unwrap_or(std::path::Path::new("."));
-            let rules = self.schedule_manager.get_rules().await;
-            let _ = crate::engine::schedule::save_schedule_rules(app_data, &rules).await;
-        }
+        self.schedule_manager.update_rule(rule.clone()).await?;
         Ok(rule)
     }
 
     /// Delete a schedule task
     pub async fn delete_schedule_task(&self, id: &str) -> Result<(), String> {
-        self.schedule_manager.remove_rule(id).await;
-        if let Some(ref path) = self.save_path {
-            let app_data = path.parent().unwrap_or(std::path::Path::new("."));
-            let rules = self.schedule_manager.get_rules().await;
-            let _ = crate::engine::schedule::save_schedule_rules(app_data, &rules).await;
-        }
-        Ok(())
+        self.schedule_manager.remove_rule(id).await
     }
 
     /// Manually trigger a schedule task (execute action immediately)
@@ -2873,6 +2880,140 @@ mod tests {
             fixture.0.join("torrent-session")
         );
         assert!(scheduler.torrent_engine.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn schedule_state_and_rule_mutations_survive_scheduler_reconstruction() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        crate::engine::schedule::save_schedule_store(
+            &paths.schedules,
+            &crate::engine::schedule::ScheduleStore {
+                state: crate::engine::schedule::ScheduleStateRecord {
+                    enabled: false,
+                    last_fired: std::collections::HashMap::from([(
+                        "already-fired".into(),
+                        "2026-09-28 08:00".into(),
+                    )]),
+                },
+                rules: vec![],
+            },
+        )
+        .unwrap();
+
+        let (scheduler, warnings) =
+            Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        assert!(!scheduler.get_schedule_state().await);
+        let rule = ScheduleRule::new(
+            "daily".into(),
+            crate::engine::schedule::ScheduleType::PauseAll,
+            crate::engine::schedule::Recurrence::Daily,
+            "09:00".into(),
+        );
+        scheduler.create_schedule_task(rule).await.unwrap();
+        scheduler.set_schedule_enabled(true).await.unwrap();
+
+        let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        assert!(restored.get_schedule_state().await);
+        assert_eq!(restored.get_schedule_tasks().await.len(), 1);
+        assert_eq!(
+            restored
+                .schedule_manager()
+                .state()
+                .await
+                .last_fired
+                .get("already-fired"),
+            Some(&"2026-09-28 08:00".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reordered_category_rules_use_dense_priorities_after_reconstruction() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        let (scheduler, warnings) =
+            Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        scheduler
+            .create_rule(CategoryRule {
+                id: "first".into(),
+                name: "First".into(),
+                match_type: crate::engine::rules::MatchType::Extension,
+                patterns: vec!["first".into()],
+                save_path: "first".into(),
+                enabled: true,
+                priority: 40,
+            })
+            .await
+            .unwrap();
+        scheduler
+            .create_rule(CategoryRule {
+                id: "second".into(),
+                name: "Second".into(),
+                match_type: crate::engine::rules::MatchType::Extension,
+                patterns: vec!["second".into()],
+                save_path: "second".into(),
+                enabled: true,
+                priority: 99,
+            })
+            .await
+            .unwrap();
+        scheduler
+            .reorder_rules(vec!["second".into(), "first".into()])
+            .await
+            .unwrap();
+
+        let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        let rules = restored.list_rules().await;
+        assert_eq!(
+            rules
+                .iter()
+                .map(|rule| (rule.id.as_str(), rule.priority))
+                .collect::<Vec<_>>(),
+            vec![("second", 0), ("first", 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn category_rules_receive_normalized_mime_from_successful_probe() {
+        let scheduler = Scheduler::new(None);
+        scheduler
+            .create_rule(CategoryRule {
+                id: "video".into(),
+                name: "Video".into(),
+                match_type: crate::engine::rules::MatchType::MimeType,
+                patterns: vec!["video/*".into()],
+                save_path: "media".into(),
+                enabled: true,
+                priority: 0,
+            })
+            .await
+            .unwrap();
+        let task = scheduler
+            .prepare_http_task(
+                "https://example.com/download".into(),
+                "fallback".into(),
+                Some("movie.bin".into()),
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(10),
+                    suggested_filename: "movie.bin".into(),
+                    final_url: "https://example.com/download".into(),
+                    mime: Some("video/mp4".into()),
+                    ..Default::default()
+                }),
+                false,
+                None,
+                Vec::new(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(task.save_path, "media/movie.bin");
     }
 
     #[tokio::test]

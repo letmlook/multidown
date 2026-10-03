@@ -356,8 +356,7 @@ async fn set_schedule_enabled(
     enabled: bool,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<(), String> {
-    state.set_schedule_enabled(enabled).await;
-    Ok(())
+    state.set_schedule_enabled(enabled).await
 }
 
 /// 列出所有计划任务
@@ -376,16 +375,19 @@ async fn get_schedule_tasks(
 /// - `end_time`: 结束时间（限速时段用，可选）
 /// - `speed_limit_kbps`: 限速值 KB/s（限速类型用）
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command fields are intentionally flat for IPC.
 async fn create_schedule_task(
     name: String,
     schedule_type: engine::schedule::ScheduleType,
     recurrence: engine::schedule::Recurrence,
+    scheduled_date: Option<String>,
     start_time: String,
     end_time: Option<String>,
     speed_limit_kbps: Option<u32>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<engine::schedule::ScheduleRule, String> {
     let mut rule = engine::schedule::ScheduleRule::new(name, schedule_type, recurrence, start_time);
+    rule.scheduled_date = scheduled_date;
     rule.end_time = end_time;
     rule.speed_limit_kbps = speed_limit_kbps;
     state.create_schedule_task(rule).await
@@ -2080,7 +2082,13 @@ pub fn run() {
                     loop {
                         interval.tick().await;
                         let now = chrono::Local::now();
-                        let events = sched_tick.schedule_manager().tick(&now).await;
+                        let events = match sched_tick.schedule_manager().tick(&now).await {
+                            Ok(events) => events,
+                            Err(error) => {
+                                eprintln!("[persistence-error] schedule tick: {error}");
+                                continue;
+                            }
+                        };
                         if events.is_empty() {
                             continue;
                         }
