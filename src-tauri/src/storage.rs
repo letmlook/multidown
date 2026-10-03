@@ -62,10 +62,11 @@ pub fn load_store<T>(
     let parsed = serde_json::from_slice::<Value>(&bytes);
     let (schema_version, value) = match parsed {
         Ok(value) => {
-            if value
-                .as_object()
-                .is_some_and(|object| object.contains_key("schema_version"))
-            {
+            if value.as_object().is_some_and(|object| {
+                object.contains_key("schema_version")
+                    && object.contains_key("written_at")
+                    && object.contains_key("data")
+            }) {
                 match serde_json::from_value::<VersionedEnvelope<Value>>(value) {
                     Ok(envelope)
                         if chrono::DateTime::parse_from_rfc3339(&envelope.written_at).is_ok() =>
@@ -92,7 +93,7 @@ pub fn load_store<T>(
     };
     let (data, mut warnings) = migrate(schema_version, value)?;
     let rejected: Vec<Value> = warnings.iter().filter_map(|warning| warning.rejected_value.as_ref().map(|value| {
-        serde_json::json!({ "record_key": warning.record_key, "message": warning.message, "value": value })
+        serde_json::json!({ "id": warning.id, "domain": warning.domain, "record_key": warning.record_key, "message": warning.message, "value": value })
     })).collect();
     let recovery_path = if rejected.is_empty() {
         None
@@ -119,6 +120,9 @@ pub fn save_store<T: Serialize>(
     schema_version: u32,
     data: &T,
 ) -> Result<(), StoreError> {
+    if schema_version < 1 {
+        return Err(StoreError::UnsupportedVersion(schema_version));
+    }
     let envelope = VersionedEnvelope {
         schema_version,
         written_at: chrono::Utc::now().to_rfc3339(),
@@ -230,8 +234,91 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     if FAIL_REPLACE.with(|flag| flag.replace(false)) {
         return Err(std::io::Error::other("injected replace failure"));
     }
-    fs::rename(source, destination)
+    #[cfg(windows)]
+    {
+        windows_atomic::replace(source, destination)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+    }
 }
+
+// BEGIN WINDOWS ATOMIC REPLACE
+#[cfg(windows)]
+mod windows_atomic {
+    use std::{io, os::windows::ffi::OsStrExt, path::Path};
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+
+    pub(super) fn replace(source: &Path, destination: &Path) -> io::Result<()> {
+        fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path contains a NUL",
+                ));
+            }
+            wide.push(0);
+            Ok(wide)
+        }
+        let source = wide_path(source)?;
+        let destination = wide_path(destination)?;
+        // Same-directory temporary files ensure a same-volume rename. Deliberately
+        // omit COPY_ALLOWED: copying then deleting cannot provide atomic replacement.
+        // SAFETY: both buffers contain valid, NUL-terminated UTF-16 and remain alive
+        // for the synchronous Win32 call. No handles or pointers escape the call.
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        #[test]
+        fn replaces_existing_unicode_destination_without_deleting_first() {
+            let directory = std::env::temp_dir().join(format!(
+                "multidown-win-replace-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&directory).unwrap();
+            let source = directory.join("新.tmp");
+            let destination = directory.join("旧.json");
+            fs::write(&source, b"new content").unwrap();
+            fs::write(&destination, b"old content").unwrap();
+            super::replace(&source, &destination).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"new content");
+            assert!(!source.exists());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+}
+// END WINDOWS ATOMIC REPLACE
 
 #[cfg(test)]
 mod tests {
@@ -285,6 +372,72 @@ mod tests {
         .unwrap();
         assert_eq!(report.data, json!(["legacy"]));
         assert_eq!(report.schema_version, 0);
+    }
+
+    #[test]
+    fn rejects_schema_zero_before_creating_files_or_rotating_backups() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path(), b"old store").unwrap();
+        fs::write(fixture.0.join("tasks.json.bak"), b"old backup").unwrap();
+        assert!(matches!(
+            save_store(&fixture.path(), 0, &json!(["new"])),
+            Err(StoreError::UnsupportedVersion(0))
+        ));
+        assert_eq!(fs::read(fixture.path()).unwrap(), b"old store");
+        assert_eq!(
+            fs::read(fixture.0.join("tasks.json.bak")).unwrap(),
+            b"old backup"
+        );
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
+        let absent = fixture.0.join("absent").join("tasks.json");
+        assert!(save_store(&absent, 0, &json!([])).is_err());
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn legacy_objects_with_envelope_field_names_remain_version_zero() {
+        let fixture = Fixture::new();
+        for legacy in [
+            json!({"schema_version": 7, "name": "legacy"}),
+            json!({"schema_version": 7, "data": ["legacy"]}),
+            json!({"schema_version": 7, "written_at": "legacy"}),
+        ] {
+            fs::write(fixture.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let report = load_store(&fixture.path(), "tasks", |version, data| {
+                assert_eq!(version, 0);
+                Ok((data, vec![]))
+            })
+            .unwrap();
+            assert_eq!(report.data, legacy);
+            assert!(report.migrated);
+            assert!(report.recovery_path.is_none());
+        }
+    }
+
+    #[test]
+    fn quarantine_preserves_stable_id_domain_and_record_metadata() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path(), r#"[42]"#).unwrap();
+        let report = load_store(&fixture.path(), "tasks", |_, _| {
+            Ok((
+                Vec::<String>::new(),
+                vec![RecoveryWarning {
+                    id: "tasks-record-0".into(),
+                    domain: "tasks".into(),
+                    record_key: Some("0".into()),
+                    message: "invalid task".into(),
+                    recovery_path: None,
+                    rejected_value: Some(json!(42)),
+                }],
+            ))
+        })
+        .unwrap();
+        let quarantined: Value =
+            serde_json::from_slice(&fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            quarantined,
+            json!([{"id": "tasks-record-0", "domain": "tasks", "record_key": "0", "message": "invalid task", "value": 42}])
+        );
     }
 
     #[test]
