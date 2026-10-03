@@ -39,6 +39,75 @@ pub struct BatchJob {
     pub save_dir: Option<String>,
 }
 
+/// Durable batch inputs and task membership. Progress summaries are recomputed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchJobRecord {
+    pub id: String,
+    pub name: String,
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub template: String,
+    #[serde(default)]
+    pub start_index: usize,
+    pub save_dir: Option<String>,
+    pub task_ids: Vec<String>,
+    pub created_at: i64,
+    #[serde(default = "pending_batch_status")]
+    pub status: BatchStatus,
+}
+
+fn pending_batch_status() -> BatchStatus {
+    BatchStatus::Pending
+}
+
+impl From<&BatchJob> for BatchJobRecord {
+    fn from(job: &BatchJob) -> Self {
+        Self {
+            id: job.id.clone(),
+            name: job.name.clone(),
+            urls: job.urls.clone(),
+            template: job.template.clone(),
+            start_index: job.start_index,
+            save_dir: job.save_dir.clone(),
+            task_ids: job.task_ids.clone(),
+            created_at: job.created_at,
+            status: job.status,
+        }
+    }
+}
+
+impl From<BatchJobRecord> for BatchJob {
+    fn from(record: BatchJobRecord) -> Self {
+        Self {
+            total_count: record.urls.len(),
+            added_count: record.task_ids.len().min(record.urls.len()),
+            id: record.id,
+            name: record.name,
+            urls: record.urls,
+            template: record.template,
+            start_index: record.start_index,
+            save_dir: record.save_dir,
+            task_ids: record.task_ids,
+            created_at: record.created_at,
+            status: record.status,
+        }
+    }
+}
+
+pub fn batches_path(app_data_dir: &std::path::Path) -> std::path::PathBuf {
+    app_data_dir.join("batches.json")
+}
+
+pub fn load_batches_report(path: &std::path::Path) -> Result<crate::storage::LoadReport<Vec<BatchJobRecord>>, crate::storage::StoreError> {
+    super::rules_persistence::load_records(path, "batches", |value| {
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    })
+}
+
+pub async fn save_batches(path: &std::path::Path, batches: &[BatchJobRecord]) -> std::io::Result<()> {
+    crate::storage::save_store(path, 1, &batches).map_err(std::io::Error::other)
+}
+
 impl BatchJob {
     pub fn new(
         name: String,
@@ -552,6 +621,49 @@ fn probe_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn minimal_batch_fixture_round_trips_and_quarantines_summary_only_record() {
+        let dir = std::env::temp_dir().join(format!("batches-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = batches_path(&dir);
+        std::fs::write(&path, r#"[{"id":"batch-1","name":"Files","urls":["https://example.com/a"],"save_dir":"/files","task_ids":["task-1"],"created_at":1700000000},{"id":"summary-only","name":"Missing sources","total_count":4,"added_count":2,"created_at":1700000000,"status":"paused"}]"#).unwrap();
+        let report = load_batches_report(&path).unwrap();
+        assert_eq!(report.data.len(), 1);
+        assert!(report.migrated);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].record_key.as_deref(), Some("summary-only"));
+        let job: BatchJob = report.data[0].clone().into();
+        assert_eq!(job.total_count, 1);
+        assert_eq!(job.added_count, 1);
+        assert_eq!(job.save_dir.as_deref(), Some("/files"));
+        let record = BatchJobRecord::from(&job);
+        save_batches(&path, &[record]).await.unwrap();
+        let reloaded = load_batches_report(&path).unwrap();
+        assert!(!reloaded.migrated);
+        assert!(reloaded.warnings.is_empty());
+        assert_eq!(reloaded.data[0].task_ids, vec!["task-1"]);
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        for field in ["total_count", "added_count", "task_count", "completed_count", "failed_count"] {
+            assert!(disk["data"][0].get(field).is_none());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn complete_batch_record_preserves_source_and_omits_derived_counts() {
+        let legacy = r#"{"id":"batch-1","name":"Videos","urls":["https://example.com/a.mp4"],"template":"video_{n}.mp4","start_index":7,"save_dir":"/videos","task_ids":["task-1"],"created_at":1700000000,"status":"paused","total_count":1,"added_count":1,"task_count":1,"completed_count":0,"failed_count":0}"#;
+        let record: BatchJobRecord = serde_json::from_str(legacy).unwrap();
+        let job: BatchJob = record.into();
+        assert_eq!(job.template, "video_{n}.mp4");
+        assert_eq!(job.start_index, 7);
+        assert_eq!(job.task_ids, vec!["task-1"]);
+        assert_eq!(job.created_at, 1700000000);
+        assert_eq!(job.status, BatchStatus::Paused);
+        let persisted = serde_json::to_value(BatchJobRecord::from(&job)).unwrap();
+        assert_eq!(persisted["urls"], serde_json::json!(["https://example.com/a.mp4"]));
+        assert_eq!(persisted["save_dir"], "/videos");
+        assert!(persisted.get("completed_count").is_none());
+    }
 
     #[test]
     fn test_parse_url_list() {

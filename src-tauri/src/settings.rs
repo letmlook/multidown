@@ -1,7 +1,46 @@
 //! 应用设置：持久化与加载
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_settings_field_is_quarantined_while_valid_fields_survive() {
+        let dir = std::env::temp_dir().join(format!("settings-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"default_save_path":"/keep","max_concurrent_tasks":"broken"}"#).unwrap();
+        let report = load_settings_report(&path).unwrap();
+        assert_eq!(report.data.default_save_path, "/keep");
+        assert_eq!(report.data.max_concurrent_tasks, 8);
+        assert_eq!(report.warnings.len(), 1);
+        let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+        assert_eq!(rejected[0]["record_key"], "max_concurrent_tasks");
+        assert_eq!(rejected[0]["value"], "broken");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn legacy_settings_preserve_values_in_versioned_store() {
+        let dir = std::env::temp_dir().join(format!("settings-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let legacy = r#"{"default_save_path":"/downloads","max_connections_per_task":4,"max_concurrent_tasks":2,"run_at_startup":false,"clipboard_monitor":true,"show_start_dialog":true,"show_complete_dialog":false,"duplicate_action":"skip","user_agent":"legacy-agent","use_last_save_path":true,"proxy_type":"none","proxy_host":"","proxy_port":8080,"notification_on_complete":true,"notification_on_fail":false,"timeout_secs":45,"save_progress_interval_secs":60}"#;
+        std::fs::write(&path, legacy).unwrap();
+        let settings = load_settings(&path).unwrap();
+        assert_eq!(settings.default_save_path, "/downloads");
+        assert_eq!(settings.max_retries, 3);
+        save_settings(&path, &settings).await.unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"]["user_agent"], "legacy-agent");
+        assert_eq!(load_settings(&path).unwrap().max_concurrent_tasks, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use crate::storage::{load_store, save_store, LoadReport, RecoveryWarning, StoreError};
 
 pub mod proxy;
 
@@ -174,14 +213,39 @@ pub fn settings_path(app_data_dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 pub fn load_settings(path: &Path) -> Result<AppSettings, Box<dyn std::error::Error + Send + Sync>> {
-    let s = std::fs::read_to_string(path)?;
-    serde_json::from_str(&s).map_err(Into::into)
+    Ok(load_settings_report(path)?.data)
+}
+
+pub fn load_settings_report(path: &Path) -> Result<LoadReport<AppSettings>, StoreError> {
+    load_store(path, "settings", |version, value| {
+        if version > 1 {
+            return Err(StoreError::UnsupportedVersion(version));
+        }
+        let fields = value.as_object().ok_or_else(|| StoreError::InvalidEnvelope("settings data must be an object".into()))?;
+        let mut accepted = serde_json::to_value(AppSettings::default())?;
+        let mut warnings = vec![];
+        for (key, field) in fields {
+            if accepted.get(key).is_none() {
+                continue;
+            }
+            let mut candidate = accepted.clone();
+            candidate[key] = field.clone();
+            match serde_json::from_value::<AppSettings>(candidate.clone()) {
+                Ok(_) => accepted = candidate,
+                Err(error) => warnings.push(RecoveryWarning {
+                    id: format!("settings-field-{key}"),
+                    domain: "settings".into(),
+                    message: error.to_string(),
+                    recovery_path: None,
+                    record_key: Some(key.clone()),
+                    rejected_value: Some(field.clone()),
+                }),
+            }
+        }
+        Ok((serde_json::from_value(accepted)?, warnings))
+    })
 }
 
 pub async fn save_settings(path: &Path, settings: &AppSettings) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(settings).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    tokio::fs::write(path, json).await
+    save_store(path, 1, settings).map_err(std::io::Error::other)
 }

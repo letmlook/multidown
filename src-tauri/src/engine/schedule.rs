@@ -21,7 +21,7 @@ pub enum ScheduleType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(from = "RecurrenceWire", into = "RecurrenceWire")]
 #[allow(dead_code)]
 pub enum Recurrence {
     Once,       // 仅一次
@@ -29,6 +29,40 @@ pub enum Recurrence {
     Weekdays,   // 工作日（周一至周五）
     Weekends,   // 周末（周六、周日）
     Weekly(Vec<Weekday>), // 指定天列表
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RecurrenceWire {
+    Once,
+    Daily,
+    Weekdays,
+    Weekends,
+    Weekly { days: Vec<Weekday> },
+}
+
+impl From<RecurrenceWire> for Recurrence {
+    fn from(value: RecurrenceWire) -> Self {
+        match value {
+            RecurrenceWire::Once => Self::Once,
+            RecurrenceWire::Daily => Self::Daily,
+            RecurrenceWire::Weekdays => Self::Weekdays,
+            RecurrenceWire::Weekends => Self::Weekends,
+            RecurrenceWire::Weekly { days } => Self::Weekly(days),
+        }
+    }
+}
+
+impl From<Recurrence> for RecurrenceWire {
+    fn from(value: Recurrence) -> Self {
+        match value {
+            Recurrence::Once => Self::Once,
+            Recurrence::Daily => Self::Daily,
+            Recurrence::Weekdays => Self::Weekdays,
+            Recurrence::Weekends => Self::Weekends,
+            Recurrence::Weekly(days) => Self::Weekly { days },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,30 +311,68 @@ fn schedule_rules_path(app_data_dir: &std::path::Path) -> std::path::PathBuf {
 pub 
 fn load_schedule_rules(app_data_dir: &std::path::Path) -> Vec<ScheduleRule> {
     let path = schedule_rules_path(app_data_dir);
-    if !path.exists() {
-        return Vec::new();
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
+    load_schedule_rules_report(&path).map(|report| report.data).unwrap_or_default()
+}
+
+pub fn load_schedule_rules_report(path: &std::path::Path) -> Result<crate::storage::LoadReport<Vec<ScheduleRule>>, crate::storage::StoreError> {
+    super::rules_persistence::load_records(path, "schedules", |mut value| {
+        if let Some(recurrence) = value.get_mut("recurrence") {
+            if let Some(kind) = recurrence.as_str() {
+                *recurrence = serde_json::json!({"type": kind});
+            } else if let Some(days) = recurrence.get("weekly").cloned() {
+                *recurrence = serde_json::json!({"type": "weekly", "days": days});
+            }
+        }
+        let rule: ScheduleRule = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        let valid_time = |time: &str| chrono::NaiveTime::parse_from_str(time, "%H:%M")
+            .is_ok_and(|parsed| parsed.format("%H:%M").to_string() == time);
+        if !valid_time(&rule.start_time) || rule.end_time.as_deref().is_some_and(|time| !valid_time(time)) {
+            return Err("schedule time must be HH:MM within 00:00..23:59".into());
+        }
+        Ok(rule)
+    })
 }
 
 #[allow(dead_code)]
 pub async 
 fn save_schedule_rules(app_data_dir: &std::path::Path, rules: &[ScheduleRule]) -> std::io::Result<()> {
     let path = schedule_rules_path(app_data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(rules)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    tokio::fs::write(&path, json).await
+    crate::storage::save_store(&path, 1, &rules).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_schedule_time_is_quarantined_without_losing_valid_rule() {
+        let dir = std::env::temp_dir().join(format!("schedules-recovery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("schedules.json");
+        std::fs::write(&path, r#"[{"id":"valid","name":"Daily","enabled":true,"schedule_type":"start_download","recurrence":"daily","start_time":"08:00"},{"id":"bad","name":"Bad","enabled":true,"schedule_type":"pause_all","recurrence":"daily","start_time":"28:00"}]"#).unwrap();
+        let report = load_schedule_rules_report(&path).unwrap();
+        assert_eq!(report.data.len(), 1);
+        assert_eq!(report.data[0].id, "valid");
+        assert_eq!(report.warnings[0].record_key.as_deref(), Some("bad"));
+        let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+        assert_eq!(rejected[0]["value"]["start_time"], "28:00");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn legacy_recurrence_forms_migrate_to_tagged_store() {
+        let dir = std::env::temp_dir().join(format!("schedules-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = schedule_rules_path(&dir);
+        std::fs::write(&path, r#"[{"id":"daily","name":"Daily","enabled":true,"schedule_type":"start_download","recurrence":"daily","start_time":"08:00","end_time":null,"speed_limit_kbps":null},{"id":"weekly","name":"Weekly","enabled":true,"schedule_type":"pause_all","recurrence":{"weekly":["Mon","Fri"]},"start_time":"23:00","end_time":null,"speed_limit_kbps":null},{"id":"react","name":"React","enabled":true,"schedule_type":"resume_all","recurrence":{"type":"daily"},"start_time":"09:00","end_time":null,"speed_limit_kbps":null},{"id":"react-weekly","name":"React Weekly","enabled":true,"schedule_type":"pause_all","recurrence":{"type":"weekly","days":["Tue"]},"start_time":"10:00","end_time":null,"speed_limit_kbps":null}]"#).unwrap();
+        let rules = load_schedule_rules(&dir);
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[1].recurrence, Recurrence::Weekly(vec![Weekday::Mon, Weekday::Fri]));
+        save_schedule_rules(&dir, &rules).await.unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"][1]["recurrence"], serde_json::json!({"type":"weekly","days":["Mon","Fri"]}));
+        assert_eq!(load_schedule_rules(&dir).len(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use chrono::TimeZone;
 
     fn local_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {

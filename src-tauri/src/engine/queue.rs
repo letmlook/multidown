@@ -154,6 +154,19 @@ pub struct QueueManager {
     active_queue_id: String,
 }
 
+pub fn load_queues_report(path: &std::path::Path) -> Result<crate::storage::LoadReport<Vec<DownloadQueue>>, crate::storage::StoreError> {
+    super::rules_persistence::load_records(path, "queues", |value| {
+        let queue: DownloadQueue = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if queue.active_hours.as_ref().is_some_and(|hours| {
+            hours.start_hour >= 24 || hours.end_hour >= 24
+                || hours.start_minute >= 60 || hours.end_minute >= 60
+        }) {
+            return Err("queue active hours exceed valid clock ranges".into());
+        }
+        Ok(queue)
+    })
+}
+
 #[allow(dead_code)]
 impl QueueManager {
     pub fn new() -> Self {
@@ -172,8 +185,11 @@ impl QueueManager {
 
     /// Load from persisted file
     pub fn load_from(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let content = std::fs::read_to_string(path)?;
-        let queues_vec: Vec<DownloadQueue> = serde_json::from_str(&content)?;
+        let queues_vec = load_queues_report(path)?.data;
+
+        let default_queue_id = queues_vec.iter().filter(|q| !q.deleted)
+            .min_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)))
+            .map(|q| q.id.clone()).unwrap_or_default();
 
         let mut queues = HashMap::new();
         for q in queues_vec {
@@ -181,7 +197,6 @@ impl QueueManager {
             queues.insert(id.clone(), Arc::new(Mutex::new(q)));
         }
 
-        let default_queue_id = queues.keys().next().cloned().unwrap_or_default();
         let active_queue_id = default_queue_id.clone();
 
         Ok(Self {
@@ -193,18 +208,15 @@ impl QueueManager {
 
     /// Save queues to file
     pub async fn save_to(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let queues_snapshot: Vec<DownloadQueue> = {
+        let mut queues_snapshot: Vec<DownloadQueue> = {
             let mut snap = Vec::new();
             for q in self.queues.values() {
                 snap.push(q.lock().clone());
             }
             snap
         };
-        let json = serde_json::to_string_pretty(&queues_snapshot)?;
-        std::fs::write(path, json)
+        queues_snapshot.sort_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)));
+        crate::storage::save_store(path, 1, &queues_snapshot).map_err(std::io::Error::other)
     }
 
     /// Get a specific queue
@@ -348,6 +360,34 @@ pub fn new_queue_manager() -> GlobalQueueManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invalid_queue_hours_are_quarantined_without_losing_membership() {
+        let dir = std::env::temp_dir().join(format!("queues-recovery-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queues.json");
+        std::fs::write(&path, r#"[{"id":"valid","name":"Queue","max_concurrent":2,"priority":0,"task_ids":["task-1"],"is_paused":false,"deleted":false,"active_hours":null,"active_days":[]},{"id":"bad","name":"Bad","max_concurrent":2,"priority":1,"task_ids":[],"is_paused":false,"deleted":false,"active_hours":{"start_hour":25,"start_minute":0,"end_hour":1,"end_minute":0},"active_days":[]}]"#).unwrap();
+        let report = load_queues_report(&path).unwrap();
+        assert_eq!(report.data.len(), 1);
+        assert_eq!(report.data[0].task_ids, vec!["task-1"]);
+        assert_eq!(report.warnings[0].record_key.as_deref(), Some("bad"));
+        assert!(report.recovery_path.unwrap().exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn legacy_queue_array_preserves_membership_in_versioned_store() {
+        let dir = std::env::temp_dir().join(format!("queues-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queues.json");
+        std::fs::write(&path, r#"[{"id":"queue-1","name":"Night","max_concurrent":2,"priority":0,"task_ids":["task-1"],"is_paused":true,"deleted":false,"active_hours":{"start_hour":23,"start_minute":0,"end_hour":1,"end_minute":0},"active_days":["monday"]}]"#).unwrap();
+        let manager = QueueManager::load_from(&path).unwrap();
+        assert_eq!(manager.queues["queue-1"].lock().task_ids, vec!["task-1"]);
+        manager.save_to(&path).await.unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"][0]["id"], "queue-1");
+        assert!(QueueManager::load_from(&path).unwrap().queues["queue-1"].lock().is_paused);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn reorder_queues_updates_priority_to_match_requested_order() {
