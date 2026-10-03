@@ -82,9 +82,14 @@ pub fn tasks_from_json(s: &str) -> Result<Vec<PersistedTask>, serde_json::Error>
     } else {
         (0, value)
     };
-    migrate_tasks(version, data)
-        .map(|(tasks, _)| tasks)
-        .map_err(|error| <serde_json::Error as serde::de::Error>::custom(error.to_string()))
+    if version > 1 {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            StoreError::UnsupportedVersion(version).to_string(),
+        ));
+    }
+    // The string-only compatibility API cannot report or preserve rejected records.
+    // Keep its historical all-or-nothing contract; disk recovery uses migrate_tasks.
+    serde_json::from_value(data)
 }
 
 pub async fn save_tasks_to_file(
@@ -156,7 +161,7 @@ impl Task {
             filename: p.filename,
             total_bytes: p.total_bytes,
             downloaded: Arc::new(AtomicU64::new(p.downloaded_bytes)),
-            status: Arc::new(Mutex::new(recovery_status(p.status))),
+            status: Arc::new(Mutex::new(p.status)),
             error_message: Arc::new(Mutex::new(None)),
             pending_segments: Arc::new(Mutex::new(VecDeque::from(p.pending_segments))),
             supports_range: p.supports_range,
@@ -232,6 +237,44 @@ mod tests {
     }
 
     #[test]
+    fn json_helper_rejects_invalid_sibling_in_legacy_and_versioned_data() {
+        let mut fixture: serde_json::Value = serde_json::from_str(LEGACY_JSON).unwrap();
+        fixture
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id":"bad"}));
+        assert!(tasks_from_json(&fixture.to_string()).is_err());
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "written_at": "2026-10-03T12:00:00Z",
+            "data": fixture
+        });
+        assert!(tasks_from_json(&envelope.to_string()).is_err());
+    }
+
+    #[test]
+    fn live_snapshot_conversion_keeps_downloading() {
+        let task = Task::new(
+            crate::engine::types::CreateTaskInput {
+                url: "https://example.com/live.zip".into(),
+                save_dir: "/tmp".into(),
+                ..Default::default()
+            },
+            true,
+            Some(100),
+        );
+        futures_block_on(async {
+            *task.status.lock().await = TaskStatus::Downloading;
+        });
+        let snapshot = futures_block_on(PersistedTaskV1::from_task(&task));
+        let live = Task::from_persisted(snapshot);
+        assert_eq!(
+            futures_block_on(async { *live.status.lock().await }),
+            TaskStatus::Downloading
+        );
+    }
+
+    #[test]
     fn legacy_downloading_is_a_recovery_candidate() {
         let json = LEGACY_JSON.replace("\"paused\"", "\"downloading\"");
         let tasks = tasks_from_json(&json).unwrap();
@@ -241,6 +284,13 @@ mod tests {
             serde_json::to_value(futures_block_on(async { *restored.status.lock().await }))
                 .unwrap(),
             "recovering"
+        );
+        let directory = TestDirectory::new();
+        let path = directory.path().join("tasks.json");
+        std::fs::write(&path, json).unwrap();
+        assert_eq!(
+            load_tasks_report(&path).unwrap().data[0].status,
+            TaskStatus::Recovering
         );
     }
 
