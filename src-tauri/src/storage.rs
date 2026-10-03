@@ -94,8 +94,9 @@ pub fn load_store<T: Serialize>(
         Err(error) => return Err(preserve_corrupt(path, domain, &bytes, error.to_string())?),
     };
     let (data, mut warnings) = migrate(schema_version, value)?;
+    let source_path = serde_json::to_value(std::path::absolute(path)?)?;
     let rejected: Vec<Value> = warnings.iter().filter_map(|warning| warning.rejected_value.as_ref().map(|value| {
-        serde_json::json!({ "id": warning.id, "domain": warning.domain, "record_key": warning.record_key, "message": warning.message, "value": value })
+        serde_json::json!({ "source_path": source_path, "id": warning.id, "domain": warning.domain, "record_key": warning.record_key, "message": warning.message, "value": value })
     })).collect();
     let recovery_path = if rejected.is_empty() {
         None
@@ -159,8 +160,13 @@ pub fn save_store<T: Serialize>(
             .write(true)
             .open(suffixed_path(path, ".bak"))?
             .sync_all()?;
+        // Persist backup names before replacing the current source.
+        sync_directory(parent)?;
     }
     replace_file(&temporary, path)?;
+    // If this fails, the complete new file is already visible; report the
+    // durability failure without claiming that the replacement was rolled back.
+    sync_directory(parent)?;
     drop(guard);
     Ok(())
 }
@@ -169,6 +175,34 @@ fn parent_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        DIRECTORY_SYNC_PATHS.with(|paths| paths.borrow_mut().push(path.to_owned()));
+        let call = DIRECTORY_SYNC_CALLS.with(|calls| {
+            let call = calls.get() + 1;
+            calls.set(call);
+            call
+        });
+        if FAIL_DIRECTORY_SYNC_AT.with(|failure| failure.get() == Some(call)) {
+            return Err(std::io::Error::other("injected directory sync failure"));
+        }
+    }
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Rust/Win32 provides no portable directory fsync equivalent. Windows
+        // keeps MoveFileExW(MOVEFILE_WRITE_THROUGH); other non-Unix targets have
+        // no directory synchronization implementation. This explicit no-op
+        // does not claim parent-directory power-loss durability on those targets.
+        let _ = path;
+        Ok(())
+    }
 }
 
 fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
@@ -220,6 +254,10 @@ fn write_recovery(path: &Path, bytes: &[u8]) -> Result<PathBuf, StoreError> {
     file.write_all(bytes)?;
     file.flush()?;
     file.sync_all()?;
+    drop(file);
+    // Quarantine metadata must be durable before a legacy migration replaces
+    // the source containing the only original copy of rejected records.
+    sync_directory(parent_directory(path))?;
     guard.0.take();
     Ok(recovery)
 }
@@ -234,7 +272,12 @@ impl Drop for TemporaryFile {
 }
 
 #[cfg(test)]
-thread_local! { static FAIL_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! {
+    static FAIL_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DIRECTORY_SYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DIRECTORY_SYNC_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    static FAIL_DIRECTORY_SYNC_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 
 fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(test)]
@@ -467,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_preserves_stable_id_domain_and_record_metadata() {
+    fn quarantine_preserves_actual_source_path_and_record_metadata() {
         let fixture = Fixture::new();
         fs::write(fixture.path(), r#"[42]"#).unwrap();
         let report = load_store(&fixture.path(), "tasks", |_, _| {
@@ -488,8 +531,105 @@ mod tests {
             serde_json::from_slice(&fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
         assert_eq!(
             quarantined,
-            json!([{"id": "tasks-record-0", "domain": "tasks", "record_key": "0", "message": "invalid task", "value": 42}])
+            json!([{"source_path": fixture.path(), "id": "tasks-record-0", "domain": "tasks", "record_key": "0", "message": "invalid task", "value": 42}])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_sync_parent_after_backup_and_final_replace() {
+        let fixture = Fixture::new();
+        DIRECTORY_SYNC_CALLS.with(|calls| calls.set(0));
+        DIRECTORY_SYNC_PATHS.with(|paths| paths.borrow_mut().clear());
+        save_store(&fixture.path(), 1, &json!(["old"])).unwrap();
+        assert_eq!(DIRECTORY_SYNC_CALLS.with(|calls| calls.get()), 1);
+        DIRECTORY_SYNC_PATHS.with(|paths| assert_eq!(*paths.borrow(), vec![fixture.0.clone()]));
+        let original = fs::read(fixture.path()).unwrap();
+        DIRECTORY_SYNC_CALLS.with(|calls| calls.set(0));
+        DIRECTORY_SYNC_PATHS.with(|paths| paths.borrow_mut().clear());
+        save_store(&fixture.path(), 1, &json!(["new"])).unwrap();
+        assert_eq!(DIRECTORY_SYNC_CALLS.with(|calls| calls.get()), 2);
+        DIRECTORY_SYNC_PATHS
+            .with(|paths| assert_eq!(*paths.borrow(), vec![fixture.0.clone(), fixture.0.clone()]));
+        assert_eq!(
+            fs::read(fixture.0.join("tasks.json.bak")).unwrap(),
+            original
+        );
+        let disk: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        assert_eq!(disk["data"], json!(["new"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failures_propagate_at_each_write_boundary() {
+        for fail_at in [1, 2] {
+            let fixture = Fixture::new();
+            save_store(&fixture.path(), 1, &json!(["old"])).unwrap();
+            let original = fs::read(fixture.path()).unwrap();
+            fs::write(fixture.0.join("tasks.json.bak"), b"earlier backup").unwrap();
+            DIRECTORY_SYNC_CALLS.with(|calls| calls.set(0));
+            FAIL_DIRECTORY_SYNC_AT.with(|failure| failure.set(Some(fail_at)));
+            let result = save_store(&fixture.path(), 1, &json!(["new"]));
+            FAIL_DIRECTORY_SYNC_AT.with(|failure| failure.set(None));
+            assert!(
+                matches!(result, Err(StoreError::Io(_))),
+                "sync failure at boundary {fail_at} was ignored: {result:?}"
+            );
+            assert_eq!(DIRECTORY_SYNC_CALLS.with(|calls| calls.get()), fail_at);
+            assert_eq!(
+                fs::read(fixture.0.join("tasks.json.bak")).unwrap(),
+                original
+            );
+            assert_eq!(
+                fs::read(fixture.0.join("tasks.json.bak.1")).unwrap(),
+                b"earlier backup"
+            );
+            let disk: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+            assert_eq!(
+                disk["data"],
+                if fail_at == 1 {
+                    json!(["old"])
+                } else {
+                    json!(["new"])
+                }
+            );
+            assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".tmp")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_sync_failure_aborts_migration_without_losing_source() {
+        let fixture = Fixture::new();
+        let original = b"[42]";
+        fs::write(fixture.path(), original).unwrap();
+        DIRECTORY_SYNC_CALLS.with(|calls| calls.set(0));
+        FAIL_DIRECTORY_SYNC_AT.with(|failure| failure.set(Some(1)));
+        let result = load_store(&fixture.path(), "tasks", |_, _| {
+            Ok((
+                Vec::<String>::new(),
+                vec![RecoveryWarning {
+                    id: "tasks-record-0".into(),
+                    domain: "tasks".into(),
+                    record_key: Some("0".into()),
+                    message: "invalid task".into(),
+                    recovery_path: None,
+                    rejected_value: Some(json!(42)),
+                }],
+            ))
+        });
+        FAIL_DIRECTORY_SYNC_AT.with(|failure| failure.set(None));
+        assert!(
+            matches!(result, Err(StoreError::Io(_))),
+            "recovery directory sync failure was ignored: {result:?}"
+        );
+        assert_eq!(fs::read(fixture.path()).unwrap(), original);
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
     }
 
     #[test]
