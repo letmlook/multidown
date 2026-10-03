@@ -51,4 +51,11 @@ describe("BitTorrentSettings", () => {
     expect(update).toHaveBeenCalledOnce();
     expect(update).toHaveBeenCalledWith({ torrent_enable_dht: false });
   });
+
+  it("explains_that_peer_limit_changes_rebuild_the_live_session", () => {
+    render(<BitTorrentSettings {...baseProps} update={vi.fn()} />);
+
+    expect(screen.getByText(/peer 上限变更会安全重建当前 BT 会话/)).toBeInTheDocument();
+    expect(screen.queryByText(/监听端口 \/ DHT \/ 代理在重启应用后生效/)).not.toBeInTheDocument();
+  });
 });

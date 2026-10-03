@@ -3,7 +3,7 @@
 //! 完全不依赖公网、DHT 或 tracker —— 种子由 `librqbit::create_torrent` 现场生成，
 //! peer 通过 `initial_peers` 直连 127.0.0.1。因此可以直接进 CI。
 
-use super::engine::{TorrentEngine, TorrentEngineConfig, TorrentRunState};
+use super::engine::{ReconfigureOutcome, TorrentEngine, TorrentEngineConfig, TorrentRunState};
 
 use librqbit::{
     create_torrent, AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode,
@@ -359,4 +359,193 @@ async fn downloads_only_selected_files() {
 
     seeder.stop().await;
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_limit_reconfigure_reattaches_existing_torrent() {
+    let root =
+        std::env::temp_dir().join(format!("multidown-bt-reconfigure-{}", uuid::Uuid::new_v4()));
+    let source = root.join("source");
+    let download = root.join("download");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(source.join("payload.bin"), b"deterministic payload").unwrap();
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = create_torrent(
+        &source.join("payload.bin"),
+        CreateTorrentOptions {
+            name: Some("payload.bin"),
+            trackers: Vec::new(),
+            piece_length: Some(16 * 1024),
+        },
+        &spawner,
+    )
+    .await
+    .unwrap();
+    let torrent_bytes = created.as_bytes().unwrap().to_vec();
+    let cfg = TorrentEngineConfig {
+        default_download_dir: download.clone(),
+        state_dir: root.join("state-one"),
+        enable_dht: false,
+        disable_lsd: true,
+        listen_port: None,
+        download_bps: None,
+        upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
+        client_name: "MultiDown-reconfigure-test".into(),
+        initial_peers: Vec::new(),
+    };
+    let engine = TorrentEngine::new(cfg.clone()).await.unwrap();
+    let inspected = engine.inspect_bytes(torrent_bytes).await.unwrap();
+    engine
+        .add("kept", &inspected, &download, None, true)
+        .await
+        .unwrap();
+
+    let outcome = engine
+        .reconfigure_session(TorrentEngineConfig {
+            peer_limit: Some(1),
+            state_dir: root.join("state-two"),
+            ..cfg
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, ReconfigureOutcome::Rebuilt { reattached: 1 });
+    assert!(engine.handle("kept").is_some());
+    assert_eq!(
+        engine.snapshot("kept").unwrap().state,
+        TorrentRunState::Paused
+    );
+    engine.stop().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_reconfigure_keeps_old_session_and_handle_usable() {
+    let root = std::env::temp_dir().join(format!(
+        "multidown-bt-reconfigure-rollback-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = root.join("source");
+    let download = root.join("download");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(source.join("payload.bin"), b"rollback payload").unwrap();
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = create_torrent(
+        &source.join("payload.bin"),
+        CreateTorrentOptions {
+            name: Some("payload.bin"),
+            trackers: Vec::new(),
+            piece_length: Some(16 * 1024),
+        },
+        &spawner,
+    )
+    .await
+    .unwrap();
+    let cfg = TorrentEngineConfig {
+        default_download_dir: download.clone(),
+        state_dir: root.join("state"),
+        enable_dht: false,
+        disable_lsd: true,
+        listen_port: None,
+        download_bps: None,
+        upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
+        client_name: "MultiDown-rollback-test".into(),
+        initial_peers: Vec::new(),
+    };
+    let engine = TorrentEngine::new(cfg.clone()).await.unwrap();
+    let inspected = engine
+        .inspect_bytes(created.as_bytes().unwrap().to_vec())
+        .await
+        .unwrap();
+    engine
+        .add("kept", &inspected, &download, None, true)
+        .await
+        .unwrap();
+    let old_listen_addr = engine.listen_addr();
+    let invalid_parent = root.join("not-a-directory");
+    std::fs::write(&invalid_parent, b"file").unwrap();
+
+    let error = engine
+        .reconfigure_session(TorrentEngineConfig {
+            state_dir: invalid_parent.join("state"),
+            peer_limit: Some(1),
+            ..cfg
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("创建种子会话目录失败"));
+    assert_eq!(engine.listen_addr(), old_listen_addr);
+    assert!(engine.handle("kept").is_some());
+    engine.resume("kept").await.unwrap();
+    engine.pause("kept").await.unwrap();
+    engine.stop().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fastresume_reattachment_unpauses_only_when_explicitly_admitted() {
+    let root =
+        std::env::temp_dir().join(format!("multidown-bt-fastresume-{}", uuid::Uuid::new_v4()));
+    let source = root.join("source");
+    let download = root.join("download");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(source.join("payload.bin"), b"fastresume payload").unwrap();
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = create_torrent(
+        &source.join("payload.bin"),
+        CreateTorrentOptions {
+            name: Some("payload.bin"),
+            trackers: Vec::new(),
+            piece_length: Some(16 * 1024),
+        },
+        &spawner,
+    )
+    .await
+    .unwrap();
+    let torrent_bytes = created.as_bytes().unwrap().to_vec();
+    let cfg = TorrentEngineConfig {
+        default_download_dir: download.clone(),
+        state_dir: root.join("state"),
+        enable_dht: false,
+        disable_lsd: true,
+        listen_port: None,
+        download_bps: None,
+        upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
+        client_name: "MultiDown-fastresume-test".into(),
+        initial_peers: Vec::new(),
+    };
+    let first = TorrentEngine::new(cfg.clone()).await.unwrap();
+    let inspected = first.inspect_bytes(torrent_bytes.clone()).await.unwrap();
+    first
+        .add("before-restart", &inspected, &download, None, true)
+        .await
+        .unwrap();
+    first.stop().await;
+
+    let restored = TorrentEngine::new(cfg).await.unwrap();
+    assert!(
+        restored.restored_sessions_are_paused_for_test(),
+        "session restore must not bypass scheduler admission"
+    );
+    let inspected = restored.inspect_bytes(torrent_bytes).await.unwrap();
+    restored
+        .add("after-restart", &inspected, &download, None, false)
+        .await
+        .unwrap();
+    assert_ne!(
+        restored.snapshot("after-restart").unwrap().state,
+        TorrentRunState::Paused
+    );
+    restored.stop().await;
+    let _ = std::fs::remove_dir_all(root);
 }

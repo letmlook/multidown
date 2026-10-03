@@ -81,6 +81,9 @@ export function BitTorrentSettings({
           />
           <span style={{ color: "#666", fontSize: 12 }}>0 表示使用引擎默认值</span>
         </div>
+        <span style={{ color: "#666", fontSize: 12, marginTop: 4, display: "block" }}>
+          peer 上限变更会安全重建当前 BT 会话，并自动重新挂载任务；失败时保留原会话和设置。
+        </span>
       </div>
       <div className="form-group">
         <label htmlFor="torrent-seed-mode">做种策略（下载完成后）</label>
@@ -148,7 +151,7 @@ export function BitTorrentSettings({
           }}
         >
           仅支持 SOCKS5；配置后将强制关闭 DHT 与本地发现，避免真实 IP 经 UDP 泄漏。
-          监听端口 / DHT / 代理在重启应用后生效
+          会话级设置会安全重建当前 BT 会话，失败时不会保存新值。
         </span>
       </div>
       <div className="options-section" style={{ marginTop: 16 }}>

@@ -795,16 +795,70 @@ async fn get_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
 #[tauri::command]
 async fn set_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
     let path = app_settings_path(&app)?;
-    save_settings(&path, &settings)
-        .await
-        .map_err(|e| e.to_string())?;
-    // 同步引擎限制（全局并发/重试次数/重复链接策略）
     if let Some(scheduler) = app.try_state::<Arc<Scheduler>>() {
-        scheduler.update_from_settings(&settings);
+        persist_and_apply_settings(&path, scheduler.inner().as_ref(), &settings).await?;
+    } else {
+        save_settings(&path, &settings)
+            .await
+            .map_err(|error| error.to_string())?;
     }
     // 同步开机自启
     sync_autostart(&app, settings.run_at_startup);
     Ok(())
+}
+
+async fn persist_and_apply_settings(
+    path: &std::path::Path,
+    scheduler: &Scheduler,
+    settings: &AppSettings,
+) -> Result<(), String> {
+    let previous = scheduler.current_settings();
+    save_settings(path, settings)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(runtime_error) = scheduler.apply_settings(settings).await {
+        return match save_settings(path, &previous).await {
+            Ok(()) => Err(runtime_error),
+            Err(rollback_error) => Err(format!(
+                "{runtime_error}; restoring previous settings failed: {rollback_error}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod settings_transaction_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_runtime_reconfigure_restores_previous_settings_file() {
+        let root = std::env::temp_dir().join(format!(
+            "multidown-settings-transaction-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let old = AppSettings::default();
+        save_settings(&path, &old).await.unwrap();
+        let scheduler = Scheduler::new(Some(root.join("tasks.json")));
+        let engine = scheduler.torrent_engine().await.unwrap();
+        engine.fail_next_reconfigure_for_test();
+        let changed = AppSettings {
+            torrent_peer_limit: 13,
+            ..old.clone()
+        };
+
+        let error = persist_and_apply_settings(&path, &scheduler, &changed)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("injected torrent session rebuild failure"));
+        assert_eq!(load_settings(&path).unwrap().torrent_peer_limit, 0);
+        assert_eq!(scheduler.current_settings().torrent_peer_limit, 0);
+        engine.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 /// 按设置开启/关闭开机自启（失败仅记录日志，不影响设置保存）

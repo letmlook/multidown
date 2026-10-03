@@ -22,7 +22,7 @@ use crate::engine::{TaskId, TorrentFileInfo, TorrentMeta};
 use crate::torrent::detect::{self, InputProtocol};
 
 /// 引擎配置，由应用设置映射而来。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentEngineConfig {
     /// 会话默认下载目录（任务未单独指定时使用）
     pub default_download_dir: PathBuf,
@@ -137,20 +137,51 @@ impl TorrentProgress {
     }
 }
 
+pub type TorrentError = anyhow::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconfigureOutcome {
+    UpdatedInPlace,
+    Rebuilt { reattached: usize },
+}
+
+#[derive(Clone)]
+struct TorrentRegistration {
+    inspected: InspectedTorrent,
+    output_folder: PathBuf,
+    selected_files: Option<Vec<usize>>,
+    paused: bool,
+}
+
 pub struct TorrentEngine {
-    session: Arc<Session>,
+    session: Mutex<Arc<Session>>,
     /// 创建时的配置快照（add 时读取 peer_limit 等）
-    cfg: TorrentEngineConfig,
+    cfg: Mutex<TorrentEngineConfig>,
     /// task_id → librqbit 句柄
     handles: Mutex<HashMap<TaskId, Arc<ManagedTorrent>>>,
-    /// 手动注入的 peer（测试用；生产为空）
-    initial_peers: Vec<SocketAddr>,
+    registrations: Mutex<HashMap<TaskId, TorrentRegistration>>,
+    lifecycle: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    fail_next_reconfigure: std::sync::atomic::AtomicBool,
 }
 
 impl TorrentEngine {
     /// 创建会话。**必须在 tokio 运行时上下文里调用**
     /// （librqbit 的 `BlockingSpawner::new` 会取 `Handle::current()`）。
     pub async fn new(cfg: TorrentEngineConfig) -> Result<Self> {
+        let session = Self::build_session(&cfg).await?;
+        Ok(Self {
+            session: Mutex::new(session),
+            cfg: Mutex::new(cfg),
+            handles: Mutex::new(HashMap::new()),
+            registrations: Mutex::new(HashMap::new()),
+            lifecycle: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fail_next_reconfigure: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    async fn build_session(cfg: &TorrentEngineConfig) -> Result<Arc<Session>> {
         std::fs::create_dir_all(&cfg.state_dir)
             .with_context(|| format!("创建种子会话目录失败: {}", cfg.state_dir.display()))?;
         std::fs::create_dir_all(&cfg.default_download_dir).with_context(|| {
@@ -191,13 +222,23 @@ impl TorrentEngine {
         let session = Session::new_with_opts(cfg.default_download_dir.clone(), opts)
             .await
             .context("初始化 BitTorrent 会话失败")?;
-
-        Ok(Self {
-            session,
-            cfg: cfg.clone(),
-            handles: Mutex::new(HashMap::new()),
-            initial_peers: cfg.initial_peers.clone(),
-        })
+        // JSON persistence restores every previous torrent eagerly. Pause all
+        // of them before exposing the engine so scheduler queue/concurrency
+        // admission remains the only path that can resume network activity.
+        let restored = session.with_torrents(|torrents| {
+            torrents
+                .map(|(_, handle)| handle.clone())
+                .collect::<Vec<_>>()
+        });
+        for handle in restored {
+            if !matches!(handle.stats().state, TorrentStatsState::Paused) {
+                session
+                    .pause(&handle)
+                    .await
+                    .context("暂停自动恢复的种子任务失败")?;
+            }
+        }
+        Ok(session)
     }
 
     /// 只解析元数据，不创建下载任务（对应 `list_only`）。
@@ -226,8 +267,8 @@ impl TorrentEngine {
     }
 
     async fn inspect_add(&self, add: AddTorrent<'static>) -> Result<InspectedTorrent> {
-        let resp = self
-            .session
+        let session = self.session.lock().clone();
+        let resp = session
             .add_torrent(
                 add,
                 Some(AddTorrentOptions {
@@ -312,18 +353,20 @@ impl TorrentEngine {
         selected_files: Option<&[usize]>,
         paused: bool,
     ) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let cfg = self.cfg.lock().clone();
+        let session = self.session.lock().clone();
         let opts = AddTorrentOptions {
             // 允许在已有文件上继续；不做种/续传都需要它
             overwrite: true,
             output_folder: Some(output_folder.to_string_lossy().into_owned()),
             only_files: selected_files.map(|s| s.to_vec()),
             paused,
-            peer_limit: self.cfg.peer_limit,
-            initial_peers: (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone()),
+            peer_limit: cfg.peer_limit,
+            initial_peers: (!cfg.initial_peers.is_empty()).then(|| cfg.initial_peers.clone()),
             ..Default::default()
         };
-        let resp = self
-            .session
+        let resp = session
             .add_torrent(
                 AddTorrent::TorrentFileBytes(inspected.metainfo.clone().into()),
                 Some(opts),
@@ -333,12 +376,40 @@ impl TorrentEngine {
         let handle = resp
             .into_handle()
             .ok_or_else(|| anyhow!("引擎未返回种子句柄"))?;
+        Self::set_handle_paused(&session, &handle, paused).await?;
         self.handles.lock().insert(task_id.to_string(), handle);
+        self.registrations.lock().insert(
+            task_id.to_string(),
+            TorrentRegistration {
+                inspected: inspected.clone(),
+                output_folder: output_folder.to_path_buf(),
+                selected_files: selected_files.map(<[_]>::to_vec),
+                paused,
+            },
+        );
         Ok(())
     }
 
     pub fn handle(&self, task_id: &str) -> Option<Arc<ManagedTorrent>> {
         self.handles.lock().get(task_id).cloned()
+    }
+
+    async fn set_handle_paused(
+        session: &Arc<Session>,
+        handle: &Arc<ManagedTorrent>,
+        paused: bool,
+    ) -> Result<()> {
+        let state = handle.stats().state;
+        let is_paused = matches!(
+            state,
+            TorrentStatsState::Paused | TorrentStatsState::Initializing { paused: true }
+        );
+        match (paused, is_paused) {
+            (true, false) => session.pause(handle).await.context("暂停种子任务失败")?,
+            (false, true) => session.unpause(handle).await.context("恢复种子任务失败")?,
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self, task_id: &str) -> Option<TorrentProgress> {
@@ -375,66 +446,190 @@ impl TorrentEngine {
     }
 
     pub async fn pause(&self, task_id: &str) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if let Some(handle) = self.handle(task_id) {
-            self.session
-                .pause(&handle)
-                .await
-                .context("暂停种子任务失败")?;
+            let session = self.session.lock().clone();
+            Self::set_handle_paused(&session, &handle, true).await?;
+            if let Some(registration) = self.registrations.lock().get_mut(task_id) {
+                registration.paused = true;
+            }
         }
         Ok(())
     }
 
     pub async fn resume(&self, task_id: &str) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if let Some(handle) = self.handle(task_id) {
-            self.session
-                .unpause(&handle)
-                .await
-                .context("恢复种子任务失败")?;
+            let session = self.session.lock().clone();
+            Self::set_handle_paused(&session, &handle, false).await?;
+            if let Some(registration) = self.registrations.lock().get_mut(task_id) {
+                registration.paused = false;
+            }
         }
         Ok(())
     }
 
     /// 从会话中移除。`delete_files=false` 保留已下载数据，便于再次续传。
     pub async fn remove(&self, task_id: &str, delete_files: bool) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         let handle = self.handles.lock().remove(task_id);
         if let Some(handle) = handle {
-            self.session
+            let session = self.session.lock().clone();
+            session
                 .delete(handle.id().into(), delete_files)
                 .await
                 .context("移除种子任务失败")?;
         }
+        self.registrations.lock().remove(task_id);
         Ok(())
     }
 
     /// 运行中改变选中的文件集合。
     pub async fn select_files(&self, task_id: &str, files: &[usize]) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         if let Some(handle) = self.handle(task_id) {
             let set: HashSet<usize> = files.iter().copied().collect();
-            self.session
+            let session = self.session.lock().clone();
+            session
                 .update_only_files(&handle, &set)
                 .await
                 .context("更新选中文件失败")?;
+            if let Some(registration) = self.registrations.lock().get_mut(task_id) {
+                registration.selected_files = Some(files.to_vec());
+            }
         }
         Ok(())
     }
 
     /// 运行时限速（同步方法，可直接在设置变更时调用）。
     pub fn set_limits(&self, download_bps: Option<u32>, upload_bps: Option<u32>) {
-        self.session
+        let session = self.session.lock().clone();
+        session
             .ratelimits
             .set_download_bps(download_bps.and_then(NonZeroU32::new));
-        self.session
+        session
             .ratelimits
             .set_upload_bps(upload_bps.and_then(NonZeroU32::new));
+        let mut cfg = self.cfg.lock();
+        cfg.download_bps = download_bps;
+        cfg.upload_bps = upload_bps;
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
-        self.session.listen_addr()
+        self.session.lock().listen_addr()
+    }
+
+    /// Rebuild session-wide settings transactionally. The old session and all
+    /// of its handles remain untouched unless the replacement session and every
+    /// torrent reattachment have succeeded.
+    pub async fn reconfigure_session(
+        &self,
+        config: TorrentEngineConfig,
+    ) -> Result<ReconfigureOutcome, TorrentError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        #[cfg(test)]
+        if self
+            .fail_next_reconfigure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("injected torrent session rebuild failure"));
+        }
+        let current = self.cfg.lock().clone();
+        if current.session_equivalent(&config) {
+            self.set_limits(config.download_bps, config.upload_bps);
+            return Ok(ReconfigureOutcome::UpdatedInPlace);
+        }
+
+        let new_session = Self::build_session(&config).await?;
+        let registrations = self.registrations.lock().clone();
+        let mut new_handles = HashMap::with_capacity(registrations.len());
+        for (task_id, registration) in &registrations {
+            let response = match new_session
+                .add_torrent(
+                    AddTorrent::TorrentFileBytes(registration.inspected.metainfo.clone().into()),
+                    Some(AddTorrentOptions {
+                        overwrite: true,
+                        output_folder: Some(
+                            registration.output_folder.to_string_lossy().into_owned(),
+                        ),
+                        only_files: registration.selected_files.clone(),
+                        paused: registration.paused,
+                        peer_limit: config.peer_limit,
+                        initial_peers: (!config.initial_peers.is_empty())
+                            .then(|| config.initial_peers.clone()),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .with_context(|| format!("重新挂载种子任务失败: {task_id}"))
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    new_session.stop().await;
+                    return Err(error);
+                }
+            };
+            let Some(handle) = response.into_handle() else {
+                new_session.stop().await;
+                return Err(anyhow!("重新挂载种子任务未返回句柄: {task_id}"));
+            };
+            if let Err(error) =
+                Self::set_handle_paused(&new_session, &handle, registration.paused).await
+            {
+                new_session.stop().await;
+                return Err(error).with_context(|| format!("恢复种子任务状态失败: {task_id}"));
+            }
+            new_handles.insert(task_id.clone(), handle);
+        }
+
+        let old_session = {
+            let mut session = self.session.lock();
+            std::mem::replace(&mut *session, new_session)
+        };
+        *self.handles.lock() = new_handles;
+        *self.cfg.lock() = config;
+        old_session.stop().await;
+        Ok(ReconfigureOutcome::Rebuilt {
+            reattached: registrations.len(),
+        })
     }
 
     /// 关闭会话（应用退出时调用）。
     pub async fn stop(&self) {
-        self.session.stop().await;
+        let session = self.session.lock().clone();
+        session.stop().await;
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_reconfigure_for_test(&self) {
+        self.fail_next_reconfigure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub fn restored_sessions_are_paused_for_test(&self) -> bool {
+        self.session.lock().with_torrents(|torrents| {
+            torrents.fold(true, |all_paused, (_, handle)| {
+                all_paused
+                    && matches!(
+                        handle.stats().state,
+                        TorrentStatsState::Paused
+                            | TorrentStatsState::Initializing { paused: true }
+                    )
+            })
+        })
+    }
+}
+
+impl TorrentEngineConfig {
+    fn session_equivalent(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.download_bps = None;
+        left.upload_bps = None;
+        right.download_bps = None;
+        right.upload_bps = None;
+        left == right
     }
 }
 

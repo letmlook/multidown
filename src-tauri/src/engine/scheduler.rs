@@ -242,6 +242,9 @@ pub struct Scheduler {
     torrent_cfg: Arc<ParkingMutex<Option<crate::torrent::engine::TorrentEngineConfig>>>,
     /// 内嵌 BitTorrent 会话（惰性初始化：只有真正用到种子时才创建）
     torrent_engine: Arc<OnceCell<Arc<crate::torrent::engine::TorrentEngine>>>,
+    /// Scheduler-owned torrent supervisors survive the start call and can be
+    /// stopped/joined by lifecycle operations instead of becoming detached.
+    torrent_supervisors: Arc<AsyncMutex<HashMap<TaskId, tokio::task::JoinHandle<()>>>>,
     /// 最近一次应用设置快照（做种策略等运行时读取）
     settings: Arc<ParkingMutex<crate::settings::AppSettings>>,
     #[cfg(test)]
@@ -619,6 +622,7 @@ impl Scheduler {
             speed_limit: Arc::new(TokenBucket::new(0)),
             torrent_cfg: Arc::new(ParkingMutex::new(None)),
             torrent_engine: Arc::new(OnceCell::new()),
+            torrent_supervisors: Arc::new(AsyncMutex::new(HashMap::new())),
             settings: Arc::new(ParkingMutex::new(crate::settings::AppSettings::default())),
             #[cfg(test)]
             admission_test_barrier: Arc::new(ParkingMutex::new(None)),
@@ -670,6 +674,31 @@ impl Scheduler {
         }
     }
 
+    /// Apply settings to the live runtime. Session-wide torrent changes are
+    /// rebuilt transactionally by `TorrentEngine`; no scheduler-visible
+    /// settings are changed until that succeeds.
+    pub async fn apply_settings(
+        &self,
+        settings: &crate::settings::AppSettings,
+    ) -> Result<(), String> {
+        if let Some(app_data) = self.save_path.as_ref().and_then(|path| path.parent()) {
+            let config =
+                crate::torrent::engine::TorrentEngineConfig::from_settings(settings, app_data);
+            if let Some(engine) = self.torrent_engine.get() {
+                engine
+                    .reconfigure_session(config)
+                    .await
+                    .map_err(|error| format!("更新 BitTorrent 会话失败: {error}"))?;
+            }
+        }
+        self.update_from_settings(settings);
+        Ok(())
+    }
+
+    pub fn current_settings(&self) -> crate::settings::AppSettings {
+        self.settings.lock().clone()
+    }
+
     /// 取（必要时惰性创建）种子引擎。
     ///
     /// 创建会话必须在 tokio 运行时上下文里进行，所以这里是 async；
@@ -692,6 +721,21 @@ impl Scheduler {
             })
             .await?;
         Ok(engine.clone())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "safe deletion Task 5 consumes the supervisor join boundary"
+        )
+    )]
+    pub(crate) async fn stop_torrent_supervisor(&self, task_id: &str) {
+        let handle = self.torrent_supervisors.lock().await.remove(task_id);
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     /// 运行中改变种子任务选中的文件。
@@ -1428,7 +1472,13 @@ impl Scheduler {
                     let task = t.clone();
                     drop(tasks);
                     return self
-                        .start_torrent_download(task, app_handle, scheduler_for_save)
+                        .start_torrent_download(
+                            task,
+                            app_handle,
+                            scheduler_for_save,
+                            None,
+                            &[TaskStatus::Pending, TaskStatus::Paused],
+                        )
                         .await;
                 }
             }
@@ -2056,6 +2106,73 @@ impl Scheduler {
                 }
             }
         }
+
+        let now = chrono::Utc::now().timestamp();
+        let settings = self.settings.lock().clone();
+        let torrent_candidates: Vec<(Arc<Task>, TaskStatus)> = {
+            let tasks = self.tasks.lock().await;
+            let mut candidates = Vec::new();
+            for task in tasks.values() {
+                if !task.kind.is_torrent() {
+                    continue;
+                }
+                let status = *task.status.lock().await;
+                let eligible = match status {
+                    TaskStatus::Recovering => true,
+                    TaskStatus::Completed => {
+                        let meta = task.torrent_meta().unwrap_or_default();
+                        let started = task
+                            .seeding_started_at
+                            .lock()
+                            .await
+                            .or(*task.completed_at.lock().await);
+                        should_recover_completed_torrent(
+                            &settings.torrent_seed_mode,
+                            meta.uploaded_bytes,
+                            task.effective_total_bytes().unwrap_or(0),
+                            settings.torrent_seed_ratio_pct,
+                            started,
+                            now,
+                            settings.torrent_seed_time_min,
+                        )
+                    }
+                    _ => false,
+                };
+                if eligible {
+                    candidates.push((task.clone(), status));
+                }
+            }
+            candidates.sort_by(|(left, _), (right, _)| {
+                (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
+            });
+            candidates
+        };
+        for (task, original_status) in torrent_candidates {
+            let task_id = task.id.clone();
+            let active_slot = match self.reserve_active_slot(&task_id).await {
+                Ok(slot) => slot,
+                Err(_) => {
+                    summary.skipped += 1;
+                    continue;
+                }
+            };
+            match self
+                .start_torrent_download(
+                    task,
+                    app_handle.clone(),
+                    None,
+                    Some(active_slot),
+                    &[original_status],
+                )
+                .await
+            {
+                Ok(()) => summary.started += 1,
+                Err(message) => {
+                    summary.failed += 1;
+                    summary.failures.push(RecoveryFailure { task_id, message });
+                }
+            }
+        }
         summary
     }
 
@@ -2068,18 +2185,23 @@ impl Scheduler {
         task: Arc<Task>,
         app_handle: Option<tauri::AppHandle>,
         scheduler_for_save: Option<Arc<Scheduler>>,
+        active_slot: Option<ActiveSlot>,
+        expected_statuses: &[TaskStatus],
     ) -> Result<(), String> {
         let task_id = task.id.clone();
 
-        let was_paused;
-        {
-            let st = task.status.lock().await;
-            if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
+        let original_status = {
+            let status = *task.status.lock().await;
+            if !expected_statuses.contains(&status) {
                 return Err("任务状态不允许开始".to_string());
             }
-            was_paused = *st == TaskStatus::Paused;
-        }
-        let active_slot = self.reserve_active_slot(&task_id).await?;
+            status
+        };
+        let was_paused = original_status == TaskStatus::Paused;
+        let active_slot = match active_slot {
+            Some(slot) => slot,
+            None => self.reserve_active_slot(&task_id).await?,
+        };
 
         let scheduler_self = scheduler_for_save
             .clone()
@@ -2088,7 +2210,8 @@ impl Scheduler {
         // 失败收尾：标记失败 + 释放并发位 + 落盘
         macro_rules! fail {
             ($msg:expr) => {{
-                *task.error_message.lock().await = Some($msg);
+                let message = $msg;
+                *task.error_message.lock().await = Some(message.clone());
                 *task.status.lock().await = TaskStatus::Failed;
                 if let Err(error) = scheduler_self.save_tasks().await {
                     eprintln!("[persistence-error] torrent failure: {error}");
@@ -2099,7 +2222,7 @@ impl Scheduler {
                         (task_id.clone(), "failed".to_string(), task.filename.clone()),
                     );
                 }
-                return Ok(());
+                return Err(message);
             }};
         }
 
@@ -2126,7 +2249,7 @@ impl Scheduler {
             metainfo_b64: Some(base64_encode(&inspected.metainfo)),
             selected_files: meta.selected_files.clone(),
             metadata_ready: true,
-            uploaded_bytes: 0,
+            uploaded_bytes: meta.uploaded_bytes,
         });
 
         // 单文件 → 直接放下载目录；多文件 → 以种子名命名的子目录
@@ -2161,25 +2284,43 @@ impl Scheduler {
             }
         }
 
-        if let Err(primary) = self
-            .persist_status_transition(
-                &task_id,
-                &[TaskStatus::Pending, TaskStatus::Paused],
-                TaskStatus::Downloading,
-            )
-            .await
-        {
-            let cleanup = if was_paused {
-                engine.pause(&task_id).await
-            } else {
-                engine.remove(&task_id, false).await
-            };
-            return Err(match cleanup {
-                Ok(()) => primary,
-                Err(error) => {
-                    format!("{primary}; torrent admission cleanup failed for {task_id}: {error}")
-                }
-            });
+        if original_status != TaskStatus::Completed {
+            if let Err(primary) = self
+                .persist_status_transition(&task_id, expected_statuses, TaskStatus::Downloading)
+                .await
+            {
+                let cleanup = if was_paused {
+                    engine.pause(&task_id).await
+                } else {
+                    engine.remove(&task_id, false).await
+                };
+                return Err(match cleanup {
+                    Ok(()) => primary,
+                    Err(error) => {
+                        format!(
+                            "{primary}; torrent admission cleanup failed for {task_id}: {error}"
+                        )
+                    }
+                });
+            }
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            let mut completed_at = task.completed_at.lock().await;
+            let previous_completed_at = *completed_at;
+            let completed_at_value = *completed_at.get_or_insert(now);
+            drop(completed_at);
+            let mut seeding_started_at = task.seeding_started_at.lock().await;
+            let previous_seeding_started_at = *seeding_started_at;
+            seeding_started_at.get_or_insert(completed_at_value);
+            drop(seeding_started_at);
+            if let Err(error) = scheduler_self.save_tasks().await {
+                *task.completed_at.lock().await = previous_completed_at;
+                *task.seeding_started_at.lock().await = previous_seeding_started_at;
+                let _ = engine.pause(&task_id).await;
+                return Err(format!(
+                    "持久化恢复后的做种时间失败，种子会话已暂停: {error}"
+                ));
+            }
         }
 
         // 通知前端元数据已就绪（文件名/总大小/文件列表此刻才确定）
@@ -2200,12 +2341,21 @@ impl Scheduler {
 
         let app_handle_clone = app_handle.clone();
         let selected = meta.selected_files.clone();
-        tokio::spawn(async move {
-            let _active_slot = active_slot;
+        let worker_task_id = task_id.clone();
+        let handle = tokio::spawn(async move {
+            let task_id = worker_task_id;
+            let mut active_slot = Some(active_slot);
+            if original_status == TaskStatus::Completed {
+                drop(active_slot.take());
+            }
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // 做种计时起点（ratio / time 策略在完成后继续轮询，到点暂停）
-            let mut completed_at: Option<std::time::Instant> = None;
+            let session_uploaded_start = engine
+                .snapshot(&task_id)
+                .map(|progress| progress.uploaded_bytes)
+                .unwrap_or(0);
+            let persisted_uploaded = meta.uploaded_bytes;
+            let mut last_snapshot_save = std::time::Instant::now();
             loop {
                 interval.tick().await;
 
@@ -2241,15 +2391,20 @@ impl Scheduler {
 
                 let files =
                     crate::torrent::engine::merge_file_infos(&inspected, &p, selected.as_deref());
+                let uploaded_bytes = persisted_uploaded
+                    .saturating_add(p.uploaded_bytes.saturating_sub(session_uploaded_start));
                 task.set_torrent_stats(TorrentStatsSnapshot {
                     upload_speed_bps: p.upload_speed_bps,
-                    uploaded_bytes: p.uploaded_bytes,
+                    uploaded_bytes,
                     peers: p.peers,
                     // librqbit 的聚合 stats 不区分"做种方"，这里如实留空而不是显示 0
                     seeds: None,
                     files,
                 })
                 .await;
+                let mut persisted_meta = task.torrent_meta().unwrap_or_default();
+                persisted_meta.uploaded_bytes = uploaded_bytes;
+                task.update_torrent_meta(persisted_meta);
 
                 if p.state == TorrentRunState::Error {
                     *task.error_message.lock().await =
@@ -2266,7 +2421,21 @@ impl Scheduler {
 
                 if p.is_finished() && status == TaskStatus::Downloading {
                     *task.status.lock().await = TaskStatus::Completed;
-                    completed_at.get_or_insert_with(std::time::Instant::now);
+                    let now = chrono::Utc::now().timestamp();
+                    let mut completed_at = task.completed_at.lock().await;
+                    if completed_at.is_none() {
+                        *completed_at = Some(now);
+                    }
+                    drop(completed_at);
+                    let mut seeding_started_at = task.seeding_started_at.lock().await;
+                    if seeding_started_at.is_none() {
+                        *seeding_started_at = Some(now);
+                    }
+                    drop(seeding_started_at);
+                    drop(active_slot.take());
+                    if let Err(error) = scheduler_self.save_tasks().await {
+                        eprintln!("[persistence-error] torrent completion transition: {error}");
+                    }
                     if let Some(app) = &app_handle_clone {
                         let _ = app.emit(
                             "download-finished",
@@ -2285,16 +2454,24 @@ impl Scheduler {
                             let _ = engine.pause(&task_id).await;
                             break;
                         }
-                        "forever" => break,
+                        "forever" => {}
                         _ => {}
                     }
                 } else if status == TaskStatus::Completed {
                     // 已完成、正在按 ratio / time 策略做种，检查是否到点
                     let s = scheduler_self.settings.lock().clone();
-                    let seeded_for = completed_at.map(|t| t.elapsed()).unwrap_or_default();
+                    let started_at = task
+                        .seeding_started_at
+                        .lock()
+                        .await
+                        .or(*task.completed_at.lock().await)
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+                    let seeded_for = std::time::Duration::from_secs(
+                        chrono::Utc::now().timestamp().saturating_sub(started_at) as u64,
+                    );
                     if seeding_pause_due(
                         &s.torrent_seed_mode,
-                        p.uploaded_bytes,
+                        uploaded_bytes,
                         p.total_bytes,
                         s.torrent_seed_ratio_pct,
                         seeded_for,
@@ -2303,6 +2480,13 @@ impl Scheduler {
                         let _ = engine.pause(&task_id).await;
                         break;
                     }
+                }
+
+                if last_snapshot_save.elapsed() >= std::time::Duration::from_secs(30) {
+                    if let Err(error) = scheduler_self.save_tasks().await {
+                        eprintln!("[persistence-error] torrent seeding snapshot: {error}");
+                    }
+                    last_snapshot_save = std::time::Instant::now();
                 }
 
                 if let Some(app) = &app_handle_clone {
@@ -2317,6 +2501,15 @@ impl Scheduler {
                 eprintln!("[persistence-error] torrent completion: {error}");
             }
         });
+        if let Some(previous) = self
+            .torrent_supervisors
+            .lock()
+            .await
+            .insert(task_id, handle)
+        {
+            previous.abort();
+            let _ = previous.await;
+        }
 
         Ok(())
     }
@@ -3207,6 +3400,7 @@ impl Clone for Scheduler {
             speed_limit: self.speed_limit.clone(),
             torrent_cfg: self.torrent_cfg.clone(),
             torrent_engine: self.torrent_engine.clone(),
+            torrent_supervisors: self.torrent_supervisors.clone(),
             settings: self.settings.clone(),
             #[cfg(test)]
             admission_test_barrier: self.admission_test_barrier.clone(),
@@ -3295,6 +3489,41 @@ fn seeding_pause_due(
             uploaded_bytes >= target
         }
         "time" => seeded_for >= std::time::Duration::from_secs(seed_time_min as u64 * 60),
+        _ => false,
+    }
+}
+
+fn should_recover_completed_torrent(
+    mode: &str,
+    uploaded_bytes: u64,
+    total_bytes: u64,
+    ratio_pct: u32,
+    seeding_started_at: Option<i64>,
+    now: i64,
+    seed_time_min: u32,
+) -> bool {
+    match mode {
+        "forever" => true,
+        "ratio" => !seeding_pause_due(
+            mode,
+            uploaded_bytes,
+            total_bytes,
+            ratio_pct,
+            std::time::Duration::ZERO,
+            seed_time_min,
+        ),
+        "time" => {
+            let started = seeding_started_at.unwrap_or(now);
+            let elapsed = std::time::Duration::from_secs(now.saturating_sub(started) as u64);
+            !seeding_pause_due(
+                mode,
+                uploaded_bytes,
+                total_bytes,
+                ratio_pct,
+                elapsed,
+                seed_time_min,
+            )
+        }
         _ => false,
     }
 }
@@ -4690,6 +4919,329 @@ mod tests {
         }
     }
 
+    mod torrent_recovery {
+        use super::*;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use librqbit::{create_torrent, CreateTorrentOptions};
+
+        async fn fixture_record(
+            fixture: &InitializationFixture,
+            id: &str,
+            status: TaskStatus,
+            uploaded_bytes: u64,
+            completed_at: Option<i64>,
+            seeding_started_at: Option<i64>,
+        ) -> PersistedTask {
+            let source = fixture.0.join(format!("source-{id}"));
+            std::fs::create_dir_all(&source).unwrap();
+            let payload = b"deterministic scheduler torrent fixture";
+            let source_file = source.join("payload.bin");
+            std::fs::write(&source_file, payload).unwrap();
+            let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+            let created = create_torrent(
+                &source_file,
+                CreateTorrentOptions {
+                    name: Some("payload.bin"),
+                    trackers: Vec::new(),
+                    piece_length: Some(16 * 1024),
+                },
+                &spawner,
+            )
+            .await
+            .unwrap();
+            let metainfo = created.as_bytes().unwrap();
+            let save_dir = fixture.0.join(format!("download-{id}"));
+            std::fs::create_dir_all(&save_dir).unwrap();
+            PersistedTask {
+                id: id.into(),
+                url: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000".into(),
+                save_path: save_dir.join("payload.bin").to_string_lossy().into_owned(),
+                filename: "payload.bin".into(),
+                total_bytes: None,
+                downloaded_bytes: if status == TaskStatus::Completed {
+                    payload.len() as u64
+                } else {
+                    0
+                },
+                status,
+                error_message: None,
+                pending_segments: Vec::new(),
+                supports_range: false,
+                created_at: 1_700_000_000,
+                auth: None,
+                extra_headers: Vec::new(),
+                etag: None,
+                last_modified: None,
+                kind: crate::engine::types::TaskKind::Torrent,
+                torrent: Some(TorrentMeta {
+                    input: "fixture.torrent".into(),
+                    info_hash: None,
+                    metainfo_b64: Some(STANDARD.encode(metainfo)),
+                    selected_files: None,
+                    metadata_ready: true,
+                    uploaded_bytes,
+                }),
+                total_dynamic: payload.len() as u64,
+                completed_at,
+                seeding_started_at,
+            }
+        }
+
+        async fn scheduler_with_torrents(
+            fixture: &InitializationFixture,
+            records: Vec<PersistedTask>,
+            settings: crate::settings::AppSettings,
+        ) -> Scheduler {
+            save_tasks_to_file(&fixture.paths().tasks, &records)
+                .await
+                .unwrap();
+            let (scheduler, warnings) = Scheduler::initialize(fixture.paths(), settings).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            scheduler
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn active_torrent_is_reattached_while_paused_torrent_stays_detached() {
+            let fixture = InitializationFixture::new();
+            let active = fixture_record(
+                &fixture,
+                "active-torrent",
+                TaskStatus::Downloading,
+                0,
+                None,
+                None,
+            )
+            .await;
+            let paused = fixture_record(
+                &fixture,
+                "paused-torrent",
+                TaskStatus::Paused,
+                0,
+                None,
+                None,
+            )
+            .await;
+            let scheduler = scheduler_with_torrents(
+                &fixture,
+                vec![active, paused],
+                crate::settings::AppSettings::default(),
+            )
+            .await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            assert_eq!(
+                scheduler.get_task("active-torrent").await.unwrap().status,
+                TaskStatus::Downloading
+            );
+            assert_eq!(
+                scheduler.get_task("paused-torrent").await.unwrap().status,
+                TaskStatus::Paused
+            );
+            let engine = scheduler.torrent_engine().await.unwrap();
+            assert!(engine.handle("active-torrent").is_some());
+            assert!(engine.handle("paused-torrent").is_none());
+            assert!(scheduler
+                .torrent_supervisors
+                .lock()
+                .await
+                .contains_key("active-torrent"));
+            scheduler.stop_torrent_supervisor("active-torrent").await;
+            assert!(!scheduler
+                .torrent_supervisors
+                .lock()
+                .await
+                .contains_key("active-torrent"));
+            engine.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn completed_ratio_and_time_policies_only_restore_when_unsatisfied() {
+            let now = chrono::Utc::now().timestamp();
+            for (mode, uploaded, started_at, should_start) in [
+                ("ratio", 10, Some(now - 60), true),
+                ("ratio", 10_000, Some(now - 60), false),
+                ("time", 0, Some(now - 60), true),
+                ("time", 0, Some(now - 31 * 60), false),
+            ] {
+                let fixture = InitializationFixture::new();
+                let record = fixture_record(
+                    &fixture,
+                    "completed-torrent",
+                    TaskStatus::Completed,
+                    uploaded,
+                    Some(now - 120),
+                    started_at,
+                )
+                .await;
+                let scheduler = scheduler_with_torrents(
+                    &fixture,
+                    vec![record],
+                    crate::settings::AppSettings {
+                        torrent_seed_mode: mode.into(),
+                        torrent_seed_ratio_pct: 100,
+                        torrent_seed_time_min: 30,
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+                let summary = scheduler
+                    .recover_tasks(None, 1, NetworkOptions::default())
+                    .await;
+                let engine = scheduler.torrent_engine().await.unwrap();
+                assert_eq!(summary.started, usize::from(should_start), "mode={mode}");
+                assert_eq!(
+                    engine.handle("completed-torrent").is_some(),
+                    should_start,
+                    "mode={mode}"
+                );
+                assert_eq!(
+                    scheduler
+                        .get_task("completed-torrent")
+                        .await
+                        .unwrap()
+                        .status,
+                    TaskStatus::Completed
+                );
+                if should_start && mode == "ratio" {
+                    let task = scheduler.tasks.lock().await["completed-torrent"].clone();
+                    assert!(
+                        task.torrent_meta().unwrap().uploaded_bytes >= uploaded,
+                        "recovery must not reset the persisted upload baseline"
+                    );
+                }
+                engine.stop().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn completed_forever_policy_always_reattaches() {
+            let fixture = InitializationFixture::new();
+            let now = chrono::Utc::now().timestamp();
+            let record = fixture_record(
+                &fixture,
+                "forever-torrent",
+                TaskStatus::Completed,
+                99_999,
+                Some(now - 86_400),
+                Some(now - 86_400),
+            )
+            .await;
+            let scheduler = scheduler_with_torrents(
+                &fixture,
+                vec![record],
+                crate::settings::AppSettings {
+                    torrent_seed_mode: "forever".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            let engine = scheduler.torrent_engine().await.unwrap();
+            assert!(engine.handle("forever-torrent").is_some());
+            assert_eq!(
+                scheduler.get_task("forever-torrent").await.unwrap().status,
+                TaskStatus::Completed
+            );
+            engine.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn invalid_persisted_metainfo_is_reported_as_recovery_failure() {
+            let fixture = InitializationFixture::new();
+            let mut record = fixture_record(
+                &fixture,
+                "invalid-torrent",
+                TaskStatus::Downloading,
+                0,
+                None,
+                None,
+            )
+            .await;
+            record.torrent.as_mut().unwrap().metainfo_b64 = Some("not-base64".into());
+            let scheduler = scheduler_with_torrents(
+                &fixture,
+                vec![record],
+                crate::settings::AppSettings::default(),
+            )
+            .await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 0);
+            assert_eq!(summary.failed, 1);
+            assert_eq!(summary.failures[0].task_id, "invalid-torrent");
+            assert!(summary.failures[0].message.contains("base64"));
+            assert_eq!(
+                scheduler.get_task("invalid-torrent").await.unwrap().status,
+                TaskStatus::Failed
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn legacy_completed_time_policy_persists_a_stable_seeding_start() {
+            let fixture = InitializationFixture::new();
+            let record = fixture_record(
+                &fixture,
+                "legacy-completed",
+                TaskStatus::Completed,
+                0,
+                None,
+                None,
+            )
+            .await;
+            let paths = fixture.paths();
+            let scheduler = scheduler_with_torrents(
+                &fixture,
+                vec![record],
+                crate::settings::AppSettings {
+                    torrent_seed_mode: "time".into(),
+                    torrent_seed_time_min: 30,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 1);
+            let seeded_at = *scheduler.tasks.lock().await["legacy-completed"]
+                .seeding_started_at
+                .lock()
+                .await;
+            assert!(seeded_at.is_some());
+            let (restored, warnings) = Scheduler::initialize(
+                paths,
+                crate::settings::AppSettings {
+                    torrent_seed_mode: "time".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(warnings.is_empty());
+            assert_eq!(
+                *restored.tasks.lock().await["legacy-completed"]
+                    .seeding_started_at
+                    .lock()
+                    .await,
+                seeded_at
+            );
+            scheduler.torrent_engine().await.unwrap().stop().await;
+        }
+    }
+
     #[tokio::test]
     async fn initialization_first_run_uses_effective_defaults_without_warnings() {
         let fixture = InitializationFixture::new();
@@ -5891,6 +6443,34 @@ mod tests {
         assert_eq!(s.speed_limit.rate_bps(), 512 * 1024);
     }
 
+    #[tokio::test]
+    async fn failed_torrent_session_reconfigure_keeps_runtime_settings_unchanged() {
+        let fixture = InitializationFixture::new();
+        let scheduler = Scheduler::new(Some(fixture.paths().tasks));
+        let engine = scheduler.torrent_engine().await.unwrap();
+        engine.fail_next_reconfigure_for_test();
+        let changed = crate::settings::AppSettings {
+            torrent_peer_limit: 7,
+            max_retries: 9,
+            ..Default::default()
+        };
+
+        let error = scheduler.apply_settings(&changed).await.unwrap_err();
+
+        assert!(error.contains("injected torrent session rebuild failure"));
+        assert_eq!(scheduler.settings.lock().torrent_peer_limit, 0);
+        assert_eq!(scheduler.limits.lock().max_retries, 3);
+        assert_eq!(
+            scheduler.torrent_cfg.lock().as_ref().unwrap().peer_limit,
+            None
+        );
+        assert!(Arc::ptr_eq(
+            &engine,
+            &scheduler.torrent_engine().await.unwrap()
+        ));
+        engine.stop().await;
+    }
+
     #[test]
     fn seeding_policy_ratio_time_forever() {
         use std::time::Duration;
@@ -5938,6 +6518,65 @@ mod tests {
             0
         ));
         assert!(!seeding_pause_due("stop", 0, 100, 0, Duration::ZERO, 0));
+    }
+
+    #[test]
+    fn completed_torrent_recovery_uses_persisted_wall_clock_and_upload_baseline() {
+        let now = 2_000_000_i64;
+        assert!(should_recover_completed_torrent(
+            "ratio",
+            99,
+            100,
+            100,
+            Some(now - 10),
+            now,
+            30,
+        ));
+        assert!(!should_recover_completed_torrent(
+            "ratio",
+            100,
+            100,
+            100,
+            Some(now - 10),
+            now,
+            30,
+        ));
+        assert!(should_recover_completed_torrent(
+            "time",
+            0,
+            100,
+            100,
+            Some(now - 29 * 60),
+            now,
+            30,
+        ));
+        assert!(!should_recover_completed_torrent(
+            "time",
+            0,
+            100,
+            100,
+            Some(now - 30 * 60),
+            now,
+            30,
+        ));
+        assert!(should_recover_completed_torrent(
+            "forever",
+            10_000,
+            100,
+            100,
+            Some(now - 86_400),
+            now,
+            30,
+        ));
+        assert!(!should_recover_completed_torrent(
+            "stop",
+            0,
+            100,
+            100,
+            Some(now),
+            now,
+            30,
+        ));
     }
 
     #[tokio::test]
