@@ -70,8 +70,16 @@ struct BatchJobRecordWire {
     created_at: i64,
     #[serde(default = "pending_batch_status")]
     status: BatchStatus,
+    #[serde(default, deserialize_with = "deserialize_present_cursor")]
     next_url_index: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_present_cursor")]
     added_count: Option<usize>,
+}
+
+fn deserialize_present_cursor<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(deserializer).map(Some)
 }
 
 impl TryFrom<BatchJobRecordWire> for BatchJobRecord {
@@ -670,6 +678,43 @@ fn probe_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn assert_null_cursor_is_quarantined(cursor_key: &str, other_key: &str) {
+        for include_other_cursor in [false, true] {
+            let dir = std::env::temp_dir().join(format!("batch-null-cursor-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = batches_path(&dir);
+            let mut invalid = serde_json::json!({"id":"invalid","name":"Bad","urls":["https://example.com/a","https://example.com/b"],"task_ids":["task-1"],"created_at":1700000000});
+            invalid[cursor_key] = serde_json::Value::Null;
+            if include_other_cursor {
+                invalid[other_key] = serde_json::json!(2);
+            }
+            let valid = serde_json::json!({"id":"valid","name":"Good","urls":["https://example.com/a"],"task_ids":["task-1"],"created_at":1700000000,"next_url_index":1});
+            let original = serde_json::to_vec(&serde_json::json!([valid, invalid])).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let report = load_batches_report(&path).unwrap();
+            assert_eq!(report.data.len(), 1, "{cursor_key}, other present: {include_other_cursor}");
+            assert_eq!(report.data[0].id, "valid");
+            assert_eq!(report.warnings.len(), 1);
+            assert_eq!(report.warnings[0].record_key.as_deref(), Some("invalid"));
+            let raw = report.warnings[0].rejected_value.as_ref().unwrap();
+            assert_eq!(raw.get(cursor_key), Some(&serde_json::Value::Null));
+            assert!(serde_json::from_value::<BatchJobRecord>(raw.clone()).is_err());
+            let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+            assert_eq!(rejected[0]["value"].get(cursor_key), Some(&serde_json::Value::Null));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_null_next_url_index_is_quarantined_with_valid_sibling_retained() {
+        assert_null_cursor_is_quarantined("next_url_index", "added_count");
+    }
+
+    #[test]
+    fn explicit_null_legacy_added_count_is_quarantined_with_valid_sibling_retained() {
+        assert_null_cursor_is_quarantined("added_count", "next_url_index");
+    }
     #[tokio::test]
     async fn dispatch_cursor_survives_restart_when_one_task_creation_failed() {
         let dir = std::env::temp_dir().join(format!("batch-cursor-{}", uuid::Uuid::new_v4()));
