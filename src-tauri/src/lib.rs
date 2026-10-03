@@ -12,7 +12,7 @@ mod storage;
 mod torrent;
 
 use browser_integration::BrowserInstallOutcome;
-use engine::scheduler::Scheduler;
+use engine::scheduler::{recover_load, Scheduler, SchedulerPaths};
 use network::{AuthConfig, NetworkOptions, ProbeResult};
 use settings::proxy::{
     load_proxy_store, save_proxy_store, ProxyConfig, ProxyMatchType,
@@ -38,6 +38,33 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 static TCP_SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 static TCP_SHUTDOWN_TX: Mutex<Option<tokio::sync::oneshot::Sender<()>>> = Mutex::new(None);
+
+/// Session-local UI acknowledgement never changes the persisted recovery evidence.
+pub(crate) struct RecoveryWarnings(parking_lot::Mutex<Vec<storage::RecoveryWarning>>);
+
+impl RecoveryWarnings {
+    pub(crate) fn new(warnings: Vec<storage::RecoveryWarning>) -> Self {
+        Self(parking_lot::Mutex::new(warnings))
+    }
+
+    pub(crate) fn list(&self) -> Vec<storage::RecoveryWarning> {
+        self.0.lock().clone()
+    }
+
+    pub(crate) fn acknowledge(&self, ids: &[String]) {
+        self.0.lock().retain(|warning| !ids.contains(&warning.id));
+    }
+}
+
+#[tauri::command]
+fn list_recovery_warnings(state: State<'_, RecoveryWarnings>) -> Vec<storage::RecoveryWarning> {
+    state.list()
+}
+
+#[tauri::command]
+fn acknowledge_recovery_warnings(ids: Vec<String>, state: State<'_, RecoveryWarnings>) {
+    state.acknowledge(&ids);
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Queue Commands
@@ -1871,37 +1898,24 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
-            let path = app
-                .path()
-                .app_data_dir()
-                .map_err(|e| e.to_string())?
-                .join("multidown_tasks.json");
-            let scheduler = Scheduler::load_from(&path).unwrap_or_else(|_| Scheduler::new(Some(path)));
+            let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+            let settings_file = settings_path(&app_data);
+            let mut warnings = Vec::new();
+            let settings = recover_load("settings", &settings_file,
+                settings::load_settings_report(&settings_file), &mut warnings)?;
+            let (scheduler, scheduler_warnings) = Scheduler::initialize(SchedulerPaths {
+                tasks: app_data.join("multidown_tasks.json"),
+                queues: app_data.join("queues.json"),
+                batches: engine::batch::batches_path(&app_data),
+                rules: engine::rules_persistence::rules_path(&app_data),
+                schedules: engine::schedule::schedule_rules_path(&app_data),
+            }, settings.clone())?;
+            warnings.extend(scheduler_warnings);
             let scheduler = Arc::new(scheduler);
             let sched_clone = scheduler.clone();
             let app_handle = app.handle().clone();
-            // 启动时同步引擎限制与开机自启状态
-            if let Ok(settings_path) = app_settings_path(&app_handle) {
-                if let Ok(settings) = load_settings(&settings_path) {
-                    scheduler.update_from_settings(&settings);
-                    sync_autostart(&app_handle, settings.run_at_startup);
-                }
-            }
-            // 加载分类规则与计划任务规则（此前从未从磁盘恢复）
-            if let Some(rules_path) = scheduler.rules_save_path() {
-                if let Err(e) = scheduler.load_rules_from(&rules_path) {
-                    debug_log(&app_handle, "加载分类规则失败", Some(&e));
-                }
-            }
-            {
-                let app_data = app.path()
-                    .app_data_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::new());
-                let sched = scheduler.clone();
-                for rule in engine::schedule::load_schedule_rules(&app_data) {
-                    tauri::async_runtime::block_on(sched.schedule_manager().add_rule(rule));
-                }
-            }
+            sync_autostart(&app_handle, settings.run_at_startup);
+            app.manage(RecoveryWarnings::new(warnings));
             app.manage(scheduler);
 
             // URL Scheme：multidown://add?url=... 直接唤起下载；
@@ -2630,6 +2644,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            list_recovery_warnings,
+            acknowledge_recovery_warnings,
             get_settings,
             set_settings,
             probe_download,

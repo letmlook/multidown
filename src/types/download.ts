@@ -1,10 +1,20 @@
 export type TaskStatus =
   | "pending"
   | "downloading"
+  | "recovering"
   | "paused"
   | "completed"
   | "failed"
   | "cancelled";
+
+/** Startup recovery notice. Acknowledgement only clears the current UI registry. */
+export interface RecoveryWarning {
+  id: string;
+  domain: string;
+  message: string;
+  recovery_path: string | null;
+  record_key: string | null;
+}
 
 /** 任务协议类型；旧任务数据默认为 "http" */
 export type TaskKind = "http" | "torrent";

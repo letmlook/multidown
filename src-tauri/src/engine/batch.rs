@@ -291,6 +291,10 @@ impl Default for BatchManager {
 }
 
 impl BatchManager {
+    pub fn from_jobs(jobs: Vec<BatchJob>) -> Self {
+        Self { jobs: RwLock::new(jobs) }
+    }
+
     pub fn new() -> Self {
         Self {
             jobs: RwLock::new(Vec::new()),
@@ -677,6 +681,18 @@ fn probe_batch(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn from_jobs_preserves_loaded_membership_and_dispatch_cursor() {
+        let mut job = super::BatchJob::new("Restored".into(), vec!["https://a".into(), "https://b".into()], String::new(), 0, None);
+        job.task_ids = vec!["task-1".into()];
+        job.added_count = 2;
+        let id = job.id.clone();
+        let manager = super::BatchManager::from_jobs(vec![job]);
+        let restored = manager.get_job(&id).await.unwrap();
+        assert_eq!(restored.task_ids, vec!["task-1"]);
+        assert_eq!(restored.added_count, 2);
+        assert_eq!(manager.list_jobs_full().await.len(), 1);
+    }
     use super::*;
     fn assert_null_cursor_is_quarantined(cursor_key: &str, other_key: &str) {
         for include_other_cursor in [false, true] {
