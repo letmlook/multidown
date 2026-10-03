@@ -176,6 +176,10 @@ pub async fn probe_with_client(
         )
         .send()
         .await?;
+        // The server's response to an actual Range request is authoritative.
+        // Some servers advertise `Accept-Ranges: bytes` on HEAD but ignore the
+        // Range header and return a full 200 response instead.
+        supports_range = get_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         if mime.is_none() {
             mime = mime_from_headers(get_resp.headers());
         }
@@ -441,6 +445,35 @@ mod tests {
             .expect("probe must make a Range GET when HEAD lacks MIME")
             .unwrap();
         assert!(fallback.starts_with("GET ") && fallback.contains("Range: bytes=0-0"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_uses_range_get_result_when_head_range_claim_is_wrong() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 2048];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let response = if request.starts_with("HEAD ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                } else {
+                    assert!(request.contains("Range: bytes=0-0"));
+                    "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: Video/MP4\r\nConnection: close\r\n\r\n0123456789"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let result = probe(&format!("http://{address}/movie")).await.unwrap();
+
+        assert_eq!(result.total_bytes, Some(10));
+        assert_eq!(result.mime.as_deref(), Some("video/mp4"));
+        assert!(!result.supports_range);
         server.await.unwrap();
     }
 
