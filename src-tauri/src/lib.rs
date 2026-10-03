@@ -8,6 +8,7 @@ mod browser_integration;
 mod network;
 mod protocol;
 mod settings;
+mod storage;
 mod torrent;
 
 use browser_integration::BrowserInstallOutcome;

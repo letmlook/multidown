@@ -1,0 +1,382 @@
+//! Shared persistence primitives. Domain migrations validate individual records.
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VersionedEnvelope<T> {
+    pub schema_version: u32,
+    pub written_at: String,
+    pub data: T,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryWarning {
+    pub id: String,
+    pub domain: String,
+    pub message: String,
+    pub recovery_path: Option<PathBuf>,
+    pub record_key: Option<String>,
+    /// Only the local quarantine writer sees raw records, never the frontend.
+    #[serde(skip_serializing)]
+    pub(crate) rejected_value: Option<Value>,
+}
+
+#[derive(Debug)]
+pub struct LoadReport<T> {
+    pub data: T,
+    pub warnings: Vec<RecoveryWarning>,
+    pub schema_version: u32,
+    pub migrated: bool,
+    pub recovery_path: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unsupported schema version {0}")]
+    UnsupportedVersion(u32),
+    #[error("invalid store envelope: {0}")]
+    InvalidEnvelope(String),
+    #[error("{domain}: {message}; preserved at {recovery_path}")]
+    Corrupt {
+        domain: String,
+        message: String,
+        recovery_path: PathBuf,
+    },
+}
+
+pub fn load_store<T>(
+    path: &Path,
+    domain: &'static str,
+    migrate: impl FnOnce(u32, Value) -> Result<(T, Vec<RecoveryWarning>), StoreError>,
+) -> Result<LoadReport<T>, StoreError> {
+    let bytes = fs::read(path)?;
+    let parsed = serde_json::from_slice::<Value>(&bytes);
+    let (schema_version, value) = match parsed {
+        Ok(value) => {
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("schema_version"))
+            {
+                match serde_json::from_value::<VersionedEnvelope<Value>>(value) {
+                    Ok(envelope)
+                        if chrono::DateTime::parse_from_rfc3339(&envelope.written_at).is_ok() =>
+                    {
+                        (envelope.schema_version, envelope.data)
+                    }
+                    Ok(_) => {
+                        return Err(preserve_corrupt(
+                            path,
+                            domain,
+                            &bytes,
+                            "written_at is not RFC3339".into(),
+                        )?)
+                    }
+                    Err(error) => {
+                        return Err(preserve_corrupt(path, domain, &bytes, error.to_string())?)
+                    }
+                }
+            } else {
+                (0, value)
+            }
+        }
+        Err(error) => return Err(preserve_corrupt(path, domain, &bytes, error.to_string())?),
+    };
+    let (data, mut warnings) = migrate(schema_version, value)?;
+    let rejected: Vec<Value> = warnings.iter().filter_map(|warning| warning.rejected_value.as_ref().map(|value| {
+        serde_json::json!({ "record_key": warning.record_key, "message": warning.message, "value": value })
+    })).collect();
+    let recovery_path = if rejected.is_empty() {
+        None
+    } else {
+        let recovery = write_recovery(path, &serde_json::to_vec_pretty(&rejected)?)?;
+        for warning in &mut warnings {
+            if warning.rejected_value.is_some() {
+                warning.recovery_path = Some(recovery.clone());
+            }
+        }
+        Some(recovery)
+    };
+    Ok(LoadReport {
+        data,
+        warnings,
+        schema_version,
+        migrated: schema_version == 0,
+        recovery_path,
+    })
+}
+
+pub fn save_store<T: Serialize>(
+    path: &Path,
+    schema_version: u32,
+    data: &T,
+) -> Result<(), StoreError> {
+    let envelope = VersionedEnvelope {
+        schema_version,
+        written_at: chrono::Utc::now().to_rfc3339(),
+        data,
+    };
+    let bytes = serde_json::to_vec_pretty(&envelope)?;
+    let parent = parent_directory(path);
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}-{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let guard = TemporaryFile(Some(temporary.clone()));
+    file.write_all(&bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    if path.exists() {
+        rotate_backups(path)?;
+        fs::copy(path, suffixed_path(path, ".bak"))?;
+        OpenOptions::new()
+            .write(true)
+            .open(suffixed_path(path, ".bak"))?
+            .sync_all()?;
+    }
+    replace_file(&temporary, path)?;
+    drop(guard);
+    Ok(())
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn rotate_backups(path: &Path) -> Result<(), StoreError> {
+    let mut last = 0usize;
+    while suffixed_path(path, &format!(".bak.{}", last + 1)).exists() {
+        last += 1;
+    }
+    for index in (1..=last).rev() {
+        fs::rename(
+            suffixed_path(path, &format!(".bak.{index}")),
+            suffixed_path(path, &format!(".bak.{}", index + 1)),
+        )?;
+    }
+    let backup = suffixed_path(path, ".bak");
+    if backup.exists() {
+        fs::rename(backup, suffixed_path(path, ".bak.1"))?;
+    }
+    Ok(())
+}
+
+fn preserve_corrupt(
+    path: &Path,
+    domain: &str,
+    bytes: &[u8],
+    message: String,
+) -> Result<StoreError, StoreError> {
+    Ok(StoreError::Corrupt {
+        domain: domain.into(),
+        message,
+        recovery_path: write_recovery(path, bytes)?,
+    })
+}
+
+fn write_recovery(path: &Path, bytes: &[u8]) -> Result<PathBuf, StoreError> {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+    let recovery = parent_directory(path).join(format!("{stem}.recovery-{timestamp}.json"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&recovery)?;
+    let mut guard = TemporaryFile(Some(recovery.clone()));
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    guard.0.take();
+    Ok(recovery)
+}
+
+struct TemporaryFile(Option<PathBuf>);
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! { static FAIL_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_REPLACE.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::other("injected replace failure"));
+    }
+    fs::rename(source, destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::{fs, path::PathBuf};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("multidown-store-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("tasks.json")
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn version_one_envelope_round_trips() {
+        let fixture = Fixture::new();
+        save_store(&fixture.path(), 1, &vec!["task"]).unwrap();
+        let disk: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"], json!(["task"]));
+        chrono::DateTime::parse_from_rfc3339(disk["written_at"].as_str().unwrap()).unwrap();
+        let report = load_store(&fixture.path(), "tasks", |version, data| {
+            assert_eq!(version, 1);
+            Ok((serde_json::from_value::<Vec<String>>(data)?, vec![]))
+        })
+        .unwrap();
+        assert_eq!(report.data, vec!["task"]);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn bare_value_is_version_zero() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path(), r#"["legacy"]"#).unwrap();
+        let report = load_store(&fixture.path(), "tasks", |version, data| {
+            assert_eq!(version, 0);
+            Ok((data, vec![]))
+        })
+        .unwrap();
+        assert_eq!(report.data, json!(["legacy"]));
+        assert_eq!(report.schema_version, 0);
+    }
+
+    #[test]
+    fn mixed_records_preserve_valid_data_and_quarantine_rejected_value() {
+        let fixture = Fixture::new();
+        fs::write(fixture.path(), r#"["valid",42]"#).unwrap();
+        let report = load_store(&fixture.path(), "tasks", |_, data| {
+            let mut valid = vec![];
+            let mut warnings = vec![];
+            for value in data.as_array().unwrap() {
+                if let Some(name) = value.as_str() {
+                    valid.push(name.to_owned());
+                } else {
+                    warnings.push(RecoveryWarning {
+                        id: "invalid-task".into(),
+                        domain: "tasks".into(),
+                        message: "invalid task".into(),
+                        recovery_path: None,
+                        record_key: Some("1".into()),
+                        rejected_value: Some(value.clone()),
+                    });
+                }
+            }
+            Ok((valid, warnings))
+        })
+        .unwrap();
+        assert_eq!(report.data, vec!["valid"]);
+        let recovery = report.recovery_path.unwrap();
+        assert!(recovery
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("tasks.recovery-"));
+        let quarantined: Value = serde_json::from_slice(&fs::read(&recovery).unwrap()).unwrap();
+        assert_eq!(quarantined.as_array().unwrap().len(), 1);
+        assert_eq!(quarantined[0]["value"], 42);
+        assert_eq!(quarantined[0]["record_key"], "1");
+        assert_eq!(report.warnings[0].recovery_path.as_ref(), Some(&recovery));
+        assert!(serde_json::to_value(&report.warnings).unwrap()[0]
+            .get("rejected_value")
+            .is_none());
+        assert_eq!(
+            fs::read_to_string(fixture.path()).unwrap(),
+            r#"["valid",42]"#
+        );
+    }
+
+    #[test]
+    fn backup_rotates_to_previous_successful_contents() {
+        let fixture = Fixture::new();
+        save_store(&fixture.path(), 1, &json!([1])).unwrap();
+        let first = fs::read(fixture.path()).unwrap();
+        save_store(&fixture.path(), 1, &json!([2])).unwrap();
+        assert_eq!(fs::read(fixture.0.join("tasks.json.bak")).unwrap(), first);
+        let second = fs::read(fixture.path()).unwrap();
+        save_store(&fixture.path(), 1, &json!([3])).unwrap();
+        assert_eq!(fs::read(fixture.0.join("tasks.json.bak")).unwrap(), second);
+        assert_eq!(fs::read(fixture.0.join("tasks.json.bak.1")).unwrap(), first);
+        save_store(&fixture.path(), 1, &json!([4])).unwrap();
+        assert_eq!(fs::read(fixture.0.join("tasks.json.bak.2")).unwrap(), first);
+    }
+
+    #[test]
+    fn corruption_is_preserved_verbatim_without_overwriting_source() {
+        let fixture = Fixture::new();
+        let original = b"{broken json\xff";
+        fs::write(fixture.path(), original).unwrap();
+        let result = load_store::<Value>(&fixture.path(), "tasks", |_, _| {
+            panic!("must not migrate invalid JSON")
+        });
+        let recovery = match result {
+            Err(StoreError::Corrupt { recovery_path, .. }) => recovery_path,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert_eq!(fs::read(recovery).unwrap(), original);
+        assert_eq!(fs::read(fixture.path()).unwrap(), original);
+    }
+
+    #[test]
+    fn failed_replace_leaves_old_file_readable_and_cleans_temporary_files() {
+        let fixture = Fixture::new();
+        save_store(&fixture.path(), 1, &json!(["old"])).unwrap();
+        FAIL_REPLACE.with(|flag| flag.set(true));
+        assert!(save_store(&fixture.path(), 1, &json!(["new"])).is_err());
+        let current: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        assert_eq!(current["data"], json!(["old"]));
+        assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .ends_with(".tmp")));
+    }
+}
