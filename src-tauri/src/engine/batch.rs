@@ -1,7 +1,7 @@
 //! 批量下载功能：URL解析、文件名模板、批量探测、批量队列管理
 
 use crate::engine::scheduler::Scheduler;
-use crate::engine::types::new_task_id;
+use crate::engine::types::{new_task_id, TaskId};
 use crate::network::{probe_with_options, NetworkOptions, ProbeResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -164,10 +164,6 @@ pub fn load_batches_report(
     })
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired by scheduler lifecycle persistence")
-)]
 pub async fn save_batches(
     path: &std::path::Path,
     batches: &[BatchJobRecord],
@@ -301,16 +297,46 @@ impl Default for BatchManager {
 }
 
 impl BatchManager {
-    pub fn from_jobs(jobs: Vec<BatchJob>) -> Self {
-        Self {
-            jobs: RwLock::new(jobs),
-        }
-    }
-
     pub fn new() -> Self {
         Self {
             jobs: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Replace the manager contents from durable records, omitting references to
+    /// tasks that did not survive task-store recovery. The dispatch cursor is
+    /// deliberately retained even when membership is filtered.
+    pub fn restore(
+        &mut self,
+        records: Vec<BatchJobRecord>,
+        known_task_ids: &HashSet<TaskId>,
+    ) -> Vec<crate::storage::RecoveryWarning> {
+        let mut warnings = Vec::new();
+        let mut jobs = Vec::with_capacity(records.len());
+        for record in records {
+            let owner = record.id.clone();
+            let mut job: BatchJob = record.into();
+            let mut missing = HashSet::new();
+            job.task_ids.retain(|task_id| {
+                if known_task_ids.contains(task_id) {
+                    return true;
+                }
+                if missing.insert(task_id.clone()) {
+                    warnings.push(crate::storage::RecoveryWarning {
+                        id: format!("batches:missing:{owner:?}:{task_id:?}"),
+                        domain: "batches".into(),
+                        message: format!("Removed missing task reference {task_id} from {owner}"),
+                        recovery_path: None,
+                        record_key: Some(owner.clone()),
+                        rejected_value: None,
+                    });
+                }
+                false
+            });
+            jobs.push(job);
+        }
+        *self.jobs.get_mut() = jobs;
+        warnings
     }
 
     pub async fn add_job(&self, job: BatchJob) -> String {
@@ -346,6 +372,10 @@ impl BatchManager {
     pub async fn remove_job(&self, id: &str) {
         let mut jobs = self.jobs.write().await;
         jobs.retain(|j| j.id != id);
+    }
+
+    pub async fn replace_jobs(&self, jobs: Vec<BatchJob>) {
+        *self.jobs.write().await = jobs;
     }
 
     /// 获取任务ID列表
@@ -693,23 +723,33 @@ pub async fn probe_batch(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn from_jobs_preserves_loaded_membership_and_dispatch_cursor() {
-        let mut job = super::BatchJob::new(
-            "Restored".into(),
-            vec!["https://a".into(), "https://b".into()],
-            String::new(),
-            0,
-            None,
-        );
-        job.task_ids = vec!["task-1".into()];
-        job.added_count = 2;
-        let id = job.id.clone();
-        let manager = super::BatchManager::from_jobs(vec![job]);
-        let restored = manager.get_job(&id).await.unwrap();
-        assert_eq!(restored.task_ids, vec!["task-1"]);
-        assert_eq!(restored.added_count, 2);
-        assert_eq!(manager.list_jobs_full().await.len(), 1);
+    async fn restore_filters_missing_task_references_and_reports_each_reference() {
+        let records = vec![super::BatchJobRecord {
+            id: "batch-1".into(),
+            name: "Restored".into(),
+            urls: vec!["https://example.com/a".into()],
+            template: String::new(),
+            start_index: 1,
+            save_dir: Some("/downloads".into()),
+            task_ids: vec!["known".into(), "missing".into(), "missing".into()],
+            created_at: 1_700_000_000,
+            status: super::BatchStatus::Paused,
+            next_url_index: 1,
+        }];
+        let known = std::collections::HashSet::from(["known".to_string()]);
+        let mut manager = super::BatchManager::new();
+
+        let warnings = manager.restore(records, &known);
+
+        let restored = manager.get_job("batch-1").await.unwrap();
+        assert_eq!(restored.task_ids, vec!["known"]);
+        assert_eq!(restored.added_count, 1);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].domain, "batches");
+        assert_eq!(warnings[0].record_key.as_deref(), Some("batch-1"));
+        assert!(warnings[0].message.contains("missing"));
     }
+
     use super::*;
     fn assert_null_cursor_is_quarantined(cursor_key: &str, other_key: &str) {
         for include_other_cursor in [false, true] {

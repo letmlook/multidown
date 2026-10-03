@@ -159,6 +159,20 @@ pub struct QueueManager {
     active_queue_id: String,
 }
 
+impl Clone for QueueManager {
+    fn clone(&self) -> Self {
+        Self {
+            queues: self
+                .queues
+                .iter()
+                .map(|(id, queue)| (id.clone(), Arc::new(Mutex::new(queue.lock().clone()))))
+                .collect(),
+            default_queue_id: self.default_queue_id.clone(),
+            active_queue_id: self.active_queue_id.clone(),
+        }
+    }
+}
+
 pub fn load_queues_report(
     path: &std::path::Path,
 ) -> Result<crate::storage::LoadReport<Vec<DownloadQueue>>, crate::storage::StoreError> {

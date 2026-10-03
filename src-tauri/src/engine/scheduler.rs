@@ -189,6 +189,9 @@ fn retain_known_tasks(
 pub struct Scheduler {
     tasks: Arc<AsyncMutex<HashMap<TaskId, Arc<Task>>>>,
     save_path: Option<PathBuf>,
+    queue_store_path: Option<PathBuf>,
+    batch_store_path: Option<PathBuf>,
+    lifecycle_persist_lock: Arc<AsyncMutex<()>>,
     queue_manager: GlobalQueueManager,
     /// Track active (downloading) task count per queue
     active_task_counts: Arc<ParkingMutex<HashMap<String, usize>>>,
@@ -280,21 +283,12 @@ impl Scheduler {
             default.task_ids.extend(unassigned);
         }
 
-        let mut batches = recover_load(
+        let batches = recover_load(
             "batches",
             &paths.batches,
             crate::engine::batch::load_batches_report(&paths.batches),
             &mut warnings,
         )?;
-        for batch in &mut batches {
-            retain_known_tasks(
-                "batches",
-                &batch.id,
-                &mut batch.task_ids,
-                &tasks,
-                &mut warnings,
-            );
-        }
         let rules = recover_load(
             "rules",
             &paths.rules,
@@ -310,12 +304,15 @@ impl Scheduler {
         let mut schedule_manager = ScheduleManager::new();
         schedule_manager.rules = Arc::new(AsyncMutex::new(schedules));
 
+        let known_task_ids = tasks.keys().cloned().collect();
         let mut scheduler = Self::new(Some(paths.tasks));
+        scheduler.queue_store_path = Some(paths.queues);
+        scheduler.batch_store_path = Some(paths.batches);
         scheduler.tasks = Arc::new(AsyncMutex::new(tasks));
         scheduler.queue_manager = Arc::new(AsyncMutex::new(queue_manager));
-        scheduler.batch_manager = Arc::new(BatchManager::from_jobs(
-            batches.into_iter().map(Into::into).collect(),
-        ));
+        let mut batch_manager = BatchManager::new();
+        warnings.extend(batch_manager.restore(batches, &known_task_ids));
+        scheduler.batch_manager = Arc::new(batch_manager);
         scheduler.rule_manager = Arc::new(RwLock::new(rules));
         scheduler.schedule_manager = Arc::new(schedule_manager);
         scheduler.update_from_settings(&settings);
@@ -325,7 +322,14 @@ impl Scheduler {
     pub fn new(save_path: Option<PathBuf>) -> Self {
         let scheduler = Self {
             tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+            queue_store_path: save_path
+                .as_ref()
+                .and_then(|path| path.parent().map(|parent| parent.join("queues.json"))),
+            batch_store_path: save_path
+                .as_ref()
+                .and_then(|path| path.parent().map(|parent| parent.join("batches.json"))),
             save_path,
+            lifecycle_persist_lock: Arc::new(AsyncMutex::new(())),
             queue_manager: crate::engine::queue::new_queue_manager(),
             active_task_counts: Arc::new(ParkingMutex::new(HashMap::new())),
             batch_manager: Arc::new(BatchManager::new()),
@@ -607,14 +611,11 @@ impl Scheduler {
         }
         let id = task.id.clone();
 
-        // Auto-assign new tasks to the initialized default queue.
-        {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
-            let _ = manager
-                .assign_task_to_queue(&id, &manager.default_queue_id)
-                .await;
-        }
+        // Auto-assign new tasks to the initialized default queue and make the
+        // membership durable before reporting creation success.
+        let default_queue_id = self.queue_manager.lock().await.default_queue_id.clone();
+        self.persist_task_queue_assignment(&id, &default_queue_id)
+            .await?;
 
         self.tasks.lock().await.insert(id.clone(), Arc::new(task));
         self.save_tasks().await;
@@ -684,13 +685,9 @@ impl Scheduler {
             let task = Task::new_torrent(meta, save_dir, placeholder);
             let id = task.id.clone();
 
-            {
-                let qm = &self.queue_manager;
-                let manager = qm.lock().await;
-                let _ = manager
-                    .assign_task_to_queue(&id, &manager.default_queue_id)
-                    .await;
-            }
+            let default_queue_id = self.queue_manager.lock().await.default_queue_id.clone();
+            self.persist_task_queue_assignment(&id, &default_queue_id)
+                .await?;
 
             self.tasks.lock().await.insert(id.clone(), Arc::new(task));
             self.save_tasks().await;
@@ -742,13 +739,9 @@ impl Scheduler {
         task.set_torrent_total(inspected.total_bytes);
         let id = task.id.clone();
 
-        {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
-            let _ = manager
-                .assign_task_to_queue(&id, &manager.default_queue_id)
-                .await;
-        }
+        let default_queue_id = self.queue_manager.lock().await.default_queue_id.clone();
+        self.persist_task_queue_assignment(&id, &default_queue_id)
+            .await?;
 
         self.tasks.lock().await.insert(id.clone(), Arc::new(task));
         self.save_tasks().await;
@@ -775,6 +768,8 @@ impl Scheduler {
 
     /// Check if a queue can start more tasks based on its concurrency limit
     async fn can_start_for_queue(&self, queue_id: &str) -> Result<bool, String> {
+        use chrono::{Datelike, Timelike};
+
         // 全局并发上限来自设置
         let global_max = self.limits.lock().max_concurrent_tasks;
 
@@ -788,11 +783,22 @@ impl Scheduler {
         let queue_max = {
             let qm = &self.queue_manager;
             let manager = qm.lock().await;
-            if let Some(queue) = manager.queues.get(queue_id) {
-                queue.lock().max_concurrent as usize
-            } else {
-                usize::MAX
+            let queue = manager
+                .queues
+                .get(queue_id)
+                .ok_or_else(|| "Queue not found".to_string())?;
+            let queue = queue.lock();
+            if queue.deleted {
+                return Err("下载队列已删除".into());
             }
+            if queue.is_paused {
+                return Err("下载队列已暂停".into());
+            }
+            let now = chrono::Local::now();
+            if !queue.is_active_at(now.weekday(), now.hour(), now.minute()) {
+                return Err("下载队列当前不在允许时段".into());
+            }
+            queue.max_concurrent as usize
         };
 
         // Check against both global and queue limits
@@ -1458,20 +1464,15 @@ impl Scheduler {
     pub async fn remove_task(&self, task_id: &str) -> Result<(), String> {
         {
             let tasks = self.tasks.lock().await;
-            let task = tasks.get(task_id).ok_or_else(|| "任务不存在".to_string())?;
-            let mut st = task.status.lock().await;
-            *st = TaskStatus::Cancelled;
+            tasks.get(task_id).ok_or_else(|| "任务不存在".to_string())?;
         }
-        // Remove the task's queue membership.
-        {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
-            if let Some(queue_id) = manager.get_task_queue(task_id).await {
-                let _ = manager.remove_task_from_queue(&queue_id, task_id).await;
-            }
-        }
+        let removed_task_ids = [task_id.to_string()];
+        self.persist_task_queue_removals(&removed_task_ids).await?;
         {
             let mut tasks = self.tasks.lock().await;
+            if let Some(task) = tasks.get(task_id) {
+                *task.status.lock().await = TaskStatus::Cancelled;
+            }
             tasks.remove(task_id);
         }
         self.save_tasks().await;
@@ -1501,21 +1502,11 @@ impl Scheduler {
         if to_remove.is_empty() {
             return Ok(0);
         }
+        self.persist_task_queue_removals(&to_remove).await?;
         {
             let mut tasks = self.tasks.lock().await;
             for id in &to_remove {
                 tasks.remove(id);
-            }
-        }
-        // Clean up from queues
-        {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
-            for id in &to_remove {
-                // Get queue for task, then remove
-                if let Some(queue_id) = manager.get_task_queue(id).await {
-                    let _ = manager.remove_task_from_queue(&queue_id, id).await;
-                }
             }
         }
         self.save_tasks().await;
@@ -1594,8 +1585,15 @@ impl Scheduler {
 
     /// Create a new queue
     pub async fn create_queue(&self, name: String, max_concurrent: u32) -> Result<String, String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
         let mut manager = self.queue_manager.lock().await;
-        Ok(manager.create_queue(name, max_concurrent, None))
+        let previous = manager.clone();
+        let id = manager.create_queue(name, max_concurrent, None);
+        if let Err(error) = self.persist_queues(&manager).await {
+            *manager = previous;
+            return Err(error);
+        }
+        Ok(id)
     }
 
     /// Update queue settings
@@ -1605,68 +1603,127 @@ impl Scheduler {
         name: Option<String>,
         enabled: Option<bool>,
         max_concurrent: Option<u32>,
-        _time_range: Option<Option<crate::engine::queue::TimeRange>>,
+        time_range: Option<Option<crate::engine::queue::TimeRange>>,
     ) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
         let manager = self.queue_manager.lock().await;
+        let previous = manager.clone();
         manager
-            .update_queue(id, name, max_concurrent, None, enabled)
-            .await
+            .update_queue(id, name, max_concurrent, None, enabled.map(|value| !value))
+            .await?;
+        if let Some(active_hours) = time_range {
+            manager
+                .queues
+                .get(id)
+                .ok_or_else(|| "Queue not found".to_string())?
+                .lock()
+                .active_hours = active_hours;
+        }
+        if let Err(error) = self.persist_queues(&manager).await {
+            drop(manager);
+            *self.queue_manager.lock().await = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Delete a queue
     pub async fn delete_queue(&self, id: &str) -> Result<(), String> {
-        self.queue_manager.lock().await.delete_queue(id).await
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let manager = self.queue_manager.lock().await;
+        let previous = manager.clone();
+        manager.delete_queue(id).await?;
+        if let Err(error) = self.persist_queues(&manager).await {
+            drop(manager);
+            *self.queue_manager.lock().await = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Pause a queue
     pub async fn pause_queue(&self, id: &str) -> Result<(), String> {
-        self.queue_manager
-            .lock()
-            .await
-            .update_queue(id, None, None, None, Some(true))
-            .await
+        self.update_queue(id, None, Some(false), None, None).await
     }
 
     /// Resume a queue
     pub async fn resume_queue(&self, id: &str) -> Result<(), String> {
-        self.queue_manager
-            .lock()
-            .await
-            .update_queue(id, None, None, None, Some(false))
-            .await
+        self.update_queue(id, None, Some(true), None, None).await
     }
 
     /// Assign a task to a queue
     pub async fn assign_task_to_queue(&self, task_id: &str, queue_id: &str) -> Result<(), String> {
-        self.queue_manager
-            .lock()
-            .await
-            .assign_task_to_queue(task_id, queue_id)
-            .await
+        if !self.tasks.lock().await.contains_key(task_id) {
+            return Err("任务不存在".into());
+        }
+        self.persist_task_queue_assignment(task_id, queue_id).await
     }
 
     /// Reorder queue priorities
     pub async fn reorder_queues(&self, queue_ids: Vec<String>) -> Result<(), String> {
-        self.queue_manager.lock().await.reorder_queues(queue_ids)
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let mut manager = self.queue_manager.lock().await;
+        let previous = manager.clone();
+        manager.reorder_queues(queue_ids)?;
+        if let Err(error) = self.persist_queues(&manager).await {
+            *manager = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Get queue manager save path for persistence
-    #[allow(dead_code)]
-    pub fn queue_save_path(&self) -> Option<PathBuf> {
-        self.save_path.as_ref().map(|p| {
-            p.parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("queues.json")
-        })
+    async fn persist_queues(
+        &self,
+        manager: &crate::engine::queue::QueueManager,
+    ) -> Result<(), String> {
+        if let Some(path) = &self.queue_store_path {
+            manager.save_to(path).await.map_err(|error| {
+                format!("queue persistence failed ({}): {error}", path.display())
+            })?;
+        }
+        Ok(())
     }
 
-    /// Save queue state
-    #[allow(dead_code)]
-    pub async fn save_queues(&self) {
-        if let Some(ref path) = self.queue_save_path() {
-            let manager = self.queue_manager.lock().await;
-            let _ = manager.save_to(path).await;
+    async fn persist_task_queue_assignment(
+        &self,
+        task_id: &str,
+        queue_id: &str,
+    ) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let manager = self.queue_manager.lock().await;
+        let previous = manager.clone();
+        if !manager.queues.contains_key(queue_id) {
+            return Err("Queue not found".into());
         }
+        for queue in manager.queues.values() {
+            queue.lock().remove_task(task_id);
+        }
+        manager.assign_task_to_queue(task_id, queue_id).await?;
+        if let Err(error) = self.persist_queues(&manager).await {
+            drop(manager);
+            *self.queue_manager.lock().await = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn persist_task_queue_removals(&self, task_ids: &[TaskId]) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let manager = self.queue_manager.lock().await;
+        let previous = manager.clone();
+        for queue in manager.queues.values() {
+            let mut queue = queue.lock();
+            for task_id in task_ids {
+                queue.remove_task(task_id);
+            }
+        }
+        if let Err(error) = self.persist_queues(&manager).await {
+            drop(manager);
+            *self.queue_manager.lock().await = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Get the queue ID for a task
@@ -1739,11 +1796,17 @@ impl Scheduler {
                 .await
             {
                 batch.task_ids.push(id);
-                batch.added_count += 1;
             }
+            batch.added_count = i + 1;
         }
         let id = batch.id.clone();
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let previous = self.batch_manager.list_jobs_full().await;
         self.batch_manager.add_job(batch).await;
+        if let Err(error) = self.persist_batches().await {
+            self.batch_manager.replace_jobs(previous).await;
+            return Err(error);
+        }
         self.save_tasks().await;
         Ok(id)
     }
@@ -1792,6 +1855,11 @@ impl Scheduler {
 
     /// Add an existing task to a batch
     pub async fn add_task_to_batch(&self, batch_id: &str, task_id: &str) -> Result<(), String> {
+        if !self.tasks.lock().await.contains_key(task_id) {
+            return Err("任务不存在".into());
+        }
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let previous = self.batch_manager.list_jobs_full().await;
         let mut job = self
             .batch_manager
             .get_job(batch_id)
@@ -1800,6 +1868,10 @@ impl Scheduler {
         if !job.task_ids.contains(&task_id.to_string()) {
             job.task_ids.push(task_id.to_string());
             self.batch_manager.update_job(job).await;
+            if let Err(error) = self.persist_batches().await {
+                self.batch_manager.replace_jobs(previous).await;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -1810,6 +1882,8 @@ impl Scheduler {
         batch_id: &str,
         task_id: &str,
     ) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let previous = self.batch_manager.list_jobs_full().await;
         let mut job = self
             .batch_manager
             .get_job(batch_id)
@@ -1817,13 +1891,42 @@ impl Scheduler {
             .ok_or("批量任务不存在")?;
         job.task_ids.retain(|id| id != task_id);
         self.batch_manager.update_job(job).await;
+        if let Err(error) = self.persist_batches().await {
+            self.batch_manager.replace_jobs(previous).await;
+            return Err(error);
+        }
         Ok(())
     }
 
     /// Delete a batch job (does not cancel the tasks in it)
     pub async fn delete_batch(&self, batch_id: &str) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let previous = self.batch_manager.list_jobs_full().await;
+        if self.batch_manager.get_job(batch_id).await.is_none() {
+            return Err("批量任务不存在".into());
+        }
         self.batch_manager.remove_job(batch_id).await;
+        if let Err(error) = self.persist_batches().await {
+            self.batch_manager.replace_jobs(previous).await;
+            return Err(error);
+        }
         Ok(())
+    }
+
+    async fn persist_batches(&self) -> Result<(), String> {
+        let Some(path) = &self.batch_store_path else {
+            return Ok(());
+        };
+        let records: Vec<_> = self
+            .batch_manager
+            .list_jobs_full()
+            .await
+            .iter()
+            .map(crate::engine::batch::BatchJobRecord::from)
+            .collect();
+        crate::engine::batch::save_batches(path, &records)
+            .await
+            .map_err(|error| format!("batch persistence failed ({}): {error}", path.display()))
     }
 
     // === Category Rules ===
@@ -2043,6 +2146,9 @@ impl Clone for Scheduler {
         Self {
             tasks: self.tasks.clone(),
             save_path: self.save_path.clone(),
+            queue_store_path: self.queue_store_path.clone(),
+            batch_store_path: self.batch_store_path.clone(),
+            lifecycle_persist_lock: self.lifecycle_persist_lock.clone(),
             queue_manager: self.queue_manager.clone(),
             active_task_counts: self.active_task_counts.clone(),
             batch_manager: self.batch_manager.clone(),
@@ -2565,6 +2671,171 @@ mod tests {
         assert!(scheduler.create_queue("Work".into(), 2).await.is_ok());
         assert!(scheduler.batch_manager.list_jobs_full().await.is_empty());
         assert!(scheduler.schedule_manager.get_rules().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_mutations_and_membership_survive_scheduler_reconstruction() {
+        let fixture = InitializationFixture::new();
+        let (scheduler, warnings) =
+            Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        assert!(warnings.is_empty());
+
+        let first = scheduler.create_queue("First".into(), 2).await.unwrap();
+        let second = scheduler.create_queue("Second".into(), 4).await.unwrap();
+        scheduler
+            .update_queue(&first, Some("Renamed".into()), Some(true), Some(5), None)
+            .await
+            .unwrap();
+        scheduler.pause_queue(&first).await.unwrap();
+        scheduler
+            .reorder_queues(vec![second.clone(), first.clone()])
+            .await
+            .unwrap();
+        let task_id = scheduler
+            .create_task(
+                "https://example.com/archive.zip".into(),
+                fixture.0.to_string_lossy().into_owned(),
+                Some("archive.zip".into()),
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(10),
+                    suggested_filename: "archive.zip".into(),
+                    final_url: "https://example.com/archive.zip".into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        scheduler
+            .assign_task_to_queue(&task_id, &first)
+            .await
+            .unwrap();
+
+        let (restored, warnings) =
+            Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        let queues = restored.list_queues().await;
+        assert_eq!(queues[0].id, second);
+        let first_summary = queues.iter().find(|queue| queue.id == first).unwrap();
+        assert_eq!(first_summary.name, "Renamed");
+        assert_eq!(first_summary.max_concurrent, 5);
+        assert!(first_summary.is_paused);
+        assert_eq!(
+            restored.get_task_queue(&task_id).await.as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_queue_persistence_rolls_back_memory_and_reports_failure() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        std::fs::create_dir(&paths.queues).unwrap();
+        let before = scheduler.list_queues().await;
+
+        let error = scheduler
+            .create_queue("Cannot persist".into(), 2)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("queue") || error.contains("Queue"));
+        assert_eq!(scheduler.list_queues().await.len(), before.len());
+    }
+
+    #[tokio::test]
+    async fn paused_queue_rejects_start_without_publishing_active_state() {
+        let fixture = InitializationFixture::new();
+        let (scheduler, _) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        let task_id = scheduler
+            .create_task(
+                "https://example.com/paused.bin".into(),
+                fixture.0.to_string_lossy().into_owned(),
+                Some("paused.bin".into()),
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(10),
+                    suggested_filename: "paused.bin".into(),
+                    final_url: "https://example.com/paused.bin".into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let queue_id = scheduler.get_task_queue(&task_id).await.unwrap();
+        scheduler.pause_queue(&queue_id).await.unwrap();
+
+        let error = scheduler
+            .start_download(&task_id, None, None, Some(1), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("暂停"));
+        assert_eq!(
+            scheduler.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Pending
+        );
+        assert!(scheduler.active_task_counts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_mutations_round_trip_and_failed_writes_roll_back() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        let batch_id = scheduler
+            .create_batch(
+                "Empty".into(),
+                vec![],
+                None,
+                None,
+                None,
+                Some("/tmp".into()),
+            )
+            .await
+            .unwrap();
+        let task_id = scheduler
+            .create_task(
+                "https://example.com/member.bin".into(),
+                fixture.0.to_string_lossy().into_owned(),
+                Some("member.bin".into()),
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(10),
+                    suggested_filename: "member.bin".into(),
+                    final_url: "https://example.com/member.bin".into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        scheduler
+            .add_task_to_batch(&batch_id, &task_id)
+            .await
+            .unwrap();
+
+        let (restored, warnings) =
+            Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            restored
+                .batch_manager
+                .get_job(&batch_id)
+                .await
+                .unwrap()
+                .task_ids,
+            vec![task_id]
+        );
+
+        std::fs::remove_file(&paths.batches).unwrap();
+        std::fs::create_dir(&paths.batches).unwrap();
+        let before = restored.batch_manager.list_jobs_full().await;
+        let error = restored.delete_batch(&batch_id).await.unwrap_err();
+        assert!(error.contains("batch") || error.contains("Batch") || error.contains("批"));
+        assert_eq!(
+            restored.batch_manager.list_jobs_full().await.len(),
+            before.len()
+        );
     }
 
     #[test]
