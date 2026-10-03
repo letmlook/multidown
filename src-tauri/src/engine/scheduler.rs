@@ -533,6 +533,58 @@ impl Scheduler {
         self.persist_task_records(&snapshots).await
     }
 
+    async fn persist_task_record_update(
+        &self,
+        task_id: &str,
+        update: impl FnOnce(&mut PersistedTask),
+    ) -> Result<Arc<Task>, String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let task = self
+            .tasks
+            .lock()
+            .await
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| "任务不存在".to_string())?;
+        let mut records = self.task_records().await;
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == task_id)
+            .ok_or_else(|| "任务不存在".to_string())?;
+        update(record);
+        self.persist_task_records(&records).await?;
+        Ok(task)
+    }
+
+    async fn persist_status_transition(
+        &self,
+        task_id: &str,
+        expected: &[TaskStatus],
+        status: TaskStatus,
+    ) -> Result<Arc<Task>, String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let task = self
+            .tasks
+            .lock()
+            .await
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| "任务不存在".to_string())?;
+        let current = *task.status.lock().await;
+        if !expected.is_empty() && !expected.contains(&current) {
+            return Err("任务状态不允许此操作".into());
+        }
+        let mut records = self.task_records().await;
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == task_id)
+            .ok_or_else(|| "任务不存在".to_string())?;
+        record.status = status;
+        self.persist_task_records(&records).await?;
+        *task.status.lock().await = status;
+        Ok(task)
+    }
+
     async fn lifecycle_snapshot(&self) -> LifecycleSnapshot {
         let tasks = self.tasks.lock().await.clone();
         let task_records = self.task_records().await;
@@ -654,6 +706,84 @@ impl Scheduler {
         }
 
         Ok(ids)
+    }
+
+    async fn commit_task_removals(&self, task_ids: &[TaskId]) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let previous = self.lifecycle_snapshot().await;
+        for task_id in task_ids {
+            if !previous.tasks.contains_key(task_id) {
+                return Err("任务不存在".into());
+            }
+        }
+
+        {
+            let mut tasks = self.tasks.lock().await;
+            for task_id in task_ids {
+                tasks.remove(task_id);
+            }
+        }
+        {
+            let manager = self.queue_manager.lock().await;
+            for queue in manager.queues.values() {
+                let mut queue = queue.lock();
+                for task_id in task_ids {
+                    queue.remove_task(task_id);
+                }
+            }
+        }
+        let mut current_batches = self.batch_manager.list_jobs_full().await;
+        for batch in &mut current_batches {
+            batch.task_ids.retain(|task_id| !task_ids.contains(task_id));
+        }
+        self.batch_manager
+            .replace_jobs(current_batches.clone())
+            .await;
+
+        if let Err(primary) = self.persist_batch_jobs(&current_batches).await {
+            *self.tasks.lock().await = previous.tasks;
+            *self.queue_manager.lock().await = previous.queues;
+            self.batch_manager.replace_jobs(previous.batches).await;
+            return Err(primary);
+        }
+
+        let queue_result = {
+            let manager = self.queue_manager.lock().await;
+            self.persist_queues(&manager).await
+        };
+        if let Err(primary) = queue_result {
+            let mut rollback = Vec::new();
+            if let Err(error) = self.persist_batch_jobs(&previous.batches).await {
+                rollback.push(error);
+            } else {
+                self.batch_manager
+                    .replace_jobs(previous.batches.clone())
+                    .await;
+            }
+            *self.tasks.lock().await = previous.tasks;
+            *self.queue_manager.lock().await = previous.queues;
+            return Err(Self::transaction_error(primary, rollback));
+        }
+
+        let current_task_records = self.task_records().await;
+        if let Err(primary) = self.persist_task_records(&current_task_records).await {
+            let mut rollback = Vec::new();
+            if let Err(error) = self.persist_queues(&previous.queues).await {
+                rollback.push(error);
+            } else {
+                *self.queue_manager.lock().await = previous.queues.clone();
+            }
+            if let Err(error) = self.persist_batch_jobs(&previous.batches).await {
+                rollback.push(error);
+            } else {
+                self.batch_manager
+                    .replace_jobs(previous.batches.clone())
+                    .await;
+            }
+            *self.tasks.lock().await = previous.tasks;
+            return Err(Self::transaction_error(primary, rollback));
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1076,13 +1206,6 @@ impl Scheduler {
             }
         }
         let active_slot = self.reserve_active_slot(task_id).await?;
-        {
-            let mut st = task.status.lock().await;
-            if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
-                return Err("任务状态不允许开始".to_string());
-            }
-            *st = TaskStatus::Downloading;
-        }
 
         if let Some(parent) = std::path::Path::new(&task.save_path).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -1140,6 +1263,12 @@ impl Scheduler {
                 return Ok(());
             }
         };
+        self.persist_status_transition(
+            task_id,
+            &[TaskStatus::Pending, TaskStatus::Paused],
+            TaskStatus::Downloading,
+        )
+        .await?;
 
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id_s.clone();
@@ -1269,13 +1398,6 @@ impl Scheduler {
             was_paused = *st == TaskStatus::Paused;
         }
         let active_slot = self.reserve_active_slot(&task_id).await?;
-        {
-            let mut st = task.status.lock().await;
-            if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
-                return Err("任务状态不允许开始".to_string());
-            }
-            *st = TaskStatus::Downloading;
-        }
 
         let scheduler_self = scheduler_for_save
             .clone()
@@ -1355,6 +1477,27 @@ impl Scheduler {
             if let Err(e) = engine.resume(&task_id).await {
                 fail!(format!("恢复种子下载失败: {e}"));
             }
+        }
+
+        if let Err(primary) = self
+            .persist_status_transition(
+                &task_id,
+                &[TaskStatus::Pending, TaskStatus::Paused],
+                TaskStatus::Downloading,
+            )
+            .await
+        {
+            let cleanup = if was_paused {
+                engine.pause(&task_id).await
+            } else {
+                engine.remove(&task_id, false).await
+            };
+            return Err(match cleanup {
+                Ok(()) => primary,
+                Err(error) => {
+                    format!("{primary}; torrent admission cleanup failed for {task_id}: {error}")
+                }
+            });
         }
 
         // 通知前端元数据已就绪（文件名/总大小/文件列表此刻才确定）
@@ -1542,8 +1685,21 @@ impl Scheduler {
                 .cloned()
                 .ok_or_else(|| "任务不存在".to_string())?
         };
+        if *task.status.lock().await != TaskStatus::Failed {
+            return Err("只有失败的任务可以重试".to_string());
+        }
+        let task = self
+            .persist_task_record_update(task_id, |record| {
+                record.status = TaskStatus::Pending;
+                record.downloaded_bytes = 0;
+                record.pending_segments = record
+                    .total_bytes
+                    .filter(|total| *total > 0)
+                    .map(|total| vec![(0, total - 1)])
+                    .unwrap_or_default();
+            })
+            .await?;
         Self::reset_failed_task(&task).await?;
-        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1554,20 +1710,43 @@ impl Scheduler {
             .get_job(batch_id)
             .await
             .ok_or("批次不存在")?;
-        let tasks = self.tasks.lock().await;
-        let mut n = 0;
-        for id in &job.task_ids {
-            if let Some(task) = tasks.get(id) {
-                if *task.status.lock().await == TaskStatus::Failed
-                    && Self::reset_failed_task(task).await.is_ok()
-                {
-                    n += 1;
+        let mut retry_tasks = Vec::new();
+        {
+            let tasks = self.tasks.lock().await;
+            for id in &job.task_ids {
+                if let Some(task) = tasks.get(id) {
+                    if *task.status.lock().await == TaskStatus::Failed {
+                        retry_tasks.push(task.clone());
+                    }
                 }
             }
         }
-        drop(tasks);
-        self.save_tasks().await?;
-        Ok(n)
+        if retry_tasks.is_empty() {
+            return Ok(0);
+        }
+        let retry_ids: std::collections::HashSet<_> =
+            retry_tasks.iter().map(|task| task.id.clone()).collect();
+        {
+            let _transaction = self.lifecycle_persist_lock.lock().await;
+            let mut records = self.task_records().await;
+            for record in records
+                .iter_mut()
+                .filter(|record| retry_ids.contains(&record.id))
+            {
+                record.status = TaskStatus::Pending;
+                record.downloaded_bytes = 0;
+                record.pending_segments = record
+                    .total_bytes
+                    .filter(|total| *total > 0)
+                    .map(|total| vec![(0, total - 1)])
+                    .unwrap_or_default();
+            }
+            self.persist_task_records(&records).await?;
+        }
+        for task in &retry_tasks {
+            Self::reset_failed_task(task).await?;
+        }
+        Ok(retry_tasks.len())
     }
 
     /// 把失败任务重置为 Pending 并恢复全量分段
@@ -1618,12 +1797,12 @@ impl Scheduler {
                 .cloned()
                 .ok_or_else(|| "任务不存在".to_string())?
         };
-        {
-            let mut st = task.status.lock().await;
-            if *st == TaskStatus::Downloading {
-                *st = TaskStatus::Paused;
-            }
+        if *task.status.lock().await != TaskStatus::Downloading {
+            return Ok(());
         }
+        let task = self
+            .persist_status_transition(task_id, &[TaskStatus::Downloading], TaskStatus::Paused)
+            .await?;
         // 种子任务直接暂停引擎里的 torrent，不必等轮询器发现状态变化（手感差异明显）
         if task.kind.is_torrent() {
             if let Ok(engine) = self.torrent_engine().await {
@@ -1632,7 +1811,6 @@ impl Scheduler {
                 }
             }
         }
-        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1655,30 +1833,15 @@ impl Scheduler {
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> Result<(), String> {
-        let tasks = self.tasks.lock().await;
-        let task = tasks.get(task_id).ok_or_else(|| "任务不存在".to_string())?;
-        let mut st = task.status.lock().await;
-        *st = TaskStatus::Cancelled;
+        self.persist_status_transition(task_id, &[], TaskStatus::Cancelled)
+            .await?;
         Ok(())
     }
 
     /// 删除任务：先取消再从列表移除并持久化，任务记录从文件中删除
     pub async fn remove_task(&self, task_id: &str) -> Result<(), String> {
-        {
-            let tasks = self.tasks.lock().await;
-            tasks.get(task_id).ok_or_else(|| "任务不存在".to_string())?;
-        }
         let removed_task_ids = [task_id.to_string()];
-        self.persist_task_queue_removals(&removed_task_ids).await?;
-        {
-            let mut tasks = self.tasks.lock().await;
-            if let Some(task) = tasks.get(task_id) {
-                *task.status.lock().await = TaskStatus::Cancelled;
-            }
-            tasks.remove(task_id);
-        }
-        self.save_tasks().await?;
-        Ok(())
+        self.commit_task_removals(&removed_task_ids).await
     }
 
     pub async fn list_downloads(&self) -> Vec<TaskInfo> {
@@ -1704,14 +1867,7 @@ impl Scheduler {
         if to_remove.is_empty() {
             return Ok(0);
         }
-        self.persist_task_queue_removals(&to_remove).await?;
-        {
-            let mut tasks = self.tasks.lock().await;
-            for id in &to_remove {
-                tasks.remove(id);
-            }
-        }
-        self.save_tasks().await?;
+        self.commit_task_removals(&to_remove).await?;
         Ok(to_remove.len())
     }
 
@@ -1904,24 +2060,6 @@ impl Scheduler {
             queue.lock().remove_task(task_id);
         }
         manager.assign_task_to_queue(task_id, queue_id).await?;
-        if let Err(error) = self.persist_queues(&manager).await {
-            drop(manager);
-            *self.queue_manager.lock().await = previous;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn persist_task_queue_removals(&self, task_ids: &[TaskId]) -> Result<(), String> {
-        let _transaction = self.lifecycle_persist_lock.lock().await;
-        let manager = self.queue_manager.lock().await;
-        let previous = manager.clone();
-        for queue in manager.queues.values() {
-            let mut queue = queue.lock();
-            for task_id in task_ids {
-                queue.remove_task(task_id);
-            }
-        }
         if let Err(error) = self.persist_queues(&manager).await {
             drop(manager);
             *self.queue_manager.lock().await = previous;
@@ -2135,15 +2273,17 @@ impl Scheduler {
     }
 
     async fn persist_batches(&self) -> Result<(), String> {
+        let jobs = self.batch_manager.list_jobs_full().await;
+        self.persist_batch_jobs(&jobs).await
+    }
+
+    async fn persist_batch_jobs(&self, jobs: &[BatchJob]) -> Result<(), String> {
         #[cfg(test)]
         self.inject_persistence_failure("batches")?;
         let Some(path) = &self.batch_store_path else {
             return Ok(());
         };
-        let records: Vec<_> = self
-            .batch_manager
-            .list_jobs_full()
-            .await
+        let records: Vec<_> = jobs
             .iter()
             .map(crate::engine::batch::BatchJobRecord::from)
             .collect();
@@ -3328,6 +3468,213 @@ mod tests {
             scheduler.get_task(&task_id).await.unwrap().status,
             TaskStatus::Failed
         );
+    }
+
+    async fn task_with_batch(
+        fixture: &InitializationFixture,
+        status: TaskStatus,
+    ) -> (Scheduler, String, String) {
+        let (scheduler, _) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        let task_id = scheduler
+            .create_task(
+                format!("https://example.com/{status:?}.bin"),
+                fixture.0.to_string_lossy().into_owned(),
+                Some(format!("{status:?}.bin")),
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(10),
+                    suggested_filename: format!("{status:?}.bin"),
+                    final_url: format!("https://example.com/{status:?}.bin"),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let batch_id = scheduler
+            .create_batch(
+                "Membership".into(),
+                vec![],
+                None,
+                None,
+                None,
+                Some("/tmp".into()),
+            )
+            .await
+            .unwrap();
+        scheduler
+            .add_task_to_batch(&batch_id, &task_id)
+            .await
+            .unwrap();
+        {
+            let task = scheduler.tasks.lock().await[&task_id].clone();
+            *task.status.lock().await = status;
+        }
+        scheduler.save_tasks().await.unwrap();
+        (scheduler, task_id, batch_id)
+    }
+
+    #[tokio::test]
+    async fn remove_task_rolls_back_all_metadata_stores_on_each_save_failure() {
+        for failed_store in ["batches", "queues", "tasks"] {
+            let fixture = InitializationFixture::new();
+            let paths = fixture.paths();
+            let (scheduler, task_id, batch_id) =
+                task_with_batch(&fixture, TaskStatus::Pending).await;
+            scheduler.install_persistence_test_failures(&[failed_store]);
+
+            let error = scheduler.remove_task(&task_id).await.unwrap_err();
+
+            assert!(error.contains(failed_store), "{failed_store}: {error}");
+            assert!(scheduler.get_task(&task_id).await.is_some());
+            assert!(scheduler.get_task_queue(&task_id).await.is_some());
+            assert!(scheduler
+                .batch_manager
+                .get_job(&batch_id)
+                .await
+                .unwrap()
+                .task_ids
+                .contains(&task_id));
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{failed_store}: {warnings:?}");
+            assert!(restored.get_task(&task_id).await.is_some());
+            assert!(restored.get_task_queue(&task_id).await.is_some());
+            assert!(restored
+                .batch_manager
+                .get_job(&batch_id)
+                .await
+                .unwrap()
+                .task_ids
+                .contains(&task_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_completed_rolls_back_all_metadata_stores_on_each_save_failure() {
+        for failed_store in ["batches", "queues", "tasks"] {
+            let fixture = InitializationFixture::new();
+            let paths = fixture.paths();
+            let (scheduler, task_id, batch_id) =
+                task_with_batch(&fixture, TaskStatus::Completed).await;
+            scheduler.install_persistence_test_failures(&[failed_store]);
+
+            let error = scheduler.clear_completed_tasks().await.unwrap_err();
+
+            assert!(error.contains(failed_store), "{failed_store}: {error}");
+            assert!(scheduler.get_task(&task_id).await.is_some());
+            assert!(scheduler.get_task_queue(&task_id).await.is_some());
+            assert!(scheduler
+                .batch_manager
+                .get_job(&batch_id)
+                .await
+                .unwrap()
+                .task_ids
+                .contains(&task_id));
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{failed_store}: {warnings:?}");
+            assert!(restored.get_task(&task_id).await.is_some());
+            assert!(restored.get_task_queue(&task_id).await.is_some());
+            assert!(restored
+                .batch_manager
+                .get_job(&batch_id)
+                .await
+                .unwrap()
+                .task_ids
+                .contains(&task_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn task_removals_delete_queue_and_batch_memberships_across_reconstruction() {
+        for (operation, status) in [
+            ("remove", TaskStatus::Pending),
+            ("clear", TaskStatus::Completed),
+        ] {
+            let fixture = InitializationFixture::new();
+            let paths = fixture.paths();
+            let (scheduler, task_id, batch_id) = task_with_batch(&fixture, status).await;
+
+            match operation {
+                "remove" => scheduler.remove_task(&task_id).await.unwrap(),
+                "clear" => assert_eq!(scheduler.clear_completed_tasks().await.unwrap(), 1),
+                _ => unreachable!(),
+            }
+
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{operation}: {warnings:?}");
+            assert!(restored.get_task(&task_id).await.is_none());
+            assert!(restored.get_task_queue(&task_id).await.is_none());
+            assert!(!restored
+                .batch_manager
+                .get_job(&batch_id)
+                .await
+                .unwrap()
+                .task_ids
+                .contains(&task_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn status_mutations_roll_back_when_task_persistence_fails() {
+        for (operation, initial) in [
+            ("pause", TaskStatus::Downloading),
+            ("retry", TaskStatus::Failed),
+            ("cancel", TaskStatus::Pending),
+        ] {
+            let fixture = InitializationFixture::new();
+            let (scheduler, task_id, _) = task_with_batch(&fixture, initial).await;
+            scheduler.install_persistence_test_failures(&["tasks"]);
+            let result = match operation {
+                "pause" => scheduler.pause_task(&task_id).await,
+                "retry" => scheduler.retry_task(&task_id).await,
+                "cancel" => scheduler.cancel_task(&task_id).await,
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{operation} reported success");
+            assert_eq!(scheduler.get_task(&task_id).await.unwrap().status, initial);
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_retry_and_cancel_persist_across_reconstruction() {
+        for (operation, initial, expected) in [
+            ("pause", TaskStatus::Downloading, TaskStatus::Paused),
+            ("retry", TaskStatus::Failed, TaskStatus::Pending),
+            ("cancel", TaskStatus::Pending, TaskStatus::Cancelled),
+        ] {
+            let fixture = InitializationFixture::new();
+            let paths = fixture.paths();
+            let (scheduler, task_id, _) = task_with_batch(&fixture, initial).await;
+
+            match operation {
+                "pause" => scheduler.pause_task(&task_id).await.unwrap(),
+                "retry" => scheduler.retry_task(&task_id).await.unwrap(),
+                "cancel" => scheduler.cancel_task(&task_id).await.unwrap(),
+                _ => unreachable!(),
+            }
+
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{operation}: {warnings:?}");
+            assert_eq!(restored.get_task(&task_id).await.unwrap().status, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_persistence_failure_restores_paused_status_and_releases_slot() {
+        let fixture = InitializationFixture::new();
+        let (scheduler, task_id, _) = task_with_batch(&fixture, TaskStatus::Paused).await;
+        scheduler.install_persistence_test_failures(&["tasks"]);
+
+        let error = scheduler
+            .resume_task(&task_id, None, None, Some(1), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("tasks"));
+        assert_eq!(
+            scheduler.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert!(scheduler.active_task_counts.lock().is_empty());
     }
 
     #[test]
