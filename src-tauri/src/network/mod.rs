@@ -7,7 +7,8 @@ pub mod system_proxy;
 pub use client::Error as NetworkError;
 pub use client::{
     build_client_from_options, open_range, probe, probe_with_client, probe_with_options,
-    validate_resume_identity, AuthConfig, NetworkOptions, ProbeResult, RangeResponse,
+    resume_validator, validate_resume_identity, AuthConfig, NetworkOptions, ProbeResult,
+    RangeResponse,
 };
 pub use rate_limit::TokenBucket;
 pub use system_proxy::detect_system_proxy;

@@ -11,7 +11,7 @@ use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskInfo, TaskStatus, TorrentMeta, TorrentStatsSnapshot};
 use crate::engine::writer::{run_file_writer, WriterMessage};
 use crate::network::{
-    build_client_from_options, probe, probe_with_client, probe_with_options,
+    build_client_from_options, probe, probe_with_client, probe_with_options, resume_validator,
     validate_resume_identity, AuthConfig, NetworkOptions, ProbeResult, RangeResponse, TokenBucket,
 };
 use crate::storage::{LoadReport, RecoveryWarning, StoreError};
@@ -248,6 +248,10 @@ pub struct Scheduler {
     admission_test_barrier: Arc<ParkingMutex<Option<Arc<tokio::sync::Barrier>>>>,
     #[cfg(test)]
     persistence_test_failures: Arc<ParkingMutex<std::collections::VecDeque<&'static str>>>,
+    #[cfg(test)]
+    writer_test_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    writer_test_join_failure: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct LifecycleSnapshot {
@@ -260,6 +264,42 @@ struct LifecycleSnapshot {
 struct ActiveSlot {
     counts: Arc<ParkingMutex<HashMap<String, usize>>>,
     queue_id: String,
+}
+
+fn validate_persisted_http_ranges(
+    total: Option<u64>,
+    downloaded: u64,
+    pending: &std::collections::VecDeque<(u64, u64)>,
+) -> Result<(), String> {
+    let total =
+        total.ok_or_else(|| "unsafe persisted segment state: total length missing".to_string())?;
+    if total == 0 || pending.is_empty() {
+        return Err("unsafe persisted segment state: pending ranges are empty".into());
+    }
+    let mut ranges: Vec<_> = pending.iter().copied().collect();
+    ranges.sort_unstable_by_key(|range| range.0);
+    let mut pending_bytes = 0u64;
+    let mut previous_end = None;
+    for (start, end) in ranges {
+        if start > end || end >= total {
+            return Err(format!(
+                "unsafe persisted segment state: range {start}-{end} exceeds total {total}"
+            ));
+        }
+        if previous_end.is_some_and(|previous| start <= previous) {
+            return Err("unsafe persisted segment state: pending ranges overlap".into());
+        }
+        pending_bytes = pending_bytes.checked_add(end - start + 1).ok_or_else(|| {
+            "unsafe persisted segment state: byte accounting overflow".to_string()
+        })?;
+        previous_end = Some(end);
+    }
+    if downloaded.checked_add(pending_bytes) != Some(total) {
+        return Err(format!(
+            "unsafe persisted segment state: downloaded {downloaded} plus pending {pending_bytes} does not equal total {total}"
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for ActiveSlot {
@@ -287,6 +327,18 @@ impl Scheduler {
     #[cfg(test)]
     fn install_persistence_test_failures(&self, domains: &[&'static str]) {
         *self.persistence_test_failures.lock() = domains.iter().copied().collect();
+    }
+
+    #[cfg(test)]
+    fn install_writer_test_failure(&self) {
+        self.writer_test_failure
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn install_writer_test_join_failure(&self) {
+        self.writer_test_join_failure
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -428,6 +480,10 @@ impl Scheduler {
             persistence_test_failures: Arc::new(ParkingMutex::new(
                 std::collections::VecDeque::new(),
             )),
+            #[cfg(test)]
+            writer_test_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            writer_test_join_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         scheduler.update_from_settings(&crate::settings::AppSettings::default());
         scheduler
@@ -1349,9 +1405,29 @@ impl Scheduler {
                 let (tx, rx) = mpsc::channel::<WriterMessage>(32);
                 let path_attempt = path.clone();
                 let total_attempt = total_bytes;
+                #[cfg(test)]
+                let inject_writer_failure = scheduler_clone
+                    .writer_test_failure
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                let inject_writer_join_failure = scheduler_clone
+                    .writer_test_join_failure
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
                 let writer_handle = tokio::spawn(async move {
-                    let _ = run_file_writer(path_attempt, total_attempt, rx).await;
+                    let result = run_file_writer(path_attempt, total_attempt, rx).await;
+                    #[cfg(test)]
+                    if inject_writer_failure {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected writer permission failure",
+                        ));
+                    }
+                    result
                 });
+                #[cfg(test)]
+                if inject_writer_join_failure {
+                    writer_handle.abort();
+                }
 
                 let mut handles = Vec::new();
                 for _ in 0..n_workers {
@@ -1383,7 +1459,26 @@ impl Scheduler {
                     let _ = h.await;
                 }
                 drop(tx);
-                let _ = writer_handle.await;
+                let writer_result = match writer_handle.await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(error) => Err(format!("writer task join failed: {error}")),
+                };
+                if let Err(error) = writer_result {
+                    *task_clone.error_message.lock().await =
+                        Some(format!("download writer failed: {error}"));
+                    *task_clone.status.lock().await = TaskStatus::Failed;
+                    if let Some(app) = &app_handle_clone {
+                        let _ = app.emit(
+                            "download-finished",
+                            (
+                                task_id_clone.clone(),
+                                "failed".to_string(),
+                                task_clone.filename.clone(),
+                            ),
+                        );
+                    }
+                    break;
+                }
 
                 let final_status = *task_clone.status.lock().await;
                 if final_status == TaskStatus::Downloading {
@@ -1535,6 +1630,66 @@ impl Scheduler {
                     continue;
                 }
             };
+            let downloaded = task.downloaded_bytes();
+            let pending = task.pending_segments.lock().await.clone();
+            if let Err(message) =
+                validate_persisted_http_ranges(task.total_bytes, downloaded, &pending)
+            {
+                let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
+                summary.failures.push(RecoveryFailure {
+                    task_id: task_id.clone(),
+                    message: persisted
+                        .err()
+                        .map(|error| format!("{message}; {error}"))
+                        .unwrap_or(message),
+                });
+                summary.failed += 1;
+                drop(active_slot);
+                continue;
+            }
+            let mut restart = false;
+            if downloaded > 0 {
+                match tokio::fs::symlink_metadata(&task.save_path).await {
+                    Ok(metadata) if !metadata.file_type().is_file() => {
+                        let message =
+                            "HTTP recovery destination is not a regular file; refusing to write"
+                                .to_string();
+                        let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
+                        summary.failures.push(RecoveryFailure {
+                            task_id: task_id.clone(),
+                            message: persisted
+                                .err()
+                                .map(|error| format!("{message}; {error}"))
+                                .unwrap_or(message),
+                        });
+                        summary.failed += 1;
+                        drop(active_slot);
+                        continue;
+                    }
+                    Ok(metadata) => {
+                        restart = Some(metadata.len()) != task.total_bytes;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        restart = true;
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "HTTP recovery could not inspect destination as a regular file: {error}"
+                        );
+                        let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
+                        summary.failures.push(RecoveryFailure {
+                            task_id: task_id.clone(),
+                            message: persisted
+                                .err()
+                                .map(|error| format!("{message}; {error}"))
+                                .unwrap_or(message),
+                        });
+                        summary.failed += 1;
+                        drop(active_slot);
+                        continue;
+                    }
+                }
+            }
             let effective_options = self.effective_network_options(&task, network_options.clone());
             let client = match build_client_from_options(&effective_options) {
                 Ok(client) => client,
@@ -1576,34 +1731,22 @@ impl Scheduler {
                 }
             };
 
-            let downloaded = task.downloaded_bytes();
             let expected_etag = task.etag.lock().await.clone();
             let expected_last_modified = task.last_modified.lock().await.clone();
-            let pending = task.pending_segments.lock().await.clone();
             let invalid_total = task.total_bytes != probe.total_bytes;
-            let invalid_segments = task.total_bytes.is_none_or(|total| {
-                pending.is_empty()
-                    || pending
-                        .iter()
-                        .any(|(start, end)| start > end || *end >= total)
-            });
             let identity_error = validate_resume_identity(
                 expected_etag.as_deref(),
                 expected_last_modified.as_deref(),
                 &probe,
             )
             .err();
-            if identity_error.is_some() || invalid_total || (downloaded > 0 && invalid_segments) {
+            if identity_error.is_some() || invalid_total {
                 let message = identity_error.map_or_else(
                     || {
-                        if invalid_total {
-                            format!(
-                                "remote representation changed: expected length {:?}, received {:?}",
-                                task.total_bytes, probe.total_bytes
-                            )
-                        } else {
-                            "unsafe persisted segment state; explicit retry is required".into()
-                        }
+                        format!(
+                            "remote representation changed: expected length {:?}, received {:?}",
+                            task.total_bytes, probe.total_bytes
+                        )
                     },
                     |error| error.to_string(),
                 );
@@ -1620,16 +1763,11 @@ impl Scheduler {
                 continue;
             }
 
-            let target_exists = tokio::fs::try_exists(&task.save_path)
-                .await
-                .unwrap_or(false);
-            let mut restart = (downloaded == 0 && invalid_segments)
-                || (downloaded > 0 && (!probe.supports_range || !target_exists));
+            let if_range =
+                resume_validator(expected_etag.as_deref(), expected_last_modified.as_deref());
+            restart |= downloaded > 0 && (!probe.supports_range || if_range.is_none());
             if downloaded > 0 && !restart {
                 let (start, _) = pending.front().expect("validated non-empty segments");
-                let if_range = expected_etag
-                    .as_deref()
-                    .or(expected_last_modified.as_deref());
                 match crate::network::open_range(
                     &client,
                     &task.url,
@@ -1641,7 +1779,7 @@ impl Scheduler {
                 .await
                 {
                     Ok(RangeResponse::Body { .. }) => {}
-                    Ok(RangeResponse::FileChanged { .. }) => restart = true,
+                    Ok(RangeResponse::FileChanged) => restart = true,
                     Err(error) => {
                         let message = format!("HTTP recovery range validation failed: {error}");
                         let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
@@ -2855,6 +2993,10 @@ impl Clone for Scheduler {
             admission_test_barrier: self.admission_test_barrier.clone(),
             #[cfg(test)]
             persistence_test_failures: self.persistence_test_failures.clone(),
+            #[cfg(test)]
+            writer_test_failure: self.writer_test_failure.clone(),
+            #[cfg(test)]
+            writer_test_join_failure: self.writer_test_join_failure.clone(),
         }
     }
 }
@@ -2980,10 +3122,13 @@ async fn run_worker(
         let Some((start, end)) = task.take_next_segment() else {
             break;
         };
-        let if_range = task.etag.lock().await.clone();
+        let etag = task.etag.lock().await.clone();
+        let last_modified = task.last_modified.lock().await.clone();
+        let if_range =
+            resume_validator(etag.as_deref(), last_modified.as_deref()).map(str::to_owned);
 
         // 下载单个分段：网络错误按指数退避重试同一段，耗尽后才判任务失败；
-        // 远端文件变更（If-Range 未满足）则重置任务全量重下
+        // If-Range 未满足时必须失败，绝不能把新表示拼入旧文件。
         let mut attempt: u32 = 0;
         loop {
             let mut written: u64 = 0;
@@ -2998,13 +3143,21 @@ async fn run_worker(
             )
             .await
             {
-                Ok(crate::network::RangeResponse::FileChanged {
-                    etag,
-                    last_modified,
-                }) => {
-                    task.reset_for_restart(etag, last_modified).await;
+                Ok(crate::network::RangeResponse::FileChanged) => {
+                    *task.error_message.lock().await = Some(
+                        "remote representation changed during download; explicit retry required"
+                            .into(),
+                    );
+                    *task.status.lock().await = TaskStatus::Failed;
                     if let Some(app) = &app_handle {
-                        let _ = app.emit("download-progress", ());
+                        let _ = app.emit(
+                            "download-finished",
+                            (
+                                _task_id.to_string(),
+                                "failed".to_string(),
+                                task.filename.clone(),
+                            ),
+                        );
                     }
                     Ok(false)
                 }
@@ -3023,6 +3176,9 @@ async fn run_worker(
                                 let len = chunk.len() as u64;
                                 bucket.acquire(chunk.len()).await;
                                 if tx.send((offset, chunk)).await.is_err() {
+                                    stream_result = Err(crate::network::NetworkError::Protocol(
+                                        "download writer channel closed".into(),
+                                    ));
                                     break;
                                 }
                                 offset += len;
@@ -3040,7 +3196,11 @@ async fn run_worker(
                         }
                     }
                     match stream_result {
-                        Ok(()) => Ok(true),
+                        Ok(()) if written == end - start + 1 => Ok(true),
+                        Ok(()) => Err(crate::network::NetworkError::Protocol(format!(
+                            "response body length {written} does not match requested range length {}",
+                            end - start + 1
+                        ))),
                         Err(e) => Err(e),
                     }
                 }
@@ -3049,7 +3209,7 @@ async fn run_worker(
 
             match outcome {
                 Ok(true) => break,   // 段完成
-                Ok(false) => return, // 远端文件已变更并重置，退出本 worker 由新段驱动
+                Ok(false) => return, // 远端文件已变更，任务已失败
                 Err(e) => {
                     // 回退已计入的进度并重试整段
                     if written > 0 {
@@ -3063,7 +3223,9 @@ async fn run_worker(
                         }
                         return;
                     }
-                    if attempt >= max_retries {
+                    if matches!(&e, crate::network::NetworkError::Protocol(_))
+                        || attempt >= max_retries
+                    {
                         let _ = task.error_message.lock().await.insert(e.to_string());
                         let mut st = task.status.lock().await;
                         *st = TaskStatus::Failed;
@@ -3181,7 +3343,7 @@ mod tests {
         use super::*;
         use crate::engine::persistence::{save_tasks_to_file, PersistedTask};
         use crate::engine::types::TaskKind;
-        use std::sync::atomic::Ordering;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         const BODY: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
@@ -3189,6 +3351,7 @@ mod tests {
             url: String,
             requests: Arc<ParkingMutex<Vec<String>>>,
             get_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+            reject_range_after: Arc<AtomicUsize>,
             handle: tokio::task::JoinHandle<()>,
         }
 
@@ -3202,12 +3365,17 @@ mod tests {
                 let last_modified = last_modified.to_string();
                 let get_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let delay_for_server = get_delay_ms.clone();
+                let reject_range_after = Arc::new(AtomicUsize::new(usize::MAX));
+                let reject_for_server = reject_range_after.clone();
+                let range_request_count = Arc::new(AtomicUsize::new(0));
                 let handle = tokio::spawn(async move {
                     while let Ok((mut stream, _)) = listener.accept().await {
                         let requests = requests_for_server.clone();
                         let etag = etag.clone();
                         let last_modified = last_modified.clone();
                         let delay = delay_for_server.clone();
+                        let reject_after = reject_for_server.clone();
+                        let range_count = range_request_count.clone();
                         tokio::spawn(async move {
                             use tokio::io::{AsyncReadExt, AsyncWriteExt};
                             let mut buffer = vec![0; 8192];
@@ -3237,6 +3405,9 @@ mod tests {
                             let validator_matches = if_range
                                 .map(|value| value == etag || value == last_modified)
                                 .unwrap_or(true);
+                            let range_rejected = range.is_some()
+                                && range_count.fetch_add(1, Ordering::Relaxed)
+                                    >= reject_after.load(Ordering::Relaxed);
                             let common = format!(
                                 "ETag: {etag}\r\nLast-Modified: {last_modified}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n"
                             );
@@ -3258,7 +3429,7 @@ mod tests {
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
                                     .await;
                             }
-                            if supports_range && validator_matches {
+                            if supports_range && validator_matches && !range_rejected {
                                 if let Some((start, end)) = range {
                                     let body = &BODY[start..=end];
                                     let response = format!(
@@ -3284,6 +3455,7 @@ mod tests {
                     url: format!("http://{address}/recovery.bin"),
                     requests,
                     get_delay_ms,
+                    reject_range_after,
                     handle,
                 }
             }
@@ -3344,6 +3516,20 @@ mod tests {
             scheduler
         }
 
+        fn write_preallocated_prefix(path: &std::path::Path, prefix: &[u8]) {
+            use std::io::{Seek, Write};
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            file.set_len(BODY.len() as u64).unwrap();
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            file.write_all(prefix).unwrap();
+            file.sync_all().unwrap();
+        }
+
         async fn wait_for_status(scheduler: &Scheduler, id: &str, expected: TaskStatus) {
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
@@ -3363,7 +3549,7 @@ mod tests {
             let server =
                 RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
             let target = fixture.0.join("resume.bin");
-            std::fs::write(&target, &BODY[..10]).unwrap();
+            write_preallocated_prefix(&target, &BODY[..10]);
             let mut record = recovery_record(
                 "resume",
                 &server.url,
@@ -3403,7 +3589,7 @@ mod tests {
                 ),
                 (
                     "last-modified-changed",
-                    Some("\"stable\""),
+                    Some("W/\"weak\""),
                     Some("Tue, 20 Oct 2026 07:28:00 GMT"),
                 ),
             ] {
@@ -3472,6 +3658,294 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn http_recovery_restarts_instead_of_appending_to_a_truncated_target() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("truncated.bin");
+            std::fs::write(&target, &BODY[..10]).unwrap();
+            let record = recovery_record(
+                "truncated",
+                &server.url,
+                target.clone(),
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 2, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            assert_eq!(summary.restarted, 1);
+            wait_for_status(&scheduler, "truncated", TaskStatus::Completed).await;
+            assert_eq!(std::fs::read(target).unwrap(), BODY);
+        }
+
+        #[tokio::test]
+        async fn http_recovery_rejects_overlapping_or_inconsistent_pending_ranges() {
+            for (id, downloaded, pending) in [
+                ("overlap", 10, vec![(10, 25), (20, 35)]),
+                ("accounting", 9, vec![(10, 35)]),
+                ("out-of-bounds", 10, vec![(10, 36)]),
+            ] {
+                let fixture = InitializationFixture::new();
+                let server =
+                    RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true)
+                        .await;
+                let target = fixture.0.join(format!("{id}.bin"));
+                let original = vec![b'x'; BODY.len()];
+                std::fs::write(&target, &original).unwrap();
+                let mut record = recovery_record(
+                    id,
+                    &server.url,
+                    target.clone(),
+                    TaskStatus::Downloading,
+                    Some("\"stable\""),
+                    None,
+                );
+                record.downloaded_bytes = downloaded;
+                record.pending_segments = pending;
+                let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+                let summary = scheduler
+                    .recover_tasks(None, 2, NetworkOptions::default())
+                    .await;
+
+                assert_eq!(summary.started, 0, "{id}");
+                assert_eq!(summary.failed, 1, "{id}");
+                let task = scheduler.get_task(id).await.unwrap();
+                assert_eq!(task.status, TaskStatus::Failed, "{id}");
+                assert!(task.error_message.unwrap().contains("segment"), "{id}");
+                assert_eq!(std::fs::read(target).unwrap(), original, "{id}");
+            }
+        }
+
+        #[tokio::test]
+        async fn http_recovery_rejects_a_non_regular_destination() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("destination-is-directory");
+            std::fs::create_dir(&target).unwrap();
+            let record = recovery_record(
+                "directory",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 0);
+            assert_eq!(summary.failed, 1);
+            let task = scheduler.get_task("directory").await.unwrap();
+            assert_eq!(task.status, TaskStatus::Failed);
+            assert!(task.error_message.unwrap().contains("regular file"));
+        }
+
+        #[tokio::test]
+        async fn http_recovery_without_a_persisted_validator_uses_safe_full_restart() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("no-validator.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "no-validator",
+                &server.url,
+                target.clone(),
+                TaskStatus::Downloading,
+                None,
+                None,
+            );
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 2, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.restarted, 1);
+            wait_for_status(&scheduler, "no-validator", TaskStatus::Completed).await;
+            assert_eq!(std::fs::read(target).unwrap(), BODY);
+        }
+
+        #[tokio::test]
+        async fn http_recovery_never_uses_a_weak_etag_for_if_range() {
+            for (id, last_modified, expected_if_range, expected_restart) in [
+                ("weak-only", None, None, 1),
+                (
+                    "weak-with-date",
+                    Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+                    Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+                    0,
+                ),
+            ] {
+                let fixture = InitializationFixture::new();
+                let server =
+                    RecoveryServer::spawn("W/\"weak\"", "Wed, 21 Oct 2026 07:28:00 GMT", true)
+                        .await;
+                let target = fixture.0.join(format!("{id}.bin"));
+                write_preallocated_prefix(&target, &BODY[..10]);
+                let record = recovery_record(
+                    id,
+                    &server.url,
+                    target.clone(),
+                    TaskStatus::Downloading,
+                    Some("W/\"weak\""),
+                    last_modified,
+                );
+                let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+                let summary = scheduler
+                    .recover_tasks(None, 1, NetworkOptions::default())
+                    .await;
+
+                assert_eq!(summary.restarted, expected_restart, "{id}");
+                wait_for_status(&scheduler, id, TaskStatus::Completed).await;
+                assert_eq!(std::fs::read(target).unwrap(), BODY, "{id}");
+                let if_ranges: Vec<_> = server
+                    .requests
+                    .lock()
+                    .iter()
+                    .filter_map(|request| {
+                        request.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("if-range")
+                                .then(|| value.trim().to_string())
+                        })
+                    })
+                    .collect();
+                match expected_if_range {
+                    Some(expected) => {
+                        assert!(!if_ranges.is_empty(), "{id}");
+                        assert!(if_ranges.iter().all(|value| value == expected), "{id}");
+                    }
+                    None => assert!(if_ranges.is_empty(), "{id}: {if_ranges:?}"),
+                }
+                assert!(
+                    if_ranges.iter().all(|value| !value.starts_with("W/")),
+                    "{id}: {if_ranges:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn http_recovery_writer_failure_is_durable_failed_not_completed() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("writer-failure.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "writer-failure",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let paths = fixture.paths();
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+            scheduler.install_writer_test_failure();
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            wait_for_status(&scheduler, "writer-failure", TaskStatus::Failed).await;
+            let task = scheduler.get_task("writer-failure").await.unwrap();
+            assert!(task.error_message.unwrap().contains("writer"));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !scheduler.active_task_counts.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty());
+            let restored = restored.get_task("writer-failure").await.unwrap();
+            assert_eq!(restored.status, TaskStatus::Failed);
+            assert!(restored.error_message.unwrap().contains("writer"));
+        }
+
+        #[tokio::test]
+        async fn http_recovery_writer_join_failure_is_durable_failed_not_completed() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("writer-panic.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "writer-panic",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let paths = fixture.paths();
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+            scheduler.install_writer_test_join_failure();
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            wait_for_status(&scheduler, "writer-panic", TaskStatus::Failed).await;
+            let task = scheduler.get_task("writer-panic").await.unwrap();
+            assert!(task.error_message.unwrap().contains("join failed"));
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty());
+            let restored = restored.get_task("writer-panic").await.unwrap();
+            assert_eq!(restored.status, TaskStatus::Failed);
+            assert!(restored.error_message.unwrap().contains("join failed"));
+        }
+
+        #[tokio::test]
+        async fn http_recovery_fails_if_representation_changes_after_preflight() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            server.reject_range_after.store(1, Ordering::Relaxed);
+            let target = fixture.0.join("changed-after-preflight.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "changed-after-preflight",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            wait_for_status(&scheduler, "changed-after-preflight", TaskStatus::Failed).await;
+            assert!(scheduler
+                .get_task("changed-after-preflight")
+                .await
+                .unwrap()
+                .error_message
+                .unwrap()
+                .contains("changed"));
+        }
+
+        #[tokio::test]
         async fn http_recovery_skips_paused_tasks_and_paused_queues_without_network_io() {
             let fixture = InitializationFixture::new();
             let server =
@@ -3526,7 +4000,7 @@ mod tests {
             let records: Vec<_> = (0..2)
                 .map(|index| {
                     let target = fixture.0.join(format!("limited-{index}.bin"));
-                    std::fs::write(&target, &BODY[..10]).unwrap();
+                    write_preallocated_prefix(&target, &BODY[..10]);
                     recovery_record(
                         &format!("limited-{index}"),
                         &server.url,

@@ -137,8 +137,8 @@ pub struct ProbeResult {
 }
 
 /// Ensure a partial download still refers to the same remote representation.
-/// Every validator that was persisted must still be present and byte-for-byte
-/// identical; losing a validator is not safe enough to append existing bytes.
+/// A strong ETag is authoritative; when it is absent (including a weak ETag),
+/// Last-Modified is the fallback. Callers must restart when neither is usable.
 #[cfg_attr(
     not(test),
     expect(
@@ -151,13 +151,16 @@ pub fn validate_resume_identity(
     expected_last_modified: Option<&str>,
     probe: &ProbeResult,
 ) -> Result<(), ResumeError> {
-    if expected_etag != probe.etag.as_deref() && expected_etag.is_some() {
+    let strong_etag = expected_etag.filter(|etag| !is_weak_etag(etag));
+    if strong_etag != probe.etag.as_deref() && strong_etag.is_some() {
         return Err(ResumeError::EtagChanged {
-            expected: expected_etag.map(str::to_owned),
+            expected: strong_etag.map(str::to_owned),
             actual: probe.etag.clone(),
         });
     }
-    if expected_last_modified != probe.last_modified.as_deref() && expected_last_modified.is_some()
+    if strong_etag.is_none()
+        && expected_last_modified != probe.last_modified.as_deref()
+        && expected_last_modified.is_some()
     {
         return Err(ResumeError::LastModifiedChanged {
             expected: expected_last_modified.map(str::to_owned),
@@ -165,6 +168,20 @@ pub fn validate_resume_identity(
         });
     }
     Ok(())
+}
+
+fn is_weak_etag(etag: &str) -> bool {
+    etag.get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("W/"))
+}
+
+/// Select a validator permitted by RFC If-Range semantics. Weak entity tags
+/// cannot guard a byte-range append, so a persisted date is the fallback.
+pub fn resume_validator<'a>(
+    etag: Option<&'a str>,
+    last_modified: Option<&'a str>,
+) -> Option<&'a str> {
+    etag.filter(|etag| !is_weak_etag(etag)).or(last_modified)
 }
 
 fn default_client() -> Client {
@@ -381,12 +398,9 @@ pub enum RangeResponse {
         last_modified: Option<String>,
     },
     /// 发送了 Range（或 If-Range）但服务器返回 200 全量响应：
-    /// 远端文件已变更或忽略 Range，调用方必须重置任务后重下，
+    /// 远端文件已变更或忽略 Range，调用方必须失败或显式全量重启，
     /// 否则把全量 body 写到错误 offset 会损坏文件
-    FileChanged {
-        etag: Option<String>,
-        last_modified: Option<String>,
-    },
+    FileChanged,
 }
 
 /// 打开一段 [start, end]（end inclusive）的下载流，附带 If-Range 一致性校验
@@ -421,10 +435,7 @@ pub async fn open_range(
     let if_range_sent = if_range.is_some();
     let acceptable_full = start == 0 && !if_range_sent;
     if status != reqwest::StatusCode::PARTIAL_CONTENT && !acceptable_full {
-        return Ok(RangeResponse::FileChanged {
-            etag,
-            last_modified,
-        });
+        return Ok(RangeResponse::FileChanged);
     }
     if status == reqwest::StatusCode::PARTIAL_CONTENT {
         validate_content_range(&headers, start, end)?;
@@ -525,7 +536,7 @@ mod tests {
         ));
         assert!(matches!(
             validate_resume_identity(
-                Some("\"new\""),
+                Some("W/\"weak\""),
                 Some("Tue, 20 Oct 2026 07:28:00 GMT"),
                 &probe
             ),
@@ -534,6 +545,20 @@ mod tests {
         let missing = ProbeResult::default();
         assert!(validate_resume_identity(Some("\"old\""), None, &missing).is_err());
         assert!(validate_resume_identity(None, None, &missing).is_ok());
+    }
+
+    #[test]
+    fn resume_validator_prefers_strong_etag_then_last_modified_and_rejects_weak_only() {
+        assert_eq!(
+            resume_validator(Some("\"strong\""), Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            Some("\"strong\"")
+        );
+        assert_eq!(
+            resume_validator(Some("W/\"weak\""), Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        assert_eq!(resume_validator(Some("W/\"weak\""), None), None);
+        assert_eq!(resume_validator(None, None), None);
     }
 
     fn headers_with(content_type: Option<&str>) -> reqwest::header::HeaderMap {
