@@ -75,6 +75,8 @@ pub struct TorrentStatsSnapshot {
 pub enum TaskStatus {
     Pending,
     Downloading,
+    /// Loaded task awaiting startup recovery; no worker is running yet.
+    Recovering,
     Paused,
     Completed,
     Failed,

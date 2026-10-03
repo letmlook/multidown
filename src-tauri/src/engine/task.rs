@@ -24,6 +24,9 @@ pub struct Task {
     pub pending_segments: Arc<Mutex<VecDeque<(u64, u64)>>>,
     pub supports_range: bool,
     pub created_at: i64,
+    /// Wall-clock timestamps survive restart; runtime speed samples do not.
+    pub completed_at: Arc<Mutex<Option<i64>>>,
+    pub seeding_started_at: Arc<Mutex<Option<i64>>>,
     /// 用于估算速度：最近一次更新的下载量
     #[allow(dead_code)]
     pub last_downloaded: Arc<AtomicU64>,
@@ -92,6 +95,8 @@ impl Task {
                 .unwrap()
                 .as_secs() as i64,
             last_downloaded: Arc::new(AtomicU64::new(0)),
+            completed_at: Arc::new(Mutex::new(None)),
+            seeding_started_at: Arc::new(Mutex::new(None)),
             last_speed_time: Arc::new(Mutex::new(None)),
             auth: input.auth,
             extra_headers: input.extra_headers,
@@ -131,6 +136,8 @@ impl Task {
                 .unwrap()
                 .as_secs() as i64,
             last_downloaded: Arc::new(AtomicU64::new(0)),
+            completed_at: Arc::new(Mutex::new(None)),
+            seeding_started_at: Arc::new(Mutex::new(None)),
             last_speed_time: Arc::new(Mutex::new(None)),
             auth: None,
             extra_headers: Vec::new(),
