@@ -256,7 +256,7 @@ fn normalized_mime(value: Option<&str>) -> Option<String> {
 fn range_zero_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let value = headers.get("content-range")?.to_str().ok()?.trim();
     let (unit, range_and_total) = value.split_once(' ')?;
-    if unit != "bytes" {
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
     let (range, total) = range_and_total.split_once('/')?;
@@ -557,7 +557,7 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                 } else {
                     assert!(request.contains("Range: bytes=0-0"));
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/12\r\nContent-Type: Video/MP4\r\nConnection: close\r\n\r\nx"
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: Bytes 0-0/12\r\nContent-Type: Video/MP4\r\nConnection: close\r\n\r\nx"
                 };
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
