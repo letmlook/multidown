@@ -83,7 +83,10 @@ fn detect_windows() -> Option<String> {
     };
     if server.contains(';') || server.contains('=') {
         for part in server.split(';') {
-            if let Some(v) = part.strip_prefix("http=").or_else(|| part.strip_prefix("https=")) {
+            if let Some(v) = part
+                .strip_prefix("http=")
+                .or_else(|| part.strip_prefix("https="))
+            {
                 if let Some(url) = parse_hostport(v) {
                     return Some(url);
                 }

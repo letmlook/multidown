@@ -9,20 +9,20 @@ use crate::engine::rules_persistence::{load_rules, save_rules};
 use crate::engine::schedule::{ScheduleManager, ScheduleRule};
 use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskInfo, TaskStatus, TorrentMeta, TorrentStatsSnapshot};
-use crate::torrent::engine::TorrentRunState;
-use crate::storage::{LoadReport, RecoveryWarning, StoreError};
 use crate::engine::writer::{run_file_writer, WriterMessage};
 use crate::network::{
     build_client_from_options, probe, probe_with_options, AuthConfig, NetworkOptions, ProbeResult,
     TokenBucket,
 };
+use crate::storage::{LoadReport, RecoveryWarning, StoreError};
+use crate::torrent::engine::TorrentRunState;
 use parking_lot::Mutex as ParkingMutex;
-use tokio::sync::Mutex as AsyncMutex;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Emitter;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{mpsc, OnceCell, RwLock};
 
 /// 引擎级限制：来自应用设置，随 set_settings 实时更新
@@ -63,15 +63,18 @@ pub(crate) fn recover_load<T: Default>(
     match report {
         Ok(mut report) => {
             if report.migrated || report.recovery_path.is_some() {
-                eprintln!("[persistence-audit] {}", serde_json::json!({
-                    "event": "store_loaded",
-                    "domain": domain,
-                    "source_path": path,
-                    "source_schema_version": report.schema_version,
-                    "migrated_to_schema": report.migrated.then_some(1),
-                    "recovery_path": report.recovery_path,
-                    "warning_count": report.warnings.len(),
-                }));
+                eprintln!(
+                    "[persistence-audit] {}",
+                    serde_json::json!({
+                        "event": "store_loaded",
+                        "domain": domain,
+                        "source_path": path,
+                        "source_schema_version": report.schema_version,
+                        "migrated_to_schema": report.migrated.then_some(1),
+                        "recovery_path": report.recovery_path,
+                        "warning_count": report.warnings.len(),
+                    })
+                );
             }
             // Loaders may generate fresh quarantine IDs; the UI needs stable IDs across reloads.
             for (index, warning) in report.warnings.iter_mut().enumerate() {
@@ -80,20 +83,38 @@ pub(crate) fn recover_load<T: Default>(
             warnings.extend(report.warnings);
             Ok(report.data)
         }
-        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-        Err(StoreError::Corrupt { message, recovery_path, .. }) => {
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(T::default())
+        }
+        Err(StoreError::Corrupt {
+            message,
+            recovery_path,
+            ..
+        }) => {
             warnings.push(RecoveryWarning {
-                id: format!("{domain}:store"), domain: domain.into(), message,
-                recovery_path: Some(recovery_path), record_key: None, rejected_value: None,
+                id: format!("{domain}:store"),
+                domain: domain.into(),
+                message,
+                recovery_path: Some(recovery_path),
+                record_key: None,
+                rejected_value: None,
             });
             Ok(T::default())
         }
         Err(StoreError::InvalidEnvelope(message)) => {
-            let recovery_path = preserve_invalid_envelope(path)
-                .map_err(|error| format!("{domain} ({}): cannot preserve invalid envelope: {error}", path.display()))?;
+            let recovery_path = preserve_invalid_envelope(path).map_err(|error| {
+                format!(
+                    "{domain} ({}): cannot preserve invalid envelope: {error}",
+                    path.display()
+                )
+            })?;
             warnings.push(RecoveryWarning {
-                id: format!("{domain}:store"), domain: domain.into(), message,
-                recovery_path: Some(recovery_path), record_key: None, rejected_value: None,
+                id: format!("{domain}:store"),
+                domain: domain.into(),
+                message,
+                recovery_path: Some(recovery_path),
+                record_key: None,
+                rejected_value: None,
             });
             Ok(T::default())
         }
@@ -107,15 +128,24 @@ fn preserve_invalid_envelope(path: &std::path::Path) -> std::io::Result<PathBuf>
     let bytes = std::fs::read(path)?;
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     for index in 0u64.. {
-        let suffix = if index == 0 { String::new() } else { format!("-{index}") };
-        let recovery = path.with_file_name(format!("{stem}.recovery-invalid-envelope{suffix}.json"));
+        let suffix = if index == 0 {
+            String::new()
+        } else {
+            format!("-{index}")
+        };
+        let recovery =
+            path.with_file_name(format!("{stem}.recovery-invalid-envelope{suffix}.json"));
         match std::fs::read(&recovery) {
             Ok(existing) if existing == bytes => return Ok(recovery),
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&recovery) {
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&recovery)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
@@ -188,53 +218,104 @@ pub struct Scheduler {
 pub const ERR_DUPLICATE_ASK: &str = "DUPLICATE_ASK";
 
 impl Scheduler {
-    pub fn initialize(paths: SchedulerPaths, settings: crate::settings::AppSettings) -> Result<(Self, Vec<RecoveryWarning>), String> {
+    pub fn initialize(
+        paths: SchedulerPaths,
+        settings: crate::settings::AppSettings,
+    ) -> Result<(Self, Vec<RecoveryWarning>), String> {
         let mut warnings = Vec::new();
-        let persisted = recover_load("tasks", &paths.tasks,
-            crate::engine::persistence::load_tasks_report(&paths.tasks), &mut warnings)?;
-        let tasks: HashMap<TaskId, Arc<Task>> = persisted.into_iter()
-            .map(|task| (task.id.clone(), Arc::new(Task::from_persisted(task)))).collect();
+        let persisted = recover_load(
+            "tasks",
+            &paths.tasks,
+            crate::engine::persistence::load_tasks_report(&paths.tasks),
+            &mut warnings,
+        )?;
+        let tasks: HashMap<TaskId, Arc<Task>> = persisted
+            .into_iter()
+            .map(|task| (task.id.clone(), Arc::new(Task::from_persisted(task))))
+            .collect();
 
-        let mut queues = recover_load("queues", &paths.queues,
-            crate::engine::queue::load_queues_report(&paths.queues), &mut warnings)?;
+        let mut queues = recover_load(
+            "queues",
+            &paths.queues,
+            crate::engine::queue::load_queues_report(&paths.queues),
+            &mut warnings,
+        )?;
         for queue in &mut queues {
-            retain_known_tasks("queues", &queue.id, &mut queue.task_ids, &tasks, &mut warnings);
+            retain_known_tasks(
+                "queues",
+                &queue.id,
+                &mut queue.task_ids,
+                &tasks,
+                &mut warnings,
+            );
         }
         let mut queue_manager = crate::engine::queue::QueueManager::new();
-        if let Some(default) = queues.iter().filter(|q| !q.deleted)
-            .min_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id))) {
+        if let Some(default) = queues
+            .iter()
+            .filter(|q| !q.deleted)
+            .min_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)))
+        {
             queue_manager.default_queue_id = default.id.clone();
             queue_manager.queues.clear();
         }
         for queue in queues {
-            queue_manager.queues.insert(queue.id.clone(), Arc::new(ParkingMutex::new(queue)));
+            queue_manager
+                .queues
+                .insert(queue.id.clone(), Arc::new(ParkingMutex::new(queue)));
         }
         // Legacy task stores predate queue persistence. Give unassigned tasks the default queue.
-        let assigned: std::collections::HashSet<_> = queue_manager.queues.values()
-            .flat_map(|queue| queue.lock().task_ids.clone()).collect();
+        let assigned: std::collections::HashSet<_> = queue_manager
+            .queues
+            .values()
+            .flat_map(|queue| queue.lock().task_ids.clone())
+            .collect();
         if let Some(default) = queue_manager.queues.get(&queue_manager.default_queue_id) {
             let mut default = default.lock();
-            let mut unassigned: Vec<_> = tasks.keys().filter(|id| !assigned.contains(*id)).cloned().collect();
+            let mut unassigned: Vec<_> = tasks
+                .keys()
+                .filter(|id| !assigned.contains(*id))
+                .cloned()
+                .collect();
             unassigned.sort();
             default.task_ids.extend(unassigned);
         }
 
-        let mut batches = recover_load("batches", &paths.batches,
-            crate::engine::batch::load_batches_report(&paths.batches), &mut warnings)?;
+        let mut batches = recover_load(
+            "batches",
+            &paths.batches,
+            crate::engine::batch::load_batches_report(&paths.batches),
+            &mut warnings,
+        )?;
         for batch in &mut batches {
-            retain_known_tasks("batches", &batch.id, &mut batch.task_ids, &tasks, &mut warnings);
+            retain_known_tasks(
+                "batches",
+                &batch.id,
+                &mut batch.task_ids,
+                &tasks,
+                &mut warnings,
+            );
         }
-        let rules = recover_load("rules", &paths.rules,
-            crate::engine::rules_persistence::load_rules_report(&paths.rules), &mut warnings)?;
-        let schedules = recover_load("schedules", &paths.schedules,
-            crate::engine::schedule::load_schedule_rules_report(&paths.schedules), &mut warnings)?;
+        let rules = recover_load(
+            "rules",
+            &paths.rules,
+            crate::engine::rules_persistence::load_rules_report(&paths.rules),
+            &mut warnings,
+        )?;
+        let schedules = recover_load(
+            "schedules",
+            &paths.schedules,
+            crate::engine::schedule::load_schedule_rules_report(&paths.schedules),
+            &mut warnings,
+        )?;
         let mut schedule_manager = ScheduleManager::new();
         schedule_manager.rules = Arc::new(AsyncMutex::new(schedules));
 
         let mut scheduler = Self::new(Some(paths.tasks));
         scheduler.tasks = Arc::new(AsyncMutex::new(tasks));
         scheduler.queue_manager = Arc::new(AsyncMutex::new(queue_manager));
-        scheduler.batch_manager = Arc::new(BatchManager::from_jobs(batches.into_iter().map(Into::into).collect()));
+        scheduler.batch_manager = Arc::new(BatchManager::from_jobs(
+            batches.into_iter().map(Into::into).collect(),
+        ));
         scheduler.rule_manager = Arc::new(RwLock::new(rules));
         scheduler.schedule_manager = Arc::new(schedule_manager);
         scheduler.update_from_settings(&settings);
@@ -281,7 +362,8 @@ impl Scheduler {
 
         // 种子引擎配置：应用数据目录就是任务文件的父目录
         if let Some(app_data) = self.save_path.as_ref().and_then(|p| p.parent()) {
-            let cfg = crate::torrent::engine::TorrentEngineConfig::from_settings(settings, app_data);
+            let cfg =
+                crate::torrent::engine::TorrentEngineConfig::from_settings(settings, app_data);
             // 会话已存在时限速可以实时生效（librqbit 的 Limits 是同步可变的）
             if let Some(engine) = self.torrent_engine.get() {
                 engine.set_limits(cfg.download_bps, cfg.upload_bps);
@@ -318,11 +400,7 @@ impl Scheduler {
     ///
     /// 引擎侧（librqbit 会话）是权威来源，并会随会话状态一起持久化；
     /// 前端应以任务快照里的 `files[].selected` 为准，而不是自己的本地缓存。
-    pub async fn set_torrent_files(
-        &self,
-        task_id: &str,
-        files: Vec<usize>,
-    ) -> Result<(), String> {
+    pub async fn set_torrent_files(&self, task_id: &str, files: Vec<usize>) -> Result<(), String> {
         let task = {
             let tasks = self.tasks.lock().await;
             tasks
@@ -357,7 +435,9 @@ impl Scheduler {
 
     /// 从持久化文件加载任务（启动时调用）
     #[allow(dead_code)] // Compatibility callers should migrate to initialize to retain warnings.
-    pub fn load_from(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_from(
+        path: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let persisted = crate::engine::load_tasks_from_file(path)?;
         let tasks: HashMap<TaskId, Arc<Task>> = persisted
             .into_iter()
@@ -401,14 +481,13 @@ impl Scheduler {
         tasks
             .values()
             .find(|t| {
-                t.url == url
-                    && {
-                        let st = t.status.try_lock();
-                        match st {
-                            Ok(s) => *s != TaskStatus::Cancelled,
-                            Err(_) => true, // 状态锁被持有（正在变更），保守视为存在
-                        }
+                t.url == url && {
+                    let st = t.status.try_lock();
+                    match st {
+                        Ok(s) => *s != TaskStatus::Cancelled,
+                        Err(_) => true, // 状态锁被持有（正在变更），保守视为存在
                     }
+                }
             })
             .map(|t| t.id.clone())
     }
@@ -436,9 +515,7 @@ impl Scheduler {
         let existing_paths: std::collections::HashSet<String> =
             tasks.values().map(|t| t.save_path.clone()).collect();
         drop(tasks);
-        let base = filename
-            .clone()
-            .unwrap_or_else(|| "download".to_string());
+        let base = filename.clone().unwrap_or_else(|| "download".to_string());
         *filename = Some(next_available_filename(&base, &existing_paths));
     }
 
@@ -449,8 +526,17 @@ impl Scheduler {
         filename: Option<String>,
         probe_result: Option<ProbeResult>,
     ) -> Result<TaskId, String> {
-        self.create_task_internal(url, save_dir, filename, probe_result, false, None, Vec::new(), true)
-            .await
+        self.create_task_internal(
+            url,
+            save_dir,
+            filename,
+            probe_result,
+            false,
+            None,
+            Vec::new(),
+            true,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -497,7 +583,12 @@ impl Scheduler {
         let mut save_dir = save_dir;
         if auto_categorize {
             let rules = self.rule_manager.read().await;
-            if let Some(dir) = match_rule(&rules, &url, filename.as_deref().unwrap_or("download"), None) {
+            if let Some(dir) = match_rule(
+                &rules,
+                &url,
+                filename.as_deref().unwrap_or("download"),
+                None,
+            ) {
                 if !dir.is_empty() {
                     save_dir = dir;
                 }
@@ -520,7 +611,9 @@ impl Scheduler {
         {
             let qm = &self.queue_manager;
             let manager = qm.lock().await;
-            let _ = manager.assign_task_to_queue(&id, &manager.default_queue_id).await;
+            let _ = manager
+                .assign_task_to_queue(&id, &manager.default_queue_id)
+                .await;
         }
 
         self.tasks.lock().await.insert(id.clone(), Arc::new(task));
@@ -552,7 +645,9 @@ impl Scheduler {
 
         // 磁力链接先做本地校验（不联网）：格式错误 / v2-only 直接报错，
         // 顺带拿到 info hash 用于去重与占位文件名
-        let magnet = if crate::torrent::detect::sniff(&input) == crate::torrent::detect::InputProtocol::Magnet {
+        let magnet = if crate::torrent::detect::sniff(&input)
+            == crate::torrent::detect::InputProtocol::Magnet
+        {
             Some(crate::torrent::detect::parse_magnet(&input)?)
         } else {
             None
@@ -563,9 +658,7 @@ impl Scheduler {
 
         if !force {
             // 种子按 info hash 去重，而不是按 URL —— 同一资源的磁力链接参数可能不同
-            let key = local_info_hash
-                .clone()
-                .unwrap_or_else(|| input.clone());
+            let key = local_info_hash.clone().unwrap_or_else(|| input.clone());
             if let Some(existing_id) = self.find_duplicate_torrent(&key).await {
                 self.handle_duplicate(&existing_id).await?;
             }
@@ -577,19 +670,14 @@ impl Scheduler {
             let placeholder = filename
                 .filter(|f| !f.trim().is_empty())
                 .map(|f| crate::torrent::detect::sanitize_filename(&f))
-                .or_else(|| {
-                    magnet
-                        .as_ref()
-                        .map(|m| m.placeholder_filename())
-                })
+                .or_else(|| magnet.as_ref().map(|m| m.placeholder_filename()))
                 .unwrap_or_else(|| "torrent".to_string());
             let meta = TorrentMeta {
                 input,
                 info_hash: local_info_hash,
                 metainfo_b64: None,
-                selected_files: selected_files.or_else(|| {
-                    magnet.as_ref().and_then(|m| m.select_only.clone())
-                }),
+                selected_files: selected_files
+                    .or_else(|| magnet.as_ref().and_then(|m| m.select_only.clone())),
                 metadata_ready: false,
                 uploaded_bytes: 0,
             };
@@ -599,7 +687,9 @@ impl Scheduler {
             {
                 let qm = &self.queue_manager;
                 let manager = qm.lock().await;
-                let _ = manager.assign_task_to_queue(&id, &manager.default_queue_id).await;
+                let _ = manager
+                    .assign_task_to_queue(&id, &manager.default_queue_id)
+                    .await;
             }
 
             self.tasks.lock().await.insert(id.clone(), Arc::new(task));
@@ -633,7 +723,9 @@ impl Scheduler {
                         .files
                         .first()
                         .map(|(_, name, _)| crate::torrent::detect::sanitize_filename(name))
-                        .unwrap_or_else(|| crate::torrent::detect::sanitize_filename(&inspected.name))
+                        .unwrap_or_else(|| {
+                            crate::torrent::detect::sanitize_filename(&inspected.name)
+                        })
                 }
             });
 
@@ -653,7 +745,9 @@ impl Scheduler {
         {
             let qm = &self.queue_manager;
             let manager = qm.lock().await;
-            let _ = manager.assign_task_to_queue(&id, &manager.default_queue_id).await;
+            let _ = manager
+                .assign_task_to_queue(&id, &manager.default_queue_id)
+                .await;
         }
 
         self.tasks.lock().await.insert(id.clone(), Arc::new(task));
@@ -670,9 +764,7 @@ impl Scheduler {
             }
             let matches = t
                 .torrent_meta()
-                .map(|m| {
-                    m.info_hash.as_deref() == Some(key) || m.input == key
-                })
+                .map(|m| m.info_hash.as_deref() == Some(key) || m.input == key)
                 .unwrap_or(false);
             if matches {
                 return Some(t.id.clone());
@@ -752,7 +844,9 @@ impl Scheduler {
         let queue_id = {
             let qm = &self.queue_manager;
             let manager = qm.lock().await;
-            manager.get_task_queue(task_id).await
+            manager
+                .get_task_queue(task_id)
+                .await
                 .unwrap_or_else(|| manager.default_queue_id.clone())
         };
 
@@ -784,7 +878,9 @@ impl Scheduler {
         }
         let path = task.save_path.clone();
         let total_bytes = task.total_bytes;
-        let scheduler_self = scheduler_for_save.clone().unwrap_or_else(|| Arc::new(self.clone()));
+        let scheduler_self = scheduler_for_save
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.clone()));
         let queue_id_clone = queue_id.clone();
 
         let n_workers = if task.supports_range {
@@ -817,11 +913,14 @@ impl Scheduler {
                 let mut st = task_clone.status.lock().await;
                 *st = TaskStatus::Failed;
                 if let Some(app) = &app_handle {
-                    let _ = app.emit("download-finished", (
-                        task_id_s.clone(),
-                        "failed".to_string(),
-                        task_clone.filename.clone(),
-                    ));
+                    let _ = app.emit(
+                        "download-finished",
+                        (
+                            task_id_s.clone(),
+                            "failed".to_string(),
+                            task_clone.filename.clone(),
+                        ),
+                    );
                 }
                 scheduler_self.decrement_active(&queue_id_clone).await;
                 if let Some(s) = scheduler_for_save {
@@ -860,7 +959,18 @@ impl Scheduler {
                     let opts_ref = net_opts.clone();
                     let bucket_ref = scheduler_clone.speed_limit.clone();
                     handles.push(tokio::spawn(async move {
-                        run_worker(task_ref, &url_ref, tx_w, ah, &tid, &client_ref, retries, &opts_ref, &bucket_ref).await;
+                        run_worker(
+                            task_ref,
+                            &url_ref,
+                            tx_w,
+                            ah,
+                            &tid,
+                            &client_ref,
+                            retries,
+                            &opts_ref,
+                            &bucket_ref,
+                        )
+                        .await;
                     }));
                 }
                 for h in handles {
@@ -877,11 +987,14 @@ impl Scheduler {
                         let mut st = task_clone.status.lock().await;
                         *st = TaskStatus::Completed;
                         if let Some(app) = &app_handle_clone {
-                            let _ = app.emit("download-finished", (
-                                task_id_clone.clone(),
-                                "completed".to_string(),
-                                task_clone.filename.clone(),
-                            ));
+                            let _ = app.emit(
+                                "download-finished",
+                                (
+                                    task_id_clone.clone(),
+                                    "completed".to_string(),
+                                    task_clone.filename.clone(),
+                                ),
+                            );
                         }
                         break;
                     }
@@ -902,11 +1015,10 @@ impl Scheduler {
                         *st = TaskStatus::Downloading;
                     }
                     if let Some(app) = &app_handle_clone {
-                        let _ = app.emit("download-retry", (
-                            task_id_clone.clone(),
-                            retry_attempts,
-                            max_retries,
-                        ));
+                        let _ = app.emit(
+                            "download-retry",
+                            (task_id_clone.clone(), retry_attempts, max_retries),
+                        );
                     }
                     continue;
                 }
@@ -940,7 +1052,9 @@ impl Scheduler {
         let queue_id = {
             let qm = &self.queue_manager;
             let manager = qm.lock().await;
-            manager.get_task_queue(&task_id).await
+            manager
+                .get_task_queue(&task_id)
+                .await
                 .unwrap_or_else(|| manager.default_queue_id.clone())
         };
         if !self.can_start_for_queue(&queue_id).await? {
@@ -1093,11 +1207,8 @@ impl Scheduler {
                 }
                 task.set_speed_sample(p.progress_bytes);
 
-                let files = crate::torrent::engine::merge_file_infos(
-                    &inspected,
-                    &p,
-                    selected.as_deref(),
-                );
+                let files =
+                    crate::torrent::engine::merge_file_infos(&inspected, &p, selected.as_deref());
                 task.set_torrent_stats(TorrentStatsSnapshot {
                     upload_speed_bps: p.upload_speed_bps,
                     uploaded_bytes: p.uploaded_bytes,
@@ -1148,9 +1259,7 @@ impl Scheduler {
                 } else if status == TaskStatus::Completed {
                     // 已完成、正在按 ratio / time 策略做种，检查是否到点
                     let s = scheduler_self.settings.lock().clone();
-                    let seeded_for = completed_at
-                        .map(|t| t.elapsed())
-                        .unwrap_or_default();
+                    let seeded_for = completed_at.map(|t| t.elapsed()).unwrap_or_default();
                     if seeding_pause_due(
                         &s.torrent_seed_mode,
                         p.uploaded_bytes,
@@ -1220,7 +1329,10 @@ impl Scheduler {
     pub async fn retry_task(&self, task_id: &str) -> Result<(), String> {
         let task = {
             let tasks = self.tasks.lock().await;
-            tasks.get(task_id).cloned().ok_or_else(|| "任务不存在".to_string())?
+            tasks
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| "任务不存在".to_string())?
         };
         Self::reset_failed_task(&task).await?;
         self.save_tasks().await;
@@ -1262,7 +1374,8 @@ impl Scheduler {
         } else {
             task.pending_segments.lock().await.clear();
         }
-        task.downloaded.store(0, std::sync::atomic::Ordering::Relaxed);
+        task.downloaded
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         *task.error_message.lock().await = None;
         *task.status.lock().await = TaskStatus::Pending;
         Ok(())
@@ -1292,7 +1405,10 @@ impl Scheduler {
     pub async fn pause_task(&self, task_id: &str) -> Result<(), String> {
         let task = {
             let tasks = self.tasks.lock().await;
-            tasks.get(task_id).cloned().ok_or_else(|| "任务不存在".to_string())?
+            tasks
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| "任务不存在".to_string())?
         };
         {
             let mut st = task.status.lock().await;
@@ -1426,7 +1542,9 @@ impl Scheduler {
         let mut pt = PersistedTask::from_task(task).await;
         let id = task_id.to_string();
         drop(tasks);
-        let probe_result = probe_with_options(&pt.url, options).await.map_err(|e| e.to_string())?;
+        let probe_result = probe_with_options(&pt.url, options)
+            .await
+            .map_err(|e| e.to_string())?;
         pt.url = probe_result.final_url;
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, Arc::new(Task::from_persisted(pt)));
@@ -1435,7 +1553,11 @@ impl Scheduler {
     }
 
     /// 移动/重命名：更新任务保存路径，若文件已存在则移动
-    pub async fn update_task_save_path(&self, task_id: &str, new_save_path: String) -> Result<(), String> {
+    pub async fn update_task_save_path(
+        &self,
+        task_id: &str,
+        new_save_path: String,
+    ) -> Result<(), String> {
         let tasks = self.tasks.lock().await;
         let task = tasks.get(task_id).ok_or("任务不存在")?;
         let old_path = task.save_path.clone();
@@ -1486,7 +1608,9 @@ impl Scheduler {
         _time_range: Option<Option<crate::engine::queue::TimeRange>>,
     ) -> Result<(), String> {
         let manager = self.queue_manager.lock().await;
-        manager.update_queue(id, name, max_concurrent, None, enabled).await
+        manager
+            .update_queue(id, name, max_concurrent, None, enabled)
+            .await
     }
 
     /// Delete a queue
@@ -1496,17 +1620,29 @@ impl Scheduler {
 
     /// Pause a queue
     pub async fn pause_queue(&self, id: &str) -> Result<(), String> {
-        self.queue_manager.lock().await.update_queue(id, None, None, None, Some(true)).await
+        self.queue_manager
+            .lock()
+            .await
+            .update_queue(id, None, None, None, Some(true))
+            .await
     }
 
     /// Resume a queue
     pub async fn resume_queue(&self, id: &str) -> Result<(), String> {
-        self.queue_manager.lock().await.update_queue(id, None, None, None, Some(false)).await
+        self.queue_manager
+            .lock()
+            .await
+            .update_queue(id, None, None, None, Some(false))
+            .await
     }
 
     /// Assign a task to a queue
     pub async fn assign_task_to_queue(&self, task_id: &str, queue_id: &str) -> Result<(), String> {
-        self.queue_manager.lock().await.assign_task_to_queue(task_id, queue_id).await
+        self.queue_manager
+            .lock()
+            .await
+            .assign_task_to_queue(task_id, queue_id)
+            .await
     }
 
     /// Reorder queue priorities
@@ -1518,7 +1654,9 @@ impl Scheduler {
     #[allow(dead_code)]
     pub fn queue_save_path(&self) -> Option<PathBuf> {
         self.save_path.as_ref().map(|p| {
-            p.parent().unwrap_or(std::path::Path::new(".")).join("queues.json")
+            p.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("queues.json")
         })
     }
 
@@ -1533,7 +1671,11 @@ impl Scheduler {
 
     /// Get the queue ID for a task
     pub async fn get_task_queue(&self, task_id: &str) -> Option<String> {
-        self.queue_manager.lock().await.get_task_queue(task_id).await
+        self.queue_manager
+            .lock()
+            .await
+            .get_task_queue(task_id)
+            .await
     }
 
     // === Batch Management ===
@@ -1545,11 +1687,9 @@ impl Scheduler {
         jobs.iter()
             .map(|job| {
                 crate::engine::batch::BatchJobInfo::from_job_with_progress(job, |id| {
-                    tasks.get(id).and_then(|t| {
-                        match t.status.try_lock() {
-                            Ok(g) => Some(*g),
-                            Err(_) => None,
-                        }
+                    tasks.get(id).and_then(|t| match t.status.try_lock() {
+                        Ok(g) => Some(*g),
+                        Err(_) => None,
                     })
                 })
             })
@@ -1586,7 +1726,16 @@ impl Scheduler {
                 ))
             };
             if let Ok(id) = self
-                .create_task_internal(url.clone(), dir.clone(), filename, None, false, None, Vec::new(), true)
+                .create_task_internal(
+                    url.clone(),
+                    dir.clone(),
+                    filename,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    true,
+                )
                 .await
             {
                 batch.task_ids.push(id);
@@ -1625,7 +1774,13 @@ impl Scheduler {
                 continue;
             }
             if self
-                .start_download(id, app_handle.clone(), None, Some(max_connections), Some(network_options.clone()))
+                .start_download(
+                    id,
+                    app_handle.clone(),
+                    None,
+                    Some(max_connections),
+                    Some(network_options.clone()),
+                )
                 .await
                 .is_ok()
             {
@@ -1637,7 +1792,10 @@ impl Scheduler {
 
     /// Add an existing task to a batch
     pub async fn add_task_to_batch(&self, batch_id: &str, task_id: &str) -> Result<(), String> {
-        let mut job = self.batch_manager.get_job(batch_id).await
+        let mut job = self
+            .batch_manager
+            .get_job(batch_id)
+            .await
             .ok_or("批量任务不存在")?;
         if !job.task_ids.contains(&task_id.to_string()) {
             job.task_ids.push(task_id.to_string());
@@ -1647,8 +1805,15 @@ impl Scheduler {
     }
 
     /// Remove a task from a batch (does not cancel the task)
-    pub async fn remove_task_from_batch(&self, batch_id: &str, task_id: &str) -> Result<(), String> {
-        let mut job = self.batch_manager.get_job(batch_id).await
+    pub async fn remove_task_from_batch(
+        &self,
+        batch_id: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
+        let mut job = self
+            .batch_manager
+            .get_job(batch_id)
+            .await
             .ok_or("批量任务不存在")?;
         job.task_ids.retain(|id| id != task_id);
         self.batch_manager.update_job(job).await;
@@ -1683,7 +1848,9 @@ impl Scheduler {
     /// Get the rules save path
     pub fn rules_save_path(&self) -> Option<PathBuf> {
         self.save_path.as_ref().map(|p| {
-            p.parent().unwrap_or(std::path::Path::new(".")).join("category_rules.json")
+            p.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("category_rules.json")
         })
     }
 
@@ -1823,14 +1990,19 @@ impl Scheduler {
     }
 
     /// Manually trigger a schedule task (execute action immediately)
-    pub async fn trigger_schedule_task(&self, id: &str, app_handle: Option<tauri::AppHandle>) -> Result<(), String> {
+    pub async fn trigger_schedule_task(
+        &self,
+        id: &str,
+        app_handle: Option<tauri::AppHandle>,
+    ) -> Result<(), String> {
         let rules = self.schedule_manager.get_rules().await;
         let rule = rules.iter().find(|r| r.id == id).ok_or("计划任务不存在")?;
-        
+
         match rule.schedule_type {
             crate::engine::schedule::ScheduleType::StartDownload => {
                 let _ = app_handle;
-                self.start_all_pending(app_handle, 8, NetworkOptions::default()).await;
+                self.start_all_pending(app_handle, 8, NetworkOptions::default())
+                    .await;
                 Ok(())
             }
             crate::engine::schedule::ScheduleType::PauseAll => {
@@ -1855,7 +2027,9 @@ impl Scheduler {
             }
             crate::engine::schedule::ScheduleType::SpeedLimit => {
                 if let Some(kbps) = rule.speed_limit_kbps {
-                    self.schedule_manager.set_speed_limit(Some(kbps), true).await;
+                    self.schedule_manager
+                        .set_speed_limit(Some(kbps), true)
+                        .await;
                     self.set_effective_speed_limit(Some(kbps as u64)).await;
                 }
                 Ok(())
@@ -2024,14 +2198,21 @@ async fn run_worker(
             )
             .await
             {
-                Ok(crate::network::RangeResponse::FileChanged { etag, last_modified }) => {
+                Ok(crate::network::RangeResponse::FileChanged {
+                    etag,
+                    last_modified,
+                }) => {
                     task.reset_for_restart(etag, last_modified).await;
                     if let Some(app) = &app_handle {
                         let _ = app.emit("download-progress", ());
                     }
                     Ok(false)
                 }
-                Ok(crate::network::RangeResponse::Body { resp, etag, last_modified }) => {
+                Ok(crate::network::RangeResponse::Body {
+                    resp,
+                    etag,
+                    last_modified,
+                }) => {
                     // 首个成功响应回填校验字段（探测未带 etag 的场景）
                     task.set_validation(etag, last_modified).await;
                     let mut stream = resp.bytes_stream();
@@ -2067,8 +2248,8 @@ async fn run_worker(
             };
 
             match outcome {
-                Ok(true) => break,          // 段完成
-                Ok(false) => return,        // 远端文件已变更并重置，退出本 worker 由新段驱动
+                Ok(true) => break,   // 段完成
+                Ok(false) => return, // 远端文件已变更并重置，退出本 worker 由新段驱动
                 Err(e) => {
                     // 回退已计入的进度并重试整段
                     if written > 0 {
@@ -2087,11 +2268,14 @@ async fn run_worker(
                         let mut st = task.status.lock().await;
                         *st = TaskStatus::Failed;
                         if let Some(app) = &app_handle {
-                            let _ = app.emit("download-finished", (
-                                _task_id.to_string(),
-                                "failed".to_string(),
-                                task.filename.clone(),
-                            ));
+                            let _ = app.emit(
+                                "download-finished",
+                                (
+                                    _task_id.to_string(),
+                                    "failed".to_string(),
+                                    task.filename.clone(),
+                                ),
+                            );
                         }
                         return;
                     }
@@ -2114,7 +2298,8 @@ mod tests {
 
     impl InitializationFixture {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("scheduler-init-{}", uuid::Uuid::new_v4()));
+            let path =
+                std::env::temp_dir().join(format!("scheduler-init-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
@@ -2144,9 +2329,15 @@ mod tests {
     async fn initialization_first_run_uses_effective_defaults_without_warnings() {
         let fixture = InitializationFixture::new();
         let mut warnings = Vec::new();
-        let settings = recover_load("settings", &fixture.0.join("settings.json"),
-            crate::settings::load_settings_report(&fixture.0.join("settings.json")), &mut warnings).unwrap();
-        let (scheduler, startup_warnings) = Scheduler::initialize(fixture.paths(), settings).unwrap();
+        let settings = recover_load(
+            "settings",
+            &fixture.0.join("settings.json"),
+            crate::settings::load_settings_report(&fixture.0.join("settings.json")),
+            &mut warnings,
+        )
+        .unwrap();
+        let (scheduler, startup_warnings) =
+            Scheduler::initialize(fixture.paths(), settings).unwrap();
         assert!(warnings.is_empty());
         assert!(startup_warnings.is_empty());
         assert!(scheduler.list_downloads().await.is_empty());
@@ -2155,43 +2346,73 @@ mod tests {
         assert!(scheduler.list_rules().await.is_empty());
         assert!(scheduler.schedule_manager.get_rules().await.is_empty());
         let config = scheduler.torrent_cfg.lock();
-        assert_eq!(config.as_ref().unwrap().state_dir, fixture.0.join("torrent-session"));
+        assert_eq!(
+            config.as_ref().unwrap().state_dir,
+            fixture.0.join("torrent-session")
+        );
         assert!(scheduler.torrent_engine.get().is_none());
     }
 
     #[tokio::test]
     async fn initialization_restores_memberships_after_tasks_and_never_starts_workers() {
         let fixture = InitializationFixture::new();
-        let task = |id: &str, status: &str| serde_json::json!({
-            "id":id, "url":"https://example.com/a", "save_path":"/tmp/a", "filename":"a",
-            "total_bytes":100, "downloaded_bytes":10, "status":status, "pending_segments":[[10,99]],
-            "supports_range":true, "created_at":1700000000
-        });
-        fixture.write("tasks.json", serde_json::json!([task("done", "completed"), task("active", "downloading")]));
-        fixture.write("queues.json", serde_json::json!([{
-            "id":"queue", "name":"Restored", "max_concurrent":2, "priority":0,
-            "task_ids":["done","active","missing"], "is_paused":true, "deleted":false,
-            "active_hours":null, "active_days":[]
-        }]));
-        fixture.write("batches.json", serde_json::json!([{
-            "id":"batch", "name":"Restored", "urls":["https://a","https://b","https://c"],
-            "task_ids":["done","active","missing"], "created_at":1700000000,
-            "status":"paused", "next_url_index":3
-        }]));
-        fixture.write("category_rules.json", serde_json::json!([{
-            "id":"rule", "name":"Media", "match_type":"extension", "patterns":["mp4"],
-            "save_path":"/media", "enabled":true, "priority":0
-        }]));
-        let schedule = crate::engine::schedule::ScheduleRule::new("Daily".into(),
+        let task = |id: &str, status: &str| {
+            serde_json::json!({
+                "id":id, "url":"https://example.com/a", "save_path":"/tmp/a", "filename":"a",
+                "total_bytes":100, "downloaded_bytes":10, "status":status, "pending_segments":[[10,99]],
+                "supports_range":true, "created_at":1700000000
+            })
+        };
+        fixture.write(
+            "tasks.json",
+            serde_json::json!([task("done", "completed"), task("active", "downloading")]),
+        );
+        fixture.write(
+            "queues.json",
+            serde_json::json!([{
+                "id":"queue", "name":"Restored", "max_concurrent":2, "priority":0,
+                "task_ids":["done","active","missing"], "is_paused":true, "deleted":false,
+                "active_hours":null, "active_days":[]
+            }]),
+        );
+        fixture.write(
+            "batches.json",
+            serde_json::json!([{
+                "id":"batch", "name":"Restored", "urls":["https://a","https://b","https://c"],
+                "task_ids":["done","active","missing"], "created_at":1700000000,
+                "status":"paused", "next_url_index":3
+            }]),
+        );
+        fixture.write(
+            "category_rules.json",
+            serde_json::json!([{
+                "id":"rule", "name":"Media", "match_type":"extension", "patterns":["mp4"],
+                "save_path":"/media", "enabled":true, "priority":0
+            }]),
+        );
+        let schedule = crate::engine::schedule::ScheduleRule::new(
+            "Daily".into(),
             crate::engine::schedule::ScheduleType::PauseAll,
-            crate::engine::schedule::Recurrence::Daily, "23:00".into());
+            crate::engine::schedule::Recurrence::Daily,
+            "23:00".into(),
+        );
         fixture.write("schedule_rules.json", serde_json::json!([schedule]));
-        let (scheduler, warnings) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
-        assert_eq!(scheduler.get_task("active").await.unwrap().status, TaskStatus::Recovering);
-        assert_eq!(scheduler.get_task("done").await.unwrap().status, TaskStatus::Completed);
+        let (scheduler, warnings) =
+            Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        assert_eq!(
+            scheduler.get_task("active").await.unwrap().status,
+            TaskStatus::Recovering
+        );
+        assert_eq!(
+            scheduler.get_task("done").await.unwrap().status,
+            TaskStatus::Completed
+        );
         assert!(scheduler.active_task_counts.lock().is_empty());
         assert!(scheduler.torrent_engine.get().is_none());
-        assert_eq!(scheduler.get_task_queue("active").await.as_deref(), Some("queue"));
+        assert_eq!(
+            scheduler.get_task_queue("active").await.as_deref(),
+            Some("queue")
+        );
         assert_eq!(scheduler.get_task_queue("missing").await, None);
         let queues = scheduler.list_queues().await;
         assert_eq!(queues.len(), 1);
@@ -2199,7 +2420,10 @@ mod tests {
         assert!(queues[0].is_paused);
         let job = scheduler.batch_manager.get_job("batch").await.unwrap();
         assert_eq!(job.task_ids, vec!["done", "active"]);
-        assert_eq!(job.added_count, 3, "filtering membership must not rewind dispatch");
+        assert_eq!(
+            job.added_count, 3,
+            "filtering membership must not rewind dispatch"
+        );
         assert_eq!(scheduler.list_batches().await[0].completed_count, 1);
         assert_eq!(scheduler.list_rules().await[0].id, "rule");
         assert_eq!(scheduler.schedule_manager.get_rules().await.len(), 1);
@@ -2219,9 +2443,15 @@ mod tests {
         let (_, warnings) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
         assert_eq!(warnings.len(), 4);
         let (_, repeated) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
-        assert_eq!(warnings.iter().map(|w| &w.id).collect::<Vec<_>>(), repeated.iter().map(|w| &w.id).collect::<Vec<_>>());
-        let preserved: Vec<_> = warnings.iter().filter_map(|w| w.recovery_path.as_ref())
-            .map(|path| (path.clone(), std::fs::read(path).unwrap())).collect();
+        assert_eq!(
+            warnings.iter().map(|w| &w.id).collect::<Vec<_>>(),
+            repeated.iter().map(|w| &w.id).collect::<Vec<_>>()
+        );
+        let preserved: Vec<_> = warnings
+            .iter()
+            .filter_map(|w| w.recovery_path.as_ref())
+            .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+            .collect();
         assert!(preserved.len() >= 3);
         let ids: Vec<_> = warnings.iter().map(|w| w.id.clone()).collect();
         let registry = crate::RecoveryWarnings::new(warnings);
@@ -2232,36 +2462,60 @@ mod tests {
         assert!(registry.list().iter().all(|w| w.id != ids[0]));
         registry.acknowledge(&ids);
         assert!(registry.list().is_empty());
-        for (path, original) in preserved { assert_eq!(std::fs::read(path).unwrap(), original); }
-        assert_eq!(std::fs::read(fixture.0.join("tasks.json")).unwrap(), b"{truncated");
+        for (path, original) in preserved {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+        assert_eq!(
+            std::fs::read(fixture.0.join("tasks.json")).unwrap(),
+            b"{truncated"
+        );
     }
 
     #[test]
     fn initialization_settings_record_warnings_reach_registry_with_effective_defaults() {
         let fixture = InitializationFixture::new();
-        fixture.write("settings.json", serde_json::json!({"max_retries":"bad", "global_speed_limit_kbps":42}));
+        fixture.write(
+            "settings.json",
+            serde_json::json!({"max_retries":"bad", "global_speed_limit_kbps":42}),
+        );
         let mut warnings = Vec::new();
-        let settings = recover_load("settings", &fixture.0.join("settings.json"),
-            crate::settings::load_settings_report(&fixture.0.join("settings.json")), &mut warnings).unwrap();
+        let settings = recover_load(
+            "settings",
+            &fixture.0.join("settings.json"),
+            crate::settings::load_settings_report(&fixture.0.join("settings.json")),
+            &mut warnings,
+        )
+        .unwrap();
         let (scheduler, _) = Scheduler::initialize(fixture.paths(), settings).unwrap();
         assert_eq!(scheduler.limits.lock().max_retries, 3);
-        assert_eq!(scheduler.torrent_cfg.lock().as_ref().unwrap().download_bps, Some(43008));
+        assert_eq!(
+            scheduler.torrent_cfg.lock().as_ref().unwrap().download_bps,
+            Some(43008)
+        );
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].domain, "settings");
-        let serialized = serde_json::to_value(crate::RecoveryWarnings::new(warnings).list()).unwrap();
+        let serialized =
+            serde_json::to_value(crate::RecoveryWarnings::new(warnings).list()).unwrap();
         assert!(serialized[0].get("rejected_value").is_none());
     }
 
     #[test]
     fn initialization_does_not_treat_unsupported_schema_or_io_failure_as_first_run() {
         let fixture = InitializationFixture::new();
-        fixture.write("tasks.json", serde_json::json!({"schema_version":99,"written_at":"2026-10-03T00:00:00Z","data":[]}));
-        let error = Scheduler::initialize(fixture.paths(), Default::default()).err().unwrap();
+        fixture.write(
+            "tasks.json",
+            serde_json::json!({"schema_version":99,"written_at":"2026-10-03T00:00:00Z","data":[]}),
+        );
+        let error = Scheduler::initialize(fixture.paths(), Default::default())
+            .err()
+            .unwrap();
         assert!(error.contains("tasks") && error.contains("99"));
         assert!(error.contains(fixture.0.to_str().unwrap()));
         std::fs::remove_file(fixture.0.join("tasks.json")).unwrap();
         std::fs::create_dir(fixture.0.join("tasks.json")).unwrap();
-        let error = Scheduler::initialize(fixture.paths(), Default::default()).err().unwrap();
+        let error = Scheduler::initialize(fixture.paths(), Default::default())
+            .err()
+            .unwrap();
         assert!(error.contains("tasks") && error.contains(fixture.0.to_str().unwrap()));
     }
 
@@ -2293,8 +2547,15 @@ mod tests {
         let result = Scheduler::initialize(fixture.paths(), Default::default());
         assert!(result.is_err());
         let error = result.err().unwrap();
-        assert!(error.contains("queues") && error.contains("preserve") && error.contains(fixture.0.to_str().unwrap()));
-        assert_eq!(std::fs::read(fixture.0.join("queues.json")).unwrap(), original);
+        assert!(
+            error.contains("queues")
+                && error.contains("preserve")
+                && error.contains(fixture.0.to_str().unwrap())
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("queues.json")).unwrap(),
+            original
+        );
     }
 
     #[tokio::test]
@@ -2311,7 +2572,10 @@ mod tests {
         let scheduler = Scheduler::new(Some(PathBuf::from("/tmp/first-run/tasks.json")));
         let config = scheduler.torrent_cfg.lock();
         let config = config.as_ref().expect("first-run torrent configuration");
-        assert_eq!(config.state_dir, PathBuf::from("/tmp/first-run/torrent-session"));
+        assert_eq!(
+            config.state_dir,
+            PathBuf::from("/tmp/first-run/torrent-session")
+        );
         assert!(config.enable_dht);
         assert!(scheduler.torrent_engine.get().is_none());
     }
@@ -2418,7 +2682,11 @@ mod tests {
             .unwrap();
         let tasks = s.tasks.lock().await;
         let names: Vec<String> = tasks.values().map(|t| t.filename.clone()).collect();
-        assert!(names.contains(&"a (1).zip".to_string()), "names={:?}", names);
+        assert!(
+            names.contains(&"a (1).zip".to_string()),
+            "names={:?}",
+            names
+        );
         assert_eq!(names.len(), 2);
         let _ = second;
     }
@@ -2456,16 +2724,44 @@ mod tests {
         assert!(seeding_pause_due("ratio", 100, 100, 100, Duration::ZERO, 0));
         assert!(seeding_pause_due("ratio", 250, 100, 100, Duration::ZERO, 0));
         // 2.5x 分享率（250%）
-        assert!(!seeding_pause_due("ratio", 200, 100, 250, Duration::ZERO, 0));
+        assert!(!seeding_pause_due(
+            "ratio",
+            200,
+            100,
+            250,
+            Duration::ZERO,
+            0
+        ));
         assert!(seeding_pause_due("ratio", 250, 100, 250, Duration::ZERO, 0));
         // ratio 0% = 完成即停；总大小未知也按停处理
         assert!(seeding_pause_due("ratio", 0, 100, 0, Duration::ZERO, 0));
         assert!(seeding_pause_due("ratio", 10, 0, 100, Duration::ZERO, 0));
         // time：做种满 N 分钟后停
-        assert!(!seeding_pause_due("time", 0, 100, 0, Duration::from_secs(29 * 60), 30));
-        assert!(seeding_pause_due("time", 0, 100, 0, Duration::from_secs(30 * 60), 30));
+        assert!(!seeding_pause_due(
+            "time",
+            0,
+            100,
+            0,
+            Duration::from_secs(29 * 60),
+            30
+        ));
+        assert!(seeding_pause_due(
+            "time",
+            0,
+            100,
+            0,
+            Duration::from_secs(30 * 60),
+            30
+        ));
         // forever / stop 不在此判定（由轮询器直接处理）
-        assert!(!seeding_pause_due("forever", 0, 100, 0, Duration::from_secs(3600), 0));
+        assert!(!seeding_pause_due(
+            "forever",
+            0,
+            100,
+            0,
+            Duration::from_secs(3600),
+            0
+        ));
         assert!(!seeding_pause_due("stop", 0, 100, 0, Duration::ZERO, 0));
     }
 
@@ -2504,7 +2800,13 @@ mod tests {
             .unwrap();
         let selected = {
             let tasks = s.tasks.lock().await;
-            tasks.get(&id2).unwrap().torrent_meta().unwrap().selected_files.clone()
+            tasks
+                .get(&id2)
+                .unwrap()
+                .torrent_meta()
+                .unwrap()
+                .selected_files
+                .clone()
         };
         assert_eq!(selected, Some(vec![0, 2]));
     }

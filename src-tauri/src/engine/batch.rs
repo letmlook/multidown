@@ -1,7 +1,7 @@
 //! 批量下载功能：URL解析、文件名模板、批量探测、批量队列管理
 
-use crate::engine::types::new_task_id;
 use crate::engine::scheduler::Scheduler;
+use crate::engine::types::new_task_id;
 use crate::network::{probe_with_options, NetworkOptions, ProbeResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -94,7 +94,8 @@ impl TryFrom<BatchJobRecordWire> for BatchJobRecord {
                 return Err(format!("{key} exceeds batch URL count"));
             }
         }
-        let next_url_index = record.next_url_index
+        let next_url_index = record
+            .next_url_index
             .or(record.added_count)
             .unwrap_or_else(|| record.task_ids.len().min(record.urls.len()));
         Ok(Self {
@@ -155,14 +156,22 @@ pub fn batches_path(app_data_dir: &std::path::Path) -> std::path::PathBuf {
     app_data_dir.join("batches.json")
 }
 
-pub fn load_batches_report(path: &std::path::Path) -> Result<crate::storage::LoadReport<Vec<BatchJobRecord>>, crate::storage::StoreError> {
+pub fn load_batches_report(
+    path: &std::path::Path,
+) -> Result<crate::storage::LoadReport<Vec<BatchJobRecord>>, crate::storage::StoreError> {
     super::rules_persistence::load_records(path, "batches", |value| {
         serde_json::from_value(value).map_err(|error| error.to_string())
     })
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by scheduler lifecycle persistence"))]
-pub async fn save_batches(path: &std::path::Path, batches: &[BatchJobRecord]) -> std::io::Result<()> {
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired by scheduler lifecycle persistence")
+)]
+pub async fn save_batches(
+    path: &std::path::Path,
+    batches: &[BatchJobRecord],
+) -> std::io::Result<()> {
     crate::storage::save_store(path, 1, &batches).map_err(std::io::Error::other)
 }
 
@@ -293,7 +302,9 @@ impl Default for BatchManager {
 
 impl BatchManager {
     pub fn from_jobs(jobs: Vec<BatchJob>) -> Self {
-        Self { jobs: RwLock::new(jobs) }
+        Self {
+            jobs: RwLock::new(jobs),
+        }
     }
 
     pub fn new() -> Self {
@@ -364,7 +375,7 @@ impl BatchManager {
 pub struct BatchScheduler {
     manager: Arc<BatchManager>,
     scheduler: Arc<Scheduler>,
-    batch_size: usize,   // 每批添加多少个任务
+    batch_size: usize, // 每批添加多少个任务
     probe_concurrency: usize,
 }
 
@@ -408,8 +419,7 @@ impl BatchScheduler {
 
     /// 批量探测URL列表（用于预览总大小）
     #[allow(dead_code)]
-pub async 
-fn probe_batch_urls(
+    pub async fn probe_batch_urls(
         &self,
         urls: &[String],
         network_options: Option<&NetworkOptions>,
@@ -418,13 +428,8 @@ fn probe_batch_urls(
     }
 
     /// 开始分发批量任务：将下一批URL创建为下载任务
-    pub async fn dispatch_next_batch(
-        &self,
-        job_id: &str,
-        save_dir: &str,
-    ) -> Result<usize, String> {
-        let job = self.manager.get_job(job_id).await
-            .ok_or("批量任务不存在")?;
+    pub async fn dispatch_next_batch(&self, job_id: &str, save_dir: &str) -> Result<usize, String> {
+        let job = self.manager.get_job(job_id).await.ok_or("批量任务不存在")?;
         if job.status != BatchStatus::Running && job.status != BatchStatus::Pending {
             return Err(format!("批量任务状态不允许: {:?}", job.status));
         }
@@ -432,23 +437,29 @@ fn probe_batch_urls(
         if remaining.is_empty() {
             return Ok(0);
         }
-        let batch = remaining.into_iter().take(self.batch_size).collect::<Vec<_>>();
+        let batch = remaining
+            .into_iter()
+            .take(self.batch_size)
+            .collect::<Vec<_>>();
         let start_idx = job.added_count;
-        
+
         let mut created_ids = Vec::new();
         for (i, url) in batch.iter().enumerate() {
             let idx = start_idx + i;
             let filename = if job.template.is_empty() {
                 None
             } else {
-                Some(apply_filename_template(&job.template, url, idx + job.start_index))
+                Some(apply_filename_template(
+                    &job.template,
+                    url,
+                    idx + job.start_index,
+                ))
             };
-            match self.scheduler.create_task(
-                url.clone(),
-                save_dir.to_string(),
-                filename,
-                None,
-            ).await {
+            match self
+                .scheduler
+                .create_task(url.clone(), save_dir.to_string(), filename, None)
+                .await
+            {
                 Ok(task_id) => {
                     created_ids.push(task_id.clone());
                     // 更新批量任务已添加数
@@ -459,7 +470,7 @@ fn probe_batch_urls(
                 }
             }
         }
-        
+
         // 更新 job 的 added_count 和 task_ids
         if let Some(mut job) = self.manager.get_job(job_id).await {
             job.added_count = (start_idx + batch.len()).min(job.total_count);
@@ -469,14 +480,13 @@ fn probe_batch_urls(
             }
             self.manager.update_job(job).await;
         }
-        
+
         Ok(created_ids.len())
     }
 
     /// 暂停批量任务
     pub async fn pause_batch(&self, job_id: &str) -> Result<(), String> {
-        let mut job = self.manager.get_job(job_id).await
-            .ok_or("批量任务不存在")?;
+        let mut job = self.manager.get_job(job_id).await.ok_or("批量任务不存在")?;
         job.status = BatchStatus::Paused;
         self.manager.update_job(job).await;
         Ok(())
@@ -484,8 +494,7 @@ fn probe_batch_urls(
 
     /// 继续批量任务
     pub async fn resume_batch(&self, job_id: &str) -> Result<(), String> {
-        let mut job = self.manager.get_job(job_id).await
-            .ok_or("批量任务不存在")?;
+        let mut job = self.manager.get_job(job_id).await.ok_or("批量任务不存在")?;
         if job.status != BatchStatus::Paused {
             return Err("只有暂停状态可以继续".to_string());
         }
@@ -496,8 +505,7 @@ fn probe_batch_urls(
 
     /// 取消批量任务
     pub async fn cancel_batch(&self, job_id: &str) -> Result<(), String> {
-        let mut job = self.manager.get_job(job_id).await
-            .ok_or("批量任务不存在")?;
+        let mut job = self.manager.get_job(job_id).await.ok_or("批量任务不存在")?;
         job.status = BatchStatus::Cancelled;
         // 取消所有已创建但未完成的任务
         for task_id in &job.task_ids {
@@ -510,8 +518,7 @@ fn probe_batch_urls(
 
 /// 解析 URL 列表，返回有效/重复/无效分类
 #[allow(dead_code)]
-pub 
-fn parse_url_list(text: &str) -> BatchImportResult {
+pub fn parse_url_list(text: &str) -> BatchImportResult {
     let mut seen = HashSet::new();
     let mut valid_urls = Vec::new();
     let mut duplicate_urls = Vec::new();
@@ -611,7 +618,11 @@ fn extract_filename_from_url(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
         let path = parsed.path();
         if !path.is_empty() {
-            let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("download");
+            let name = path
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("download");
             // URL解码
             if let Ok(decoded) = urlencoding::decode(name) {
                 return decoded.into_owned();
@@ -640,14 +651,13 @@ fn sanitize_filename(name: &str) -> String {
 /// 批量探测多个 URL，返回每个的探测结果（用于预览大小）
 /// 使用信号量控制并发数
 #[allow(dead_code)]
-pub async 
-fn probe_batch(
+pub async fn probe_batch(
     urls: &[String],
     concurrency: usize,
     network_options: Option<&NetworkOptions>,
 ) -> Vec<Option<ProbeResult>> {
-    use tokio::sync::Semaphore;
     use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     let sem = Arc::new(Semaphore::new(concurrency.clamp(1, 10)));
     let mut handles = Vec::new();
@@ -684,7 +694,13 @@ fn probe_batch(
 mod tests {
     #[tokio::test]
     async fn from_jobs_preserves_loaded_membership_and_dispatch_cursor() {
-        let mut job = super::BatchJob::new("Restored".into(), vec!["https://a".into(), "https://b".into()], String::new(), 0, None);
+        let mut job = super::BatchJob::new(
+            "Restored".into(),
+            vec!["https://a".into(), "https://b".into()],
+            String::new(),
+            0,
+            None,
+        );
         job.task_ids = vec!["task-1".into()];
         job.added_count = 2;
         let id = job.id.clone();
@@ -697,7 +713,8 @@ mod tests {
     use super::*;
     fn assert_null_cursor_is_quarantined(cursor_key: &str, other_key: &str) {
         for include_other_cursor in [false, true] {
-            let dir = std::env::temp_dir().join(format!("batch-null-cursor-{}", uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("batch-null-cursor-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let path = batches_path(&dir);
             let mut invalid = serde_json::json!({"id":"invalid","name":"Bad","urls":["https://example.com/a","https://example.com/b"],"task_ids":["task-1"],"created_at":1700000000});
@@ -709,16 +726,28 @@ mod tests {
             let original = serde_json::to_vec(&serde_json::json!([valid, invalid])).unwrap();
             std::fs::write(&path, &original).unwrap();
             let report = load_batches_report(&path).unwrap();
-            assert_eq!(report.data.len(), 1, "{cursor_key}, other present: {include_other_cursor}");
+            assert_eq!(
+                report.data.len(),
+                1,
+                "{cursor_key}, other present: {include_other_cursor}"
+            );
             assert_eq!(report.data[0].id, "valid");
             assert_eq!(report.warnings.len(), 1);
             assert_eq!(report.warnings[0].record_key.as_deref(), Some("invalid"));
             let raw = report.warnings[0].rejected_value.as_ref().unwrap();
             assert_eq!(raw.get(cursor_key), Some(&serde_json::Value::Null));
             assert!(serde_json::from_value::<BatchJobRecord>(raw.clone()).is_err());
-            let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
-            assert_eq!(rejected[0]["value"].get(cursor_key), Some(&serde_json::Value::Null));
-            assert_eq!(std::fs::read(path.with_extension("json.bak")).unwrap(), original);
+            let rejected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap())
+                    .unwrap();
+            assert_eq!(
+                rejected[0]["value"].get(cursor_key),
+                Some(&serde_json::Value::Null)
+            );
+            assert_eq!(
+                std::fs::read(path.with_extension("json.bak")).unwrap(),
+                original
+            );
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -739,18 +768,34 @@ mod tests {
         let path = batches_path(&dir);
         let mut job = BatchJob::new(
             "Files".into(),
-            vec!["https://example.com/a".into(), "https://example.com/b".into(), "https://example.com/c".into()],
-            "file_{n}".into(), 7, Some("/files".into()),
+            vec![
+                "https://example.com/a".into(),
+                "https://example.com/b".into(),
+                "https://example.com/c".into(),
+            ],
+            "file_{n}".into(),
+            7,
+            Some("/files".into()),
         );
         job.added_count = 2;
         job.task_ids = vec!["successful-task".into()];
-        save_batches(&path, &[BatchJobRecord::from(&job)]).await.unwrap();
+        save_batches(&path, &[BatchJobRecord::from(&job)])
+            .await
+            .unwrap();
         let restored: BatchJob = load_batches_report(&path).unwrap().data.remove(0).into();
         assert_eq!(restored.added_count, 2);
         assert_eq!(restored.remaining(), 1);
         assert_eq!(restored.urls[restored.added_count], "https://example.com/c");
-        assert_eq!(apply_filename_template(&restored.template, &restored.urls[restored.added_count], restored.added_count + restored.start_index), "file_9");
-        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            apply_filename_template(
+                &restored.template,
+                &restored.urls[restored.added_count],
+                restored.added_count + restored.start_index
+            ),
+            "file_9"
+        );
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["data"][0]["next_url_index"], 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -761,13 +806,17 @@ mod tests {
         let job: BatchJob = record.into();
         assert_eq!(job.added_count, 2);
         assert_eq!(job.remaining(), 1);
-        assert_eq!(serde_json::to_value(BatchJobRecord::from(&job)).unwrap()["next_url_index"], 2);
+        assert_eq!(
+            serde_json::to_value(BatchJobRecord::from(&job)).unwrap()["next_url_index"],
+            2
+        );
     }
 
     #[test]
     fn explicit_out_of_bounds_cursors_are_quarantined_per_batch() {
         for cursor_key in ["next_url_index", "added_count"] {
-            let dir = std::env::temp_dir().join(format!("batch-invalid-cursor-{}", uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("batch-invalid-cursor-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let path = batches_path(&dir);
             let mut invalid = serde_json::json!({"id":"invalid","name":"Bad","urls":["https://example.com/a"],"task_ids":[],"created_at":1700000000});
@@ -780,9 +829,14 @@ mod tests {
             assert_eq!(report.data[0].id, "valid");
             assert_eq!(report.warnings.len(), 1);
             assert_eq!(report.warnings[0].record_key.as_deref(), Some("invalid"));
-            let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+            let rejected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap())
+                    .unwrap();
             assert_eq!(rejected[0]["value"][cursor_key], 2);
-            assert_eq!(std::fs::read(path.with_extension("json.bak")).unwrap(), original);
+            assert_eq!(
+                std::fs::read(path.with_extension("json.bak")).unwrap(),
+                original
+            );
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -792,7 +846,10 @@ mod tests {
         let fallback: BatchJobRecord = serde_json::from_str(r#"{"id":"fallback","name":"Files","urls":["https://example.com/a"],"task_ids":["task-1","task-2"],"created_at":1700000000}"#).unwrap();
         let job: BatchJob = fallback.into();
         assert_eq!(job.added_count, 1);
-        assert_eq!(serde_json::to_value(BatchJobRecord::from(&job)).unwrap()["next_url_index"], 1);
+        assert_eq!(
+            serde_json::to_value(BatchJobRecord::from(&job)).unwrap()["next_url_index"],
+            1
+        );
         let explicit: BatchJobRecord = serde_json::from_str(r#"{"id":"explicit","name":"Files","urls":["https://example.com/a","https://example.com/b"],"task_ids":["task-1"],"created_at":1700000000,"next_url_index":2,"added_count":1}"#).unwrap();
         assert_eq!(BatchJob::from(explicit).added_count, 2);
     }
@@ -806,7 +863,10 @@ mod tests {
         assert_eq!(report.data.len(), 1);
         assert!(report.migrated);
         assert_eq!(report.warnings.len(), 1);
-        assert_eq!(report.warnings[0].record_key.as_deref(), Some("summary-only"));
+        assert_eq!(
+            report.warnings[0].record_key.as_deref(),
+            Some("summary-only")
+        );
         let job: BatchJob = report.data[0].clone().into();
         assert_eq!(job.total_count, 1);
         assert_eq!(job.added_count, 1);
@@ -817,10 +877,17 @@ mod tests {
         assert!(!reloaded.migrated);
         assert!(reloaded.warnings.is_empty());
         assert_eq!(reloaded.data[0].task_ids, vec!["task-1"]);
-        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
         assert_eq!(disk["data"][0]["next_url_index"], 1);
-        for field in ["total_count", "added_count", "task_count", "completed_count", "failed_count"] {
+        for field in [
+            "total_count",
+            "added_count",
+            "task_count",
+            "completed_count",
+            "failed_count",
+        ] {
             assert!(disk["data"][0].get(field).is_none());
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -836,7 +903,10 @@ mod tests {
         assert_eq!(job.created_at, 1700000000);
         assert_eq!(job.status, BatchStatus::Paused);
         let persisted = serde_json::to_value(BatchJobRecord::from(&job)).unwrap();
-        assert_eq!(persisted["urls"], serde_json::json!(["https://example.com/a.mp4"]));
+        assert_eq!(
+            persisted["urls"],
+            serde_json::json!(["https://example.com/a.mp4"])
+        );
         assert_eq!(persisted["save_dir"], "/videos");
         assert!(persisted.get("completed_count").is_none());
     }

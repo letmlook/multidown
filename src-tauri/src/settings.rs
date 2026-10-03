@@ -8,12 +8,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("settings-recovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
-        std::fs::write(&path, r#"{"default_save_path":"/keep","max_concurrent_tasks":"broken"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"default_save_path":"/keep","max_concurrent_tasks":"broken"}"#,
+        )
+        .unwrap();
         let report = load_settings_report(&path).unwrap();
         assert_eq!(report.data.default_save_path, "/keep");
         assert_eq!(report.data.max_concurrent_tasks, 8);
         assert_eq!(report.warnings.len(), 1);
-        let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+        let rejected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
         assert_eq!(rejected[0]["record_key"], "max_concurrent_tasks");
         assert_eq!(rejected[0]["value"], "broken");
         std::fs::remove_dir_all(dir).unwrap();
@@ -29,7 +34,8 @@ mod tests {
         assert_eq!(settings.default_save_path, "/downloads");
         assert_eq!(settings.max_retries, 3);
         save_settings(&path, &settings).await.unwrap();
-        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
         assert_eq!(disk["data"]["user_agent"], "legacy-agent");
         assert_eq!(load_settings(&path).unwrap().max_concurrent_tasks, 2);
@@ -37,10 +43,9 @@ mod tests {
     }
 }
 
-
+use crate::storage::{load_store, save_store, LoadReport, RecoveryWarning, StoreError};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::storage::{load_store, save_store, LoadReport, RecoveryWarning, StoreError};
 
 pub mod proxy;
 
@@ -221,7 +226,9 @@ pub fn load_settings_report(path: &Path) -> Result<LoadReport<AppSettings>, Stor
         if version > 1 {
             return Err(StoreError::UnsupportedVersion(version));
         }
-        let fields = value.as_object().ok_or_else(|| StoreError::InvalidEnvelope("settings data must be an object".into()))?;
+        let fields = value
+            .as_object()
+            .ok_or_else(|| StoreError::InvalidEnvelope("settings data must be an object".into()))?;
         let mut accepted = serde_json::to_value(AppSettings::default())?;
         let mut warnings = vec![];
         for (key, field) in fields {

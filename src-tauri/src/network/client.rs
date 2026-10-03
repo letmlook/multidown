@@ -66,7 +66,10 @@ fn build_client(options: &NetworkOptions) -> Result<Client, Error> {
 }
 
 /// 为请求附加自定义头与认证（UA 在 Client 层设置）
-fn apply_request_options(mut rb: reqwest::RequestBuilder, options: &NetworkOptions) -> reqwest::RequestBuilder {
+fn apply_request_options(
+    mut rb: reqwest::RequestBuilder,
+    options: &NetworkOptions,
+) -> reqwest::RequestBuilder {
     for (k, v) in &options.extra_headers {
         if k.is_empty() || v.is_empty() {
             continue;
@@ -126,7 +129,9 @@ pub async fn probe_with_client(
     url: &str,
     options: &NetworkOptions,
 ) -> Result<ProbeResult, Error> {
-    let url = url.parse::<reqwest::Url>().map_err(|e| Error::Url(e.to_string()))?;
+    let url = url
+        .parse::<reqwest::Url>()
+        .map_err(|e| Error::Url(e.to_string()))?;
 
     // 先发 HEAD
     let resp = apply_request_options(client.head(url.clone()), options)
@@ -230,7 +235,9 @@ pub fn is_torrent_response(
 
     content_type_torrent
         || final_path_lower.ends_with(".torrent")
-        || suggested_filename.to_ascii_lowercase().ends_with(".torrent")
+        || suggested_filename
+            .to_ascii_lowercase()
+            .ends_with(".torrent")
 }
 
 fn parse_content_disposition_filename(disp: &str) -> Option<String> {
@@ -289,7 +296,9 @@ pub async fn open_range(
     if_range: Option<&str>,
     options: &NetworkOptions,
 ) -> Result<RangeResponse, Error> {
-    let url = url.parse::<reqwest::Url>().map_err(|e| Error::Url(e.to_string()))?;
+    let url = url
+        .parse::<reqwest::Url>()
+        .map_err(|e| Error::Url(e.to_string()))?;
     let mut rb = apply_request_options(client.get(url), options)
         .header("Range", format!("bytes={}-{}", start, end));
     if let Some(etag) = if_range {
@@ -310,7 +319,10 @@ pub async fn open_range(
     let if_range_sent = if_range.is_some();
     let acceptable_full = start == 0 && !if_range_sent;
     if status != reqwest::StatusCode::PARTIAL_CONTENT && !acceptable_full {
-        return Ok(RangeResponse::FileChanged { etag, last_modified });
+        return Ok(RangeResponse::FileChanged {
+            etag,
+            last_modified,
+        });
     }
     Ok(RangeResponse::Body {
         resp,

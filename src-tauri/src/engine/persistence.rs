@@ -2,9 +2,9 @@
 
 use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskKind, TaskStatus, TorrentMeta};
-use crate::storage::{LoadReport, RecoveryWarning, StoreError};
 #[cfg(test)]
 use crate::storage::VersionedEnvelope;
+use crate::storage::{LoadReport, RecoveryWarning, StoreError};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
@@ -335,7 +335,10 @@ mod tests {
         assert!(!warning.contains("private"));
         let quarantined = std::fs::read_to_string(report.recovery_path.unwrap()).unwrap();
         assert!(quarantined.contains("private"));
-        assert_eq!(std::fs::read_to_string(path.with_extension("json.bak")).unwrap(), fixture.to_string());
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+            fixture.to_string()
+        );
         let tasks = load_tasks_from_file(&path).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].filename, "big.zip");

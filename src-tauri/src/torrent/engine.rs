@@ -376,7 +376,10 @@ impl TorrentEngine {
 
     pub async fn pause(&self, task_id: &str) -> Result<()> {
         if let Some(handle) = self.handle(task_id) {
-            self.session.pause(&handle).await.context("暂停种子任务失败")?;
+            self.session
+                .pause(&handle)
+                .await
+                .context("暂停种子任务失败")?;
         }
         Ok(())
     }
@@ -470,10 +473,7 @@ pub fn merge_file_infos(
     progress: &TorrentProgress,
     fallback_selected: Option<&[usize]>,
 ) -> Vec<TorrentFileInfo> {
-    let selected = progress
-        .selected_files
-        .as_deref()
-        .or(fallback_selected);
+    let selected = progress.selected_files.as_deref().or(fallback_selected);
     inspected
         .files
         .iter()
@@ -524,10 +524,7 @@ mod tests {
     #[test]
     fn multi_file_torrent_gets_its_own_subfolder() {
         let t = inspected(
-            vec![
-                (0, "a.txt".into(), 10),
-                (1, "sub/b.txt".into(), 20),
-            ],
+            vec![(0, "a.txt".into(), 10), (1, "sub/b.txt".into(), 20)],
             "My Pack",
         );
         assert!(t.is_multi_file());

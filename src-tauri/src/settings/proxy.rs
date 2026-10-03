@@ -1,7 +1,7 @@
 //! 代理配置管理：存储、规则、测速
 
-use base64::Engine;
 use crate::network::NetworkOptions;
+use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -90,9 +90,9 @@ impl ProxyConfig {
     /// 设置密码（自动 base64 编码）
     #[allow(dead_code)]
     pub fn set_password(&mut self, pwd: Option<String>) {
-        self.password_b64 = pwd.as_ref().map(|p| {
-            base64::engine::general_purpose::STANDARD.encode(p.as_bytes())
-        });
+        self.password_b64 = pwd
+            .as_ref()
+            .map(|p| base64::engine::general_purpose::STANDARD.encode(p.as_bytes()));
         self.updated_at = chrono::Utc::now().timestamp_millis();
     }
 
@@ -101,13 +101,18 @@ impl ProxyConfig {
         let base = self.to_proxy_url()?;
         if let (Some(u), Some(p)) = (&self.username, self.get_password()) {
             // reqwest wants: scheme://username:password@host:port
-            Some(format!("{}://{}:{}@{}:{}",
+            Some(format!(
+                "{}://{}:{}@{}:{}",
                 match self.proxy_type {
                     ProxyType::Http => "http",
                     ProxyType::Socks5 => "socks5",
                     ProxyType::Https => "https",
                 },
-                u, p, self.host, self.port))
+                u,
+                p,
+                self.host,
+                self.port
+            ))
         } else {
             Some(base)
         }
@@ -142,7 +147,12 @@ pub struct ProxyRule {
 }
 
 impl ProxyRule {
-    pub fn new(name: String, match_type: ProxyMatchType, patterns: Vec<String>, proxy_id: String) -> Self {
+    pub fn new(
+        name: String,
+        match_type: ProxyMatchType,
+        patterns: Vec<String>,
+        proxy_id: String,
+    ) -> Self {
         let now = chrono::Utc::now().timestamp_millis();
         Self {
             id: Uuid::new_v4().to_string(),
@@ -166,12 +176,8 @@ impl ProxyRule {
             return false;
         }
         self.patterns.iter().any(|p| match self.match_type {
-            ProxyMatchType::DomainContains => {
-                url.contains(p)
-            }
-            ProxyMatchType::UrlContains => {
-                url.contains(p)
-            }
+            ProxyMatchType::DomainContains => url.contains(p),
+            ProxyMatchType::UrlContains => url.contains(p),
             ProxyMatchType::Extension => {
                 if let Some(ext) = url.rsplit('.').next() {
                     ext.eq_ignore_ascii_case(p.trim_start_matches('.'))
@@ -200,8 +206,7 @@ fn proxies_path(app_data_dir: &Path) -> std::path::PathBuf {
 
 /// 加载代理配置
 #[allow(dead_code)]
-pub 
-fn load_proxy_store(app_data_dir: &Path) -> ProxyStore {
+pub fn load_proxy_store(app_data_dir: &Path) -> ProxyStore {
     let path = proxies_path(app_data_dir);
     if let Ok(s) = std::fs::read_to_string(&path) {
         serde_json::from_str(&s).unwrap_or_default()
@@ -212,20 +217,22 @@ fn load_proxy_store(app_data_dir: &Path) -> ProxyStore {
 
 /// 保存代理配置（异步）
 #[allow(dead_code)]
-pub async 
-fn save_proxy_store(app_data_dir: &std::path::Path, store: &ProxyStore) -> Result<(), std::io::Error> {
+pub async fn save_proxy_store(
+    app_data_dir: &std::path::Path,
+    store: &ProxyStore,
+) -> Result<(), std::io::Error> {
     let path = proxies_path(app_data_dir);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let json = serde_json::to_string_pretty(store).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_string_pretty(store)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     tokio::fs::write(path, json).await
 }
 
 /// 将 ProxyStore 转换为网络层可用的 NetworkOptions
 #[allow(dead_code)]
-pub 
-fn proxy_config_to_network_options(config: &ProxyConfig) -> Option<NetworkOptions> {
+pub fn proxy_config_to_network_options(config: &ProxyConfig) -> Option<NetworkOptions> {
     config.to_authenticated_url().map(|url| NetworkOptions {
         proxy_url: Some(url),
         timeout_secs: 30,
@@ -242,7 +249,11 @@ pub fn match_proxy_rule<'a>(url: &str, store: &'a ProxyStore) -> Option<&'a Prox
 
     for rule in sorted_rules {
         if rule.matches(url) {
-            if let Some(proxy) = store.proxies.iter().find(|p| p.id == rule.proxy_id && p.enabled) {
+            if let Some(proxy) = store
+                .proxies
+                .iter()
+                .find(|p| p.id == rule.proxy_id && p.enabled)
+            {
                 return Some(proxy);
             }
         }
@@ -340,7 +351,11 @@ impl ProxyConfig {
         let _req_start = Instant::now();
         match tokio::time::timeout(timeout, client.head(test_url).send()).await {
             Ok(Ok(resp)) if resp.status().is_success() || resp.status().as_u16() == 204 => None,
-            Ok(Ok(resp)) => Some(format!("HTTP {}: {:?}", resp.status().as_u16(), resp.headers())),
+            Ok(Ok(resp)) => Some(format!(
+                "HTTP {}: {:?}",
+                resp.status().as_u16(),
+                resp.headers()
+            )),
             Ok(Err(e)) => Some(format!("请求失败: {}", e)),
             Err(_) => Some("请求超时".to_string()),
         }

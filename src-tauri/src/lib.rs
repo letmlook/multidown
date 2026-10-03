@@ -3,35 +3,35 @@
     windows_subsystem = "windows"
 )]
 
-mod engine;
 mod browser_integration;
+mod engine;
 mod network;
 mod protocol;
 mod settings;
 mod storage;
 mod torrent;
 
+use arboard::Clipboard;
 use browser_integration::BrowserInstallOutcome;
+use chrono::Local;
 use engine::scheduler::{recover_load, Scheduler, SchedulerPaths};
+use engine::TaskStatus;
 use network::{AuthConfig, NetworkOptions, ProbeResult};
 use settings::proxy::{
-    load_proxy_store, save_proxy_store, ProxyConfig, ProxyMatchType,
-    ProxyRule, ProxyTestResult, ProxyType,
+    load_proxy_store, save_proxy_store, ProxyConfig, ProxyMatchType, ProxyRule, ProxyTestResult,
+    ProxyType,
 };
 use settings::{load_settings, save_settings, settings_path, AppSettings};
-use engine::TaskStatus;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
-use tauri::{Manager, State};
-use tauri::Emitter;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
+use tauri::Emitter;
+use tauri::{Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use arboard::Clipboard;
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
-use chrono::Local;
 
 // 全局变量，用于存储TCP服务器的停止标志
 use std::sync::atomic::AtomicBool;
@@ -72,7 +72,9 @@ fn acknowledge_recovery_warnings(ids: Vec<String>, state: State<'_, RecoveryWarn
 
 /// 列出所有下载队列
 #[tauri::command]
-async fn list_queues(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::queue::QueueSummary>, String> {
+async fn list_queues(
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<Vec<engine::queue::QueueSummary>, String> {
     Ok(state.list_queues().await)
 }
 
@@ -103,7 +105,9 @@ async fn update_queue(
     max_concurrent: Option<u32>,
     state: State<'_, Arc<Scheduler>>,
 ) -> Result<(), String> {
-    state.update_queue(&queue_id, name, enabled, max_concurrent, None).await
+    state
+        .update_queue(&queue_id, name, enabled, max_concurrent, None)
+        .await
 }
 
 /// 删除队列（软删除，默认队列不可删除）
@@ -159,7 +163,9 @@ async fn get_task_queue(
 
 /// 列出所有批量任务
 #[tauri::command]
-async fn list_batches(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::batch::BatchJobInfo>, String> {
+async fn list_batches(
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<Vec<engine::batch::BatchJobInfo>, String> {
     Ok(state.list_batches().await)
 }
 
@@ -189,19 +195,13 @@ async fn create_batch(
 
 /// 重试失败任务（重置为全量重下）
 #[tauri::command]
-async fn retry_task(
-    task_id: String,
-    state: State<'_, Arc<Scheduler>>,
-) -> Result<(), String> {
+async fn retry_task(task_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
     state.retry_task(&task_id).await
 }
 
 /// 重试批次内所有失败任务
 #[tauri::command]
-async fn retry_batch(
-    batch_id: String,
-    state: State<'_, Arc<Scheduler>>,
-) -> Result<usize, String> {
+async fn retry_batch(batch_id: String, state: State<'_, Arc<Scheduler>>) -> Result<usize, String> {
     state.retry_batch(&batch_id).await
 }
 
@@ -256,7 +256,9 @@ async fn delete_batch(batch_id: String, state: State<'_, Arc<Scheduler>>) -> Res
 
 /// 列出所有分类规则
 #[tauri::command]
-async fn list_rules(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::rules::CategoryRule>, String> {
+async fn list_rules(
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<Vec<engine::rules::CategoryRule>, String> {
     Ok(state.list_rules().await)
 }
 
@@ -309,7 +311,10 @@ async fn delete_rule(rule_id: String, state: State<'_, Arc<Scheduler>>) -> Resul
 
 /// 重新排序规则（拖拽排序）
 #[tauri::command]
-async fn reorder_rules(rule_ids: Vec<String>, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+async fn reorder_rules(
+    rule_ids: Vec<String>,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
     state.reorder_rules(rule_ids).await
 }
 
@@ -317,7 +322,10 @@ async fn reorder_rules(rule_ids: Vec<String>, state: State<'_, Arc<Scheduler>>) 
 /// - `url`: 待测试的下载 URL
 /// - 返回匹配到的规则的保存路径，若无匹配返回 None
 #[tauri::command]
-async fn test_rules(url: String, state: State<'_, Arc<Scheduler>>) -> Result<Option<engine::MatchResult>, String> {
+async fn test_rules(
+    url: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<Option<engine::MatchResult>, String> {
     Ok(state.test_rules_info(&url).await)
 }
 
@@ -344,14 +352,19 @@ async fn get_schedule_state(state: State<'_, Arc<Scheduler>>) -> Result<Schedule
 
 /// 设置全局调度开关
 #[tauri::command]
-async fn set_schedule_enabled(enabled: bool, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
+async fn set_schedule_enabled(
+    enabled: bool,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
     state.set_schedule_enabled(enabled).await;
     Ok(())
 }
 
 /// 列出所有计划任务
 #[tauri::command]
-async fn get_schedule_tasks(state: State<'_, Arc<Scheduler>>) -> Result<Vec<engine::schedule::ScheduleRule>, String> {
+async fn get_schedule_tasks(
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<Vec<engine::schedule::ScheduleRule>, String> {
     Ok(state.get_schedule_tasks().await)
 }
 
@@ -397,7 +410,11 @@ async fn delete_schedule_task(id: String, state: State<'_, Arc<Scheduler>>) -> R
 
 /// 手动触发一个计划任务（立即执行）
 #[tauri::command]
-async fn trigger_schedule_task(id: String, state: State<'_, Arc<Scheduler>>, app_handle: tauri::AppHandle) -> Result<(), String> {
+async fn trigger_schedule_task(
+    id: String,
+    state: State<'_, Arc<Scheduler>>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
     state.trigger_schedule_task(&id, Some(app_handle)).await
 }
 
@@ -434,11 +451,13 @@ async fn add_proxy(
     let mut config = ProxyConfig::new(name, proxy_type, host, port);
     config.username = username;
     config.set_password(password);
-    
+
     let mut store = load_proxy_store(&app_data);
     store.proxies.push(config.clone());
-    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
-    
+    save_proxy_store(&app_data, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+
     Ok(config)
 }
 
@@ -458,22 +477,41 @@ async fn update_proxy(
 ) -> Result<ProxyConfig, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let mut store = load_proxy_store(&app_data);
-    
-    let proxy = store.proxies.iter_mut().find(|p| p.id == id)
+
+    let proxy = store
+        .proxies
+        .iter_mut()
+        .find(|p| p.id == id)
         .ok_or("代理不存在")?;
-    
-    if let Some(n) = name { proxy.name = n; }
-    if let Some(t) = proxy_type { proxy.proxy_type = t; }
-    if let Some(h) = host { proxy.host = h; }
-    if let Some(p) = port { proxy.port = p; }
-    if let Some(u) = username { proxy.username = Some(u); }
-    if let Some(pw) = password { proxy.set_password(Some(pw)); }
-    if let Some(e) = enabled { proxy.enabled = e; }
+
+    if let Some(n) = name {
+        proxy.name = n;
+    }
+    if let Some(t) = proxy_type {
+        proxy.proxy_type = t;
+    }
+    if let Some(h) = host {
+        proxy.host = h;
+    }
+    if let Some(p) = port {
+        proxy.port = p;
+    }
+    if let Some(u) = username {
+        proxy.username = Some(u);
+    }
+    if let Some(pw) = password {
+        proxy.set_password(Some(pw));
+    }
+    if let Some(e) = enabled {
+        proxy.enabled = e;
+    }
     proxy.updated_at = chrono::Utc::now().timestamp_millis();
-    
+
     let updated = proxy.clone();
-    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
-    
+    save_proxy_store(&app_data, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+
     Ok(updated)
 }
 
@@ -487,7 +525,9 @@ async fn delete_proxy(app: tauri::AppHandle, id: String) -> Result<(), String> {
     if store.proxies.len() == len_before {
         return Err("代理不存在".to_string());
     }
-    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    save_proxy_store(&app_data, &store)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -507,19 +547,19 @@ async fn test_proxy(
     config.username = username;
     config.set_password(password);
     config.id = "test".to_string();
-    
+
     // 构建带认证的 URL 进行测试
     if let Some(url) = config.to_authenticated_url() {
         // 使用 reqwest 构建代理客户端进行实际连接测试
         let test_url = "http://www.gstatic.com/generate_204";
         let timeout = std::time::Duration::from_secs(10);
-        
+
         let client = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all(&url).map_err(|e| e.to_string())?)
             .timeout(timeout)
             .build()
             .map_err(|e| e.to_string())?;
-        
+
         let start = std::time::Instant::now();
         match tokio::time::timeout(timeout, client.head(test_url).send()).await {
             Ok(Ok(resp)) if resp.status().is_success() || resp.status().as_u16() == 204 => {
@@ -574,12 +614,16 @@ async fn add_proxy_rule(
 ) -> Result<ProxyRule, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let mut rule = ProxyRule::new(name, match_type, patterns, proxy_id);
-    if let Some(p) = priority { rule.priority = p; }
-    
+    if let Some(p) = priority {
+        rule.priority = p;
+    }
+
     let mut store = load_proxy_store(&app_data);
     store.rules.push(rule.clone());
-    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
-    
+    save_proxy_store(&app_data, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+
     Ok(rule)
 }
 
@@ -598,21 +642,38 @@ async fn update_proxy_rule(
 ) -> Result<ProxyRule, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let mut store = load_proxy_store(&app_data);
-    
-    let rule = store.rules.iter_mut().find(|r| r.id == id)
+
+    let rule = store
+        .rules
+        .iter_mut()
+        .find(|r| r.id == id)
         .ok_or("规则不存在")?;
-    
-    if let Some(n) = name { rule.name = n; }
-    if let Some(e) = enabled { rule.enabled = e; }
-    if let Some(m) = match_type { rule.match_type = m; }
-    if let Some(p) = patterns { rule.patterns = p; }
-    if let Some(pid) = proxy_id { rule.proxy_id = pid; }
-    if let Some(p) = priority { rule.priority = p; }
+
+    if let Some(n) = name {
+        rule.name = n;
+    }
+    if let Some(e) = enabled {
+        rule.enabled = e;
+    }
+    if let Some(m) = match_type {
+        rule.match_type = m;
+    }
+    if let Some(p) = patterns {
+        rule.patterns = p;
+    }
+    if let Some(pid) = proxy_id {
+        rule.proxy_id = pid;
+    }
+    if let Some(p) = priority {
+        rule.priority = p;
+    }
     rule.updated_at = chrono::Utc::now().timestamp_millis();
-    
+
     let updated = rule.clone();
-    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
-    
+    save_proxy_store(&app_data, &store)
+        .await
+        .map_err(|e| e.to_string())?;
+
     Ok(updated)
 }
 
@@ -626,7 +687,9 @@ async fn delete_proxy_rule(app: tauri::AppHandle, id: String) -> Result<(), Stri
     if store.rules.len() == len_before {
         return Err("规则不存在".to_string());
     }
-    save_proxy_store(&app_data, &store).await.map_err(|e| e.to_string())?;
+    save_proxy_store(&app_data, &store)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -637,24 +700,20 @@ fn debug_log(app: &tauri::AppHandle, message: &str, data: Option<&str>) {
         Some(d) => format!("[{}] [Multidown Main] {}: {}", timestamp, message, d),
         None => format!("[{}] [Multidown Main] {}", timestamp, message),
     };
-    
+
     // 输出到标准错误
     eprintln!("{}", log_message);
-    
+
     // 写入日志文件
     if let Ok(app_data) = app.path().app_data_dir() {
         let log_path = app_data.join("multidown.log");
-        
+
         // 确保日志目录存在
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             let mut writer = BufWriter::new(file);
             let _ = writeln!(writer, "{}", log_message);
         } else {
@@ -677,25 +736,24 @@ fn debug_log_detailed(app: &tauri::AppHandle, message: &str, details: &str) {
 #[allow(dead_code)]
 fn error_log(app: &tauri::AppHandle, message: &str, error: &str) {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-    let log_message = format!("[{}] [Multidown Main] [ERROR] {}: {}", timestamp, message, error);
-    
+    let log_message = format!(
+        "[{}] [Multidown Main] [ERROR] {}: {}",
+        timestamp, message, error
+    );
+
     // 输出到标准错误
     eprintln!("{}", log_message);
-    
+
     // 写入日志文件
     if let Ok(app_data) = app.path().app_data_dir() {
         let log_path = app_data.join("multidown.log");
-        
+
         // 确保日志目录存在
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             let mut writer = BufWriter::new(file);
             let _ = writeln!(writer, "{}", log_message);
         }
@@ -735,7 +793,9 @@ async fn get_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
 #[tauri::command]
 async fn set_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
     let path = app_settings_path(&app)?;
-    save_settings(&path, &settings).await.map_err(|e| e.to_string())?;
+    save_settings(&path, &settings)
+        .await
+        .map_err(|e| e.to_string())?;
     // 同步引擎限制（全局并发/重试次数/重复链接策略）
     if let Some(scheduler) = app.try_state::<Arc<Scheduler>>() {
         scheduler.update_from_settings(&settings);
@@ -1160,25 +1220,22 @@ fn get_default_download_dir(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn exit_app(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<Scheduler>>,
-) -> Result<(), String> {
+async fn exit_app(app: tauri::AppHandle, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
     // 优雅关闭 BitTorrent 会话：释放监听端口并落盘 fastresume 状态
     state.shutdown_torrent().await;
 
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.destroy();
     }
-    
+
     // 设置TCP服务器关闭标志
     TCP_SHUTDOWN_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
-    
+
     // 发送停止信号给TCP服务器
     if let Some(tx) = TCP_SHUTDOWN_TX.lock().unwrap().take() {
         let _ = tx.send(());
     }
-    
+
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(350));
@@ -1254,9 +1311,7 @@ fn get_browser_extension_path(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn install_browser_extension(
-    app: tauri::AppHandle,
-) -> Result<BrowserInstallOutcome, String> {
+async fn install_browser_extension(app: tauri::AppHandle) -> Result<BrowserInstallOutcome, String> {
     register_native_host(app.clone())?;
     let ext_dir = get_extension_directory(app)?;
     browser_integration::open_extension_installers(std::path::Path::new(&ext_dir))
@@ -1266,12 +1321,12 @@ async fn install_browser_extension(
 fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let ext_dir = app_data.join("extension");
-    
+
     // 检查扩展目录是否存在
     if ext_dir.join("manifest.json").exists() {
         return Ok(ext_dir.to_string_lossy().to_string());
     }
-    
+
     // 检查资源目录中的扩展文件
     if let Ok(res_dir) = app.path().resource_dir() {
         // 首先检查解压后的扩展目录
@@ -1279,7 +1334,7 @@ fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
         if unpacked_ext_dir.join("manifest.json").exists() {
             // 复制到应用数据目录
             std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-            
+
             // 复制所有文件
             let files = std::fs::read_dir(&unpacked_ext_dir).map_err(|e| e.to_string())?;
             for file in files {
@@ -1290,27 +1345,27 @@ fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
                     std::fs::copy(&src_path, &dest_path).map_err(|e| e.to_string())?;
                 }
             }
-            
+
             return Ok(ext_dir.to_string_lossy().to_string());
         }
-        
+
         // 尝试使用ZIP文件
         let zip_path = res_dir.join("extension").join("multidown-extension.zip");
         if zip_path.exists() {
             // 创建扩展目录
             std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-            
+
             // 解压zip文件
             let zip_content = std::fs::read(&zip_path).map_err(|e| e.to_string())?;
-            
+
             // 使用zip库解压
             let mut cursor = std::io::Cursor::new(zip_content);
             let mut archive = zip::ZipArchive::new(&mut cursor).map_err(|e| e.to_string())?;
-            
+
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
                 let outpath = ext_dir.join(file.name());
-                
+
                 if file.name().ends_with('/') {
                     std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
                 } else {
@@ -1323,27 +1378,27 @@ fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
                     std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
                 }
             }
-            
+
             return Ok(ext_dir.to_string_lossy().to_string());
         }
-        
+
         // 最后尝试CRX文件
         let crx_path = res_dir.join("extension").join("multidown-extension.crx");
         if crx_path.exists() {
             // 创建扩展目录
             std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-            
+
             // 解压crx文件（实际上是zip文件）
             let crx_content = std::fs::read(&crx_path).map_err(|e| e.to_string())?;
-            
+
             // 使用zip库解压
             let mut cursor = std::io::Cursor::new(crx_content);
             let mut archive = zip::ZipArchive::new(&mut cursor).map_err(|e| e.to_string())?;
-            
+
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
                 let outpath = ext_dir.join(file.name());
-                
+
                 if file.name().ends_with('/') {
                     std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
                 } else {
@@ -1356,38 +1411,36 @@ fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
                     std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
                 }
             }
-            
+
             return Ok(ext_dir.to_string_lossy().to_string());
         }
     }
-    
+
     Err("扩展文件不存在".to_string())
 }
-
-
 
 #[tauri::command]
 async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, String> {
     use std::fs::File;
     use std::io::Write;
     use zip::write::FileOptions;
-    
+
     // 获取扩展路径
     let ext_path = get_browser_extension_path(app.clone())?;
     let ext_dir = std::path::Path::new(&ext_path);
-    
+
     // 创建输出目录
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let output_dir = app_data.join("extension");
     std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
-    
+
     // 生成zip文件路径
     let zip_path = output_dir.join("multidown-extension.zip");
-    
+
     // 创建zip文件
     let file = File::create(&zip_path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
-    
+
     // 遍历扩展目录中的所有文件
     let walk_dir = walkdir::WalkDir::new(ext_dir).into_iter();
     for entry in walk_dir.filter_map(|e| e.ok()) {
@@ -1396,7 +1449,7 @@ async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, Stri
             // 计算相对路径
             let relative_path = path.strip_prefix(ext_dir).map_err(|e| e.to_string())?;
             let relative_path_str = relative_path.to_string_lossy().to_string();
-            
+
             // 写入文件到zip
             zip.start_file(relative_path_str, FileOptions::default())
                 .map_err(|e| e.to_string())?;
@@ -1406,10 +1459,10 @@ async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, Stri
             zip.write_all(&buffer).map_err(|e| e.to_string())?;
         }
     }
-    
+
     // 完成zip写入
     zip.finish().map_err(|e| e.to_string())?;
-    
+
     Ok(zip_path.to_string_lossy().to_string())
 }
 
@@ -1484,10 +1537,7 @@ fn handle_external_input(app: &tauri::AppHandle, raw: &str) {
         return;
     }
     debug_log(app, "收到外部下载输入", Some(&input));
-    PENDING_EXTERNAL_INPUTS
-        .lock()
-        .unwrap()
-        .push(input.clone());
+    PENDING_EXTERNAL_INPUTS.lock().unwrap().push(input.clone());
     let _ = app.emit("external-input", serde_json::json!({ "input": input }));
 }
 
@@ -1539,23 +1589,24 @@ fn firefox_manifest_content(native_host_path: &str) -> String {
 }
 
 fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "windows")]{
+    #[cfg(target_os = "windows")]
+    {
         use winreg::enums::*;
         use winreg::RegKey;
-        
+
         // 获取资源目录
         let res_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
         let native_host_src = res_dir.join("native-host");
-        
+
         if !native_host_src.exists() {
             return Err("Native host directory not found in resources".to_string());
         }
-        
+
         // 复制到应用数据目录以确保权限
         let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
         let native_host_dir = app_data.join("native-host");
         std::fs::create_dir_all(&native_host_dir).map_err(|e| e.to_string())?;
-        
+
         // 复制 native host 文件
         let files = std::fs::read_dir(&native_host_src).map_err(|e| e.to_string())?;
         for file in files {
@@ -1566,7 +1617,7 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
                 std::fs::copy(&src_path, &dest_path).map_err(|e| e.to_string())?;
             }
         }
-        
+
         // 写入当前安装路径与固定的 Chromium 扩展 ID。
         let manifest_path = native_host_dir.join("com.multidown.app.json");
         let native_host_exe_path = native_host_dir.join("multidown-native-host.exe");
@@ -1575,47 +1626,66 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
             chromium_manifest_content(&native_host_exe_path.to_string_lossy()),
         )
         .map_err(|e| e.to_string())?;
-        
+
         // 注册 Chrome Native Host
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let path = r"Software\Google\Chrome\NativeMessagingHosts\com.multidown.app";
         let (key, _) = hkcu.create_subkey(path).map_err(|e| e.to_string())?;
-        key.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
-        
+        key.set_value("", &manifest_path.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())?;
+
         // 注册 Edge Native Host
         let path_edge = r"Software\Microsoft\Edge\NativeMessagingHosts\com.multidown.app";
         let (key_edge, _) = hkcu.create_subkey(path_edge).map_err(|e| e.to_string())?;
-        key_edge.set_value("", &manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
+        key_edge
+            .set_value("", &manifest_path.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())?;
 
         // 注册 Firefox Native Host（Firefox 要求 allowed_extensions 精确匹配，单独写 manifest）
         let native_host_exe_path = native_host_dir.join("multidown-native-host.exe");
         let ff_manifest_path = native_host_dir.join("com.multidown.app.firefox.json");
-        std::fs::write(&ff_manifest_path, firefox_manifest_content(&native_host_exe_path.to_string_lossy()))
-            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            &ff_manifest_path,
+            firefox_manifest_content(&native_host_exe_path.to_string_lossy()),
+        )
+        .map_err(|e| e.to_string())?;
         let path_ff = r"Software\Mozilla\NativeMessagingHosts\com.multidown.app";
         let (key_ff, _) = hkcu.create_subkey(path_ff).map_err(|e| e.to_string())?;
-        key_ff.set_value("", &ff_manifest_path.to_string_lossy().to_string()).map_err(|e| e.to_string())?;
+        key_ff
+            .set_value("", &ff_manifest_path.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
-    #[cfg(target_os = "macos")]{
+    #[cfg(target_os = "macos")]
+    {
         // macOS 实现
         let home_dir = dirs::home_dir().ok_or("无法获取用户主目录".to_string())?;
-        let chrome_dir = home_dir.join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
-        let edge_dir = home_dir.join("Library/Application Support/Microsoft Edge/NativeMessagingHosts");
-        
+        let chrome_dir =
+            home_dir.join("Library/Application Support/Google/Chrome/NativeMessagingHosts");
+        let edge_dir =
+            home_dir.join("Library/Application Support/Microsoft Edge/NativeMessagingHosts");
+
         std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
-        
+
         // 获取资源目录
         let res_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
         let native_host_path = res_dir.join("native-host").join("multidown-native-host");
-        
+
         // 创建 manifest 文件
         let manifest_str = chromium_manifest_content(&native_host_path.to_string_lossy());
 
-        std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
-        std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
+        std::fs::write(
+            chrome_dir.join("com.multidown.app.json"),
+            manifest_str.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(
+            edge_dir.join("com.multidown.app.json"),
+            manifest_str.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
 
         // Firefox：allowed_extensions 精确 ID
         let mozilla_dir = home_dir.join("Library/Application Support/Mozilla/NativeMessagingHosts");
@@ -1628,29 +1698,42 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
             "allowed_extensions": ["multidown@letmlook"]
         });
         let ff_str = serde_json::to_string_pretty(&ff_manifest).map_err(|e| e.to_string())?;
-        std::fs::write(mozilla_dir.join("com.multidown.app.json"), ff_str.as_bytes()).map_err(|e| e.to_string())?;
+        std::fs::write(
+            mozilla_dir.join("com.multidown.app.json"),
+            ff_str.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }
-    #[cfg(target_os = "linux")]{
+    #[cfg(target_os = "linux")]
+    {
         // Linux 实现
         let home_dir = dirs::home_dir().ok_or("无法获取用户主目录".to_string())?;
         let chrome_dir = home_dir.join(".config/google-chrome/NativeMessagingHosts");
         let edge_dir = home_dir.join(".config/microsoft-edge/NativeMessagingHosts");
         let mozilla_dir = home_dir.join(".mozilla/native-messaging-hosts");
-        
+
         std::fs::create_dir_all(&chrome_dir).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&edge_dir).map_err(|e| e.to_string())?;
-        
+
         // 获取资源目录
         let res_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
         let native_host_path = res_dir.join("native-host").join("multidown-native-host");
-        
+
         // 创建 manifest 文件
         let manifest_str = chromium_manifest_content(&native_host_path.to_string_lossy());
 
-        std::fs::write(chrome_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
-        std::fs::write(edge_dir.join("com.multidown.app.json"), manifest_str.as_bytes()).map_err(|e| e.to_string())?;
+        std::fs::write(
+            chrome_dir.join("com.multidown.app.json"),
+            manifest_str.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(
+            edge_dir.join("com.multidown.app.json"),
+            manifest_str.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
 
         // Firefox：allowed_extensions 精确 ID
         std::fs::create_dir_all(&mozilla_dir).map_err(|e| e.to_string())?;
@@ -1662,7 +1745,11 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
             "allowed_extensions": ["multidown@letmlook"]
         });
         let ff_str = serde_json::to_string_pretty(&ff_manifest).map_err(|e| e.to_string())?;
-        std::fs::write(mozilla_dir.join("com.multidown.app.json"), ff_str.as_bytes()).map_err(|e| e.to_string())?;
+        std::fs::write(
+            mozilla_dir.join("com.multidown.app.json"),
+            ff_str.as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -1724,10 +1811,7 @@ async fn export_tasks(state: State<'_, Arc<Scheduler>>) -> Result<String, String
             filename: t.filename,
         })
         .collect();
-    let data = ExportData {
-        version: 1,
-        tasks,
-    };
+    let data = ExportData { version: 1, tasks };
     serde_json::to_string_pretty(&data).map_err(|e| e.to_string())
 }
 
@@ -2045,14 +2129,14 @@ pub fn run() {
                     }
                 });
             }
-            
+
             // 检查是否首次运行，如果是则自动安装扩展
             let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let first_run_flag = app_data.join("first_run");
             if !first_run_flag.exists() {
                 // 创建首次运行标志
                 std::fs::write(&first_run_flag, "").ok();
-                
+
                 // 自动安装扩展
                 let app_handle_clone = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -2064,7 +2148,7 @@ pub fn run() {
             let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
-            
+
             // 尝试加载应用程序图标作为托盘图标
             let mut tray_builder = TrayIconBuilder::new()
                 .tooltip("Multidown")
@@ -2083,15 +2167,15 @@ pub fn run() {
                             if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.destroy();
                             }
-                            
+
                             // 设置TCP服务器关闭标志
                             TCP_SHUTDOWN_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
-                            
+
                             // 发送停止信号给TCP服务器
                             if let Some(tx) = TCP_SHUTDOWN_TX.lock().unwrap().take() {
                                 let _ = tx.send(());
                             }
-                            
+
                             let app = app.clone();
                             std::thread::spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2101,13 +2185,13 @@ pub fn run() {
                         _ => {}
                     }
                 });
-            
+
             // 尝试使用应用程序图标作为托盘图标
             if let Some(icon) = app.default_window_icon() {
                 // 直接使用默认窗口图标
                 tray_builder = tray_builder.icon(icon.to_owned());
             }
-            
+
             let _tray = tray_builder.build(app)?;
 
             // 浏览器扩展 Native Host：TCP 服务，接收扩展发来的消息并返回结果
@@ -2124,18 +2208,18 @@ pub fn run() {
                 open_window: bool,
                 responder: oneshot::Sender<Result<(), String>>,
             }
-            
+
             #[derive(Debug)]
             struct OpenWindowTask {
                 url: String,
                 responder: oneshot::Sender<Result<(), String>>,
             }
-            
+
             enum TaskMessage {
                 Download(DownloadTask),
                 OpenWindow(OpenWindowTask),
             }
-            
+
             let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel::<TaskMessage>();
             let app_data = match app.path().app_data_dir() {
                 Ok(d) => d,
@@ -2143,13 +2227,13 @@ pub fn run() {
             };
             let port_file = app_data.join("native_host_port.txt");
             let app_handle_clone = app_handle.clone();
-            
+
             debug_log(&app_handle, "启动TCP服务器", None);
-            
+
             // 创建关闭信号通道
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             *TCP_SHUTDOWN_TX.lock().unwrap() = Some(shutdown_tx);
-            
+
             tauri::async_runtime::spawn(async move {
                 let listener = match TcpListener::bind("127.0.0.1:0").await {
                     Ok(l) => l,
@@ -2188,9 +2272,9 @@ pub fn run() {
                                     continue;
                                 }
                             };
-                    
+
                     debug_log(&app_handle_clone, "接受到新连接", Some(&addr.to_string()));
-                    
+
                     let (reader, mut writer) = stream.into_split();
                     let mut reader = BufReader::new(reader);
                     let mut line = String::new();
@@ -2203,9 +2287,9 @@ pub fn run() {
                         debug_log(&app_handle_clone, "接收到空消息", None);
                         continue;
                     }
-                    
+
                     debug_log(&app_handle_clone, "接收到消息", Some(&line));
-                    
+
                     // 解析消息
                     let msg: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&line) {
                         Ok(m) => {
@@ -2230,10 +2314,10 @@ pub fn run() {
                             }
                         }
                     };
-                    
+
                     let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("download");
                     debug_log(&app_handle_clone, "处理动作", Some(action));
-                    
+
                     match action {
                         "get_config" => {
                             // 下发捕获配置给扩展（总开关 + 域名黑名单）
@@ -2264,7 +2348,7 @@ pub fn run() {
                                         || s.starts_with("magnet:")
                                         || crate::torrent::detect::sniff(s).is_torrent()
                                 });
-                            
+
                             let url = match url {
                                 Some(u) => {
                                     debug_log(&app_handle_clone, "获取到下载URL", Some(u));
@@ -2279,7 +2363,7 @@ pub fn run() {
                                     continue;
                                 }
                             };
-                            
+
                             let filename = msg.get("filename").and_then(|v| v.as_str()).map(String::from);
                             let referer = msg.get("referer").and_then(|v| v.as_str()).map(String::from);
                             let user_agent = msg.get("user_agent").and_then(|v| v.as_str()).map(String::from);
@@ -2287,9 +2371,9 @@ pub fn run() {
                             let post_data = msg.get("post_data").and_then(|v| v.as_str()).map(String::from);
                             let save_path = msg.get("save_path").and_then(|v| v.as_str()).map(String::from);
                             let open_window = msg.get("open_window").and_then(|v| v.as_bool()).unwrap_or(true);
-                            
+
                             debug_log(&app_handle_clone, "下载参数", Some(&format!("filename: {:?}, referer: {:?}, open_window: {:?}", filename, referer, open_window)));
-                            
+
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let download_task = DownloadTask {
                                 url,
@@ -2302,16 +2386,16 @@ pub fn run() {
                                 open_window,
                                 responder: resp_tx,
                             };
-                            
+
                             if task_tx.send(TaskMessage::Download(download_task)).is_err() {
                                 debug_log(&app_handle_clone, "发送任务失败", None);
                                 let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
                                 let _ = writer.shutdown().await;
                                 continue;
                             }
-                            
+
                             debug_log(&app_handle_clone, "任务发送成功，等待响应", None);
-                            
+
                             let response = match resp_rx.await {
                                 Ok(Ok(())) => {
                                     debug_log(&app_handle_clone, "任务处理成功", None);
@@ -2326,29 +2410,29 @@ pub fn run() {
                                     b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec()
                                 }
                             };
-                            
+
                             debug_log(&app_handle_clone, "发送响应", Some(&String::from_utf8_lossy(&response)));
                             let _ = writer.write_all(&response).await;
                             let _ = writer.shutdown().await;
                         }
-                        
+
                         "open_window" => {
                             let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
                             debug_log(&app_handle_clone, "处理打开窗口请求", Some(url));
-                            
+
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let open_window_task = OpenWindowTask {
                                 url: url.to_string(),
                                 responder: resp_tx,
                             };
-                            
+
                             if task_tx.send(TaskMessage::OpenWindow(open_window_task)).is_err() {
                                 debug_log(&app_handle_clone, "发送打开窗口任务失败", None);
                                 let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
                                 let _ = writer.shutdown().await;
                                 continue;
                             }
-                            
+
                             let response = match resp_rx.await {
                                 Ok(Ok(())) => {
                                     debug_log(&app_handle_clone, "打开窗口成功", None);
@@ -2363,11 +2447,11 @@ pub fn run() {
                                     b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec()
                                 }
                             };
-                            
+
                             let _ = writer.write_all(&response).await;
                             let _ = writer.shutdown().await;
                         }
-                        
+
                         _ => {
                             debug_log(&app_handle_clone, "未知动作", Some(action));
                             let _ = writer
@@ -2377,7 +2461,7 @@ pub fn run() {
                         }
                     }
                         },
-                        
+
                         _ = &mut *shutdown_rx => {
                             debug_log(&app_handle_clone, "接收到停止信号，关闭TCP服务器", None);
                             // 尝试删除端口文件
@@ -2389,7 +2473,7 @@ pub fn run() {
                     }
                 }
             });
-            
+
             let app_worker = app_handle.clone();
             let sched_worker = sched_clone.clone();
             tauri::async_runtime::spawn(async move {
@@ -2544,17 +2628,17 @@ pub fn run() {
                             };
                             let _ = responder.send(result);
                         }
-                        
+
                         TaskMessage::OpenWindow(task) => {
                             let OpenWindowTask { url, responder } = task;
-                            
+
                             // 显示主窗口
                             if let Some(window) = app_worker.get_webview_window("main") {
                                 let _ = window.show();
                                 let _ = window.unminimize();
                                 let _ = window.set_focus();
                             }
-                            
+
                             // 如果提供了URL，自动添加到下载（磁力/种子分流到种子任务）
                             if crate::torrent::detect::sniff(&url).is_torrent() {
                                 let save_dir = default_save_dir_for_browser(&app_worker);

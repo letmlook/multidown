@@ -99,11 +99,7 @@ async fn downloads_a_locally_seeded_torrent() {
     let torrent_bytes = created.as_bytes().unwrap().to_vec();
 
     // 做种端：源文件复制到做种目录，librqbit 校验后即可上传
-    std::fs::copy(
-        source_dir.join("payload.bin"),
-        seed_dir.join("payload.bin"),
-    )
-    .unwrap();
+    std::fs::copy(source_dir.join("payload.bin"), seed_dir.join("payload.bin")).unwrap();
     let seeder_addr: SocketAddr = format!("127.0.0.1:{}", pick_port()).parse().unwrap();
     let seeder = spawn_seeder(torrent_bytes.clone(), &seed_dir, seeder_addr)
         .await
@@ -263,7 +259,9 @@ async fn downloads_only_selected_files() {
 
     // 两个文件 → 多文件种子
     let a: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 251) as u8).collect();
-    let b: Vec<u8> = (0..48 * 1024u32).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+    let b: Vec<u8> = (0..48 * 1024u32)
+        .map(|i| ((i * 7 + 3) % 251) as u8)
+        .collect();
     std::fs::write(source_dir.join("a.bin"), &a).unwrap();
     std::fs::write(source_dir.join("b.bin"), &b).unwrap();
 
@@ -327,7 +325,13 @@ async fn downloads_only_selected_files() {
         .map(|(idx, _, _)| *idx)
         .expect("文件表里应包含 b.bin");
     engine
-        .add("sel-task", &inspected, &output_folder, Some(&[b_index]), false)
+        .add(
+            "sel-task",
+            &inspected,
+            &output_folder,
+            Some(&[b_index]),
+            false,
+        )
         .await
         .expect("加入下载失败");
 

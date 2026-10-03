@@ -85,7 +85,10 @@ impl MagnetInfo {
         match &self.display_name {
             Some(name) if !name.trim().is_empty() => sanitize_filename(name),
             // 没有 dn 时用 info hash 前 16 位，保证同一资源每次生成的名字稳定
-            _ => format!("torrent-{}", &self.info_hash[..self.info_hash.len().min(16)]),
+            _ => format!(
+                "torrent-{}",
+                &self.info_hash[..self.info_hash.len().min(16)]
+            ),
         }
     }
 }
@@ -152,12 +155,10 @@ pub fn parse_magnet(input: &str) -> Result<MagnetInfo, String> {
 
     let info_hash = match info_hash {
         Some(h) => h,
-        None if saw_btmh => {
-            return Err(
-                "该磁力链接只包含 BitTorrent v2 (urn:btmh:) 的 info hash，当前引擎只支持 v1，无法下载"
-                    .to_string(),
-            )
-        }
+        None if saw_btmh => return Err(
+            "该磁力链接只包含 BitTorrent v2 (urn:btmh:) 的 info hash，当前引擎只支持 v1，无法下载"
+                .to_string(),
+        ),
         None => return Err("磁力链接缺少 xt=urn:btih: 参数".to_string()),
     };
 
@@ -181,8 +182,8 @@ fn normalize_info_hash(raw: &str) -> Result<String, String> {
         return Err("磁力链接的 info hash 含非 16 进制字符".to_string());
     }
     if raw.len() == 32 {
-        let bytes = base32_decode(raw)
-            .ok_or_else(|| "磁力链接的 base32 info hash 解码失败".to_string())?;
+        let bytes =
+            base32_decode(raw).ok_or_else(|| "磁力链接的 base32 info hash 解码失败".to_string())?;
         return Ok(hex_encode(&bytes));
     }
     Err(format!(
@@ -378,13 +379,14 @@ mod tests {
         // 且与等价的 hex 写法解析出同一个值（Ubuntu 21.04 live-server）
         let from_base32 =
             parse_magnet("magnet:?xt=urn:btih:ZK2QOSKNALV3CF4LHDZOTV56FGOINODC").unwrap();
-        let from_hex = parse_magnet(
-            "magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862",
-        )
-        .unwrap();
+        let from_hex =
+            parse_magnet("magnet:?xt=urn:btih:cab507494d02ebb1178b38f2e9d7be299c86b862").unwrap();
         assert_eq!(from_base32.info_hash.len(), 40);
         assert_eq!(from_base32.info_hash, from_hex.info_hash);
-        assert_eq!(from_base32.info_hash, "cab507494d02ebb1178b38f2e9d7be299c86b862");
+        assert_eq!(
+            from_base32.info_hash,
+            "cab507494d02ebb1178b38f2e9d7be299c86b862"
+        );
     }
 
     #[test]
@@ -405,10 +407,8 @@ mod tests {
         assert_eq!(parse_select_only("abc"), None);
         // 反向区间忽略
         assert_eq!(parse_select_only("7-4"), None);
-        let m = parse_magnet(
-            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&so=1-2",
-        )
-        .unwrap();
+        let m = parse_magnet("magnet:?xt=urn:btih:0000000000000000000000000000000000000000&so=1-2")
+            .unwrap();
         assert_eq!(m.select_only, Some(vec![1, 2]));
     }
 
@@ -416,7 +416,10 @@ mod tests {
     fn rejects_v2_only_magnet_with_clear_message() {
         let err = parse_magnet("magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e")
             .unwrap_err();
-        assert!(err.contains("v2"), "错误信息应说明 v2 不支持，实际为: {err}");
+        assert!(
+            err.contains("v2"),
+            "错误信息应说明 v2 不支持，实际为: {err}"
+        );
     }
 
     #[test]
@@ -445,10 +448,8 @@ mod tests {
         assert!(!name.contains('/'), "路径分隔符必须被清理: {name}");
         assert!(!name.contains(".."), "不应保留 .. : {name}");
 
-        let without_dn = parse_magnet(
-            "magnet:?xt=urn:btih:abcdef0000000000000000000000000000000000",
-        )
-        .unwrap();
+        let without_dn =
+            parse_magnet("magnet:?xt=urn:btih:abcdef0000000000000000000000000000000000").unwrap();
         assert_eq!(
             without_dn.placeholder_filename(),
             "torrent-abcdef0000000000"

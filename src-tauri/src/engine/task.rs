@@ -238,7 +238,9 @@ impl Task {
     pub fn speed_bps(&self) -> Option<u64> {
         let last = self.last_speed_time.try_lock().ok()?;
         let (prev_dl, prev_time) = *last.as_ref()?;
-        let elapsed = std::time::Instant::now().duration_since(prev_time).as_secs();
+        let elapsed = std::time::Instant::now()
+            .duration_since(prev_time)
+            .as_secs();
         if elapsed == 0 {
             return None;
         }

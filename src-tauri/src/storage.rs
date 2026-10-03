@@ -362,7 +362,10 @@ mod tests {
         let disk: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
         assert_eq!(disk["data"], json!(["legacy"]));
-        assert_eq!(fs::read(fixture.0.join("tasks.json.bak")).unwrap(), original);
+        assert_eq!(
+            fs::read(fixture.0.join("tasks.json.bak")).unwrap(),
+            original
+        );
         let second = load_store(&fixture.path(), "tasks", |_, data| Ok((data, vec![]))).unwrap();
         assert!(!second.migrated);
         assert_eq!(second.schema_version, 1);
@@ -378,10 +381,19 @@ mod tests {
         let result = load_store(&fixture.path(), "tasks", |_, data| Ok((data, vec![])));
         FAIL_REPLACE.with(|flag| flag.set(false));
         let error = result.unwrap_err().to_string();
-        assert!(error.contains("migration write failed") && error.contains("injected replace failure"));
+        assert!(
+            error.contains("migration write failed") && error.contains("injected replace failure")
+        );
         assert_eq!(fs::read(fixture.path()).unwrap(), original);
-        assert_eq!(fs::read(fixture.0.join("tasks.json.bak")).unwrap(), original);
-        assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| entry.unwrap().path().extension().is_some_and(|ext| ext == "tmp")));
+        assert_eq!(
+            fs::read(fixture.0.join("tasks.json.bak")).unwrap(),
+            original
+        );
+        assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "tmp")));
     }
 
     #[test]

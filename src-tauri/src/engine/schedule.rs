@@ -14,20 +14,20 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum ScheduleType {
-    StartDownload,  // 定时开始所有待下载任务
-    PauseAll,       // 暂停所有下载
-    ResumeAll,      // 恢复所有下载
-    SpeedLimit,     // 全局限速
+    StartDownload, // 定时开始所有待下载任务
+    PauseAll,      // 暂停所有下载
+    ResumeAll,     // 恢复所有下载
+    SpeedLimit,    // 全局限速
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RecurrenceWire", into = "RecurrenceWire")]
 #[allow(dead_code)]
 pub enum Recurrence {
-    Once,       // 仅一次
-    Daily,      // 每天
-    Weekdays,   // 工作日（周一至周五）
-    Weekends,   // 周末（周六、周日）
+    Once,                 // 仅一次
+    Daily,                // 每天
+    Weekdays,             // 工作日（周一至周五）
+    Weekends,             // 周末（周六、周日）
     Weekly(Vec<Weekday>), // 指定天列表
 }
 
@@ -85,7 +85,12 @@ pub struct ScheduleRule {
 }
 
 impl ScheduleRule {
-    pub fn new(name: String, schedule_type: ScheduleType, recurrence: Recurrence, start_time: String) -> Self {
+    pub fn new(
+        name: String,
+        schedule_type: ScheduleType,
+        recurrence: Recurrence,
+        start_time: String,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             name,
@@ -242,16 +247,8 @@ impl ScheduleManager {
             if !rule.should_fire(now) {
                 continue;
             }
-            let key = format!(
-                "{}|{}",
-                rule.id,
-                now.format("%Y-%m-%d %H:%M")
-            );
-            let first_time = self
-                .fired_keys
-                .lock()
-                .unwrap()
-                .insert(key);
+            let key = format!("{}|{}", rule.id, now.format("%Y-%m-%d %H:%M"));
+            let first_time = self.fired_keys.lock().unwrap().insert(key);
             if !first_time {
                 continue;
             }
@@ -274,7 +271,10 @@ impl ScheduleManager {
         if active_limit != current {
             match active_limit {
                 Some(kbps) => {
-                    *sl = SpeedLimit { kbps: Some(kbps), active: true };
+                    *sl = SpeedLimit {
+                        kbps: Some(kbps),
+                        active: true,
+                    };
                     events.push(ScheduleEvent::SpeedLimitActivated(kbps));
                 }
                 None => {
@@ -293,7 +293,7 @@ pub enum ScheduleEvent {
     StartAll,
     PauseAll,
     ResumeAll,
-    SpeedLimitActivated(u32),  // kbps
+    SpeedLimitActivated(u32), // kbps
     SpeedLimitDeactivated,
 }
 
@@ -302,19 +302,21 @@ pub enum ScheduleEvent {
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
-pub 
-fn schedule_rules_path(app_data_dir: &std::path::Path) -> std::path::PathBuf {
+pub fn schedule_rules_path(app_data_dir: &std::path::Path) -> std::path::PathBuf {
     app_data_dir.join("schedule_rules.json")
 }
 
 #[allow(dead_code)]
-pub 
-fn load_schedule_rules(app_data_dir: &std::path::Path) -> Vec<ScheduleRule> {
+pub fn load_schedule_rules(app_data_dir: &std::path::Path) -> Vec<ScheduleRule> {
     let path = schedule_rules_path(app_data_dir);
-    load_schedule_rules_report(&path).map(|report| report.data).unwrap_or_default()
+    load_schedule_rules_report(&path)
+        .map(|report| report.data)
+        .unwrap_or_default()
 }
 
-pub fn load_schedule_rules_report(path: &std::path::Path) -> Result<crate::storage::LoadReport<Vec<ScheduleRule>>, crate::storage::StoreError> {
+pub fn load_schedule_rules_report(
+    path: &std::path::Path,
+) -> Result<crate::storage::LoadReport<Vec<ScheduleRule>>, crate::storage::StoreError> {
     super::rules_persistence::load_records(path, "schedules", |mut value| {
         if let Some(recurrence) = value.get_mut("recurrence") {
             if let Some(kind) = recurrence.as_str() {
@@ -323,10 +325,18 @@ pub fn load_schedule_rules_report(path: &std::path::Path) -> Result<crate::stora
                 *recurrence = serde_json::json!({"type": "weekly", "days": days});
             }
         }
-        let rule: ScheduleRule = serde_json::from_value(value).map_err(|error| error.to_string())?;
-        let valid_time = |time: &str| chrono::NaiveTime::parse_from_str(time, "%H:%M")
-            .is_ok_and(|parsed| parsed.format("%H:%M").to_string() == time);
-        if !valid_time(&rule.start_time) || rule.end_time.as_deref().is_some_and(|time| !valid_time(time)) {
+        let rule: ScheduleRule =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        let valid_time = |time: &str| {
+            chrono::NaiveTime::parse_from_str(time, "%H:%M")
+                .is_ok_and(|parsed| parsed.format("%H:%M").to_string() == time)
+        };
+        if !valid_time(&rule.start_time)
+            || rule
+                .end_time
+                .as_deref()
+                .is_some_and(|time| !valid_time(time))
+        {
             return Err("schedule time must be HH:MM within 00:00..23:59".into());
         }
         Ok(rule)
@@ -334,8 +344,10 @@ pub fn load_schedule_rules_report(path: &std::path::Path) -> Result<crate::stora
 }
 
 #[allow(dead_code)]
-pub async 
-fn save_schedule_rules(app_data_dir: &std::path::Path, rules: &[ScheduleRule]) -> std::io::Result<()> {
+pub async fn save_schedule_rules(
+    app_data_dir: &std::path::Path,
+    rules: &[ScheduleRule],
+) -> std::io::Result<()> {
     let path = schedule_rules_path(app_data_dir);
     crate::storage::save_store(&path, 1, &rules).map_err(std::io::Error::other)
 }
@@ -353,7 +365,8 @@ mod tests {
         assert_eq!(report.data.len(), 1);
         assert_eq!(report.data[0].id, "valid");
         assert_eq!(report.warnings[0].record_key.as_deref(), Some("bad"));
-        let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+        let rejected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
         assert_eq!(rejected[0]["value"]["start_time"], "28:00");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -365,11 +378,18 @@ mod tests {
         std::fs::write(&path, r#"[{"id":"daily","name":"Daily","enabled":true,"schedule_type":"start_download","recurrence":"daily","start_time":"08:00","end_time":null,"speed_limit_kbps":null},{"id":"weekly","name":"Weekly","enabled":true,"schedule_type":"pause_all","recurrence":{"weekly":["Mon","Fri"]},"start_time":"23:00","end_time":null,"speed_limit_kbps":null},{"id":"react","name":"React","enabled":true,"schedule_type":"resume_all","recurrence":{"type":"daily"},"start_time":"09:00","end_time":null,"speed_limit_kbps":null},{"id":"react-weekly","name":"React Weekly","enabled":true,"schedule_type":"pause_all","recurrence":{"type":"weekly","days":["Tue"]},"start_time":"10:00","end_time":null,"speed_limit_kbps":null}]"#).unwrap();
         let rules = load_schedule_rules(&dir);
         assert_eq!(rules.len(), 4);
-        assert_eq!(rules[1].recurrence, Recurrence::Weekly(vec![Weekday::Mon, Weekday::Fri]));
+        assert_eq!(
+            rules[1].recurrence,
+            Recurrence::Weekly(vec![Weekday::Mon, Weekday::Fri])
+        );
         save_schedule_rules(&dir, &rules).await.unwrap();
-        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
-        assert_eq!(disk["data"][1]["recurrence"], serde_json::json!({"type":"weekly","days":["Mon","Fri"]}));
+        assert_eq!(
+            disk["data"][1]["recurrence"],
+            serde_json::json!({"type":"weekly","days":["Mon","Fri"]})
+        );
         assert_eq!(load_schedule_rules(&dir).len(), 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -448,7 +468,10 @@ mod tests {
         let manager = ScheduleManager::new();
         manager.add_rule(rule).await;
 
-        assert!(matches!(manager.tick(&now).await.as_slice(), [ScheduleEvent::StartAll]));
+        assert!(matches!(
+            manager.tick(&now).await.as_slice(),
+            [ScheduleEvent::StartAll]
+        ));
         assert!(manager.tick(&now).await.is_empty());
         assert!(!manager.get_rules().await[0].enabled);
     }

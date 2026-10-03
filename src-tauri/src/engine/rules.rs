@@ -7,22 +7,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchType {
-    Extension,    // 文件扩展名，如 "mp4", "avi"
-    Domain,        // 域名，如 "youtube.com"
-    MimeType,      // MIME类型，如 "video/*"
-    UrlContains,   // URL包含字符串
+    Extension,   // 文件扩展名，如 "mp4", "avi"
+    Domain,      // 域名，如 "youtube.com"
+    MimeType,    // MIME类型，如 "video/*"
+    UrlContains, // URL包含字符串
 }
 
 /// 单条分类规则
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryRule {
     pub id: String,
-    pub name: String,           // 规则名称，如"视频"
-    pub match_type: MatchType,  // 匹配类型
-    pub patterns: Vec<String>,   // 匹配模式列表
-    pub save_path: String,      // 目标保存路径
+    pub name: String,          // 规则名称，如"视频"
+    pub match_type: MatchType, // 匹配类型
+    pub patterns: Vec<String>, // 匹配模式列表
+    pub save_path: String,     // 目标保存路径
     pub enabled: bool,
-    pub priority: usize,        // 优先级，数值越小越靠前
+    pub priority: usize, // 优先级，数值越小越靠前
 }
 
 impl CategoryRule {
@@ -39,7 +39,12 @@ impl CategoryRule {
             match self.match_type {
                 MatchType::Extension => {
                     // 匹配文件扩展名（pat 不带点，如 "mp4"）
-                    if filename.rsplit('.').next().map(|e| e.eq_ignore_ascii_case(pat)).unwrap_or(false) {
+                    if filename
+                        .rsplit('.')
+                        .next()
+                        .map(|e| e.eq_ignore_ascii_case(pat))
+                        .unwrap_or(false)
+                    {
                         return true;
                     }
                 }
@@ -85,21 +90,35 @@ impl CategoryRule {
 
 /// 根据规则列表，为给定 URL/文件名找到一个匹配的保存路径
 /// 若无匹配返回 None（使用默认路径）
-pub fn match_rule(rules: &[CategoryRule], url: &str, filename: &str, mime: Option<&str>) -> Option<String> {
+pub fn match_rule(
+    rules: &[CategoryRule],
+    url: &str,
+    filename: &str,
+    mime: Option<&str>,
+) -> Option<String> {
     match_rule_info(rules, url, filename, mime).map(|r| r.save_dir)
 }
 
 /// Like match_rule but returns full MatchResult for test_rules command
-pub fn match_rule_info(rules: &[CategoryRule], url: &str, filename: &str, mime: Option<&str>) -> Option<MatchResult> {
+pub fn match_rule_info(
+    rules: &[CategoryRule],
+    url: &str,
+    filename: &str,
+    mime: Option<&str>,
+) -> Option<MatchResult> {
     let mut sorted: Vec<_> = rules.iter().collect();
     sorted.sort_by_key(|r| r.priority);
     for rule in sorted {
         for pat in &rule.patterns {
-            if pat.is_empty() { continue; }
+            if pat.is_empty() {
+                continue;
+            }
             let matched = match rule.match_type {
-                MatchType::Extension => {
-                    filename.rsplit('.').next().map(|e| e.eq_ignore_ascii_case(pat)).unwrap_or(false)
-                }
+                MatchType::Extension => filename
+                    .rsplit('.')
+                    .next()
+                    .map(|e| e.eq_ignore_ascii_case(pat))
+                    .unwrap_or(false),
                 MatchType::Domain => url.contains(pat),
                 MatchType::MimeType => {
                     if let Some(m) = mime {
@@ -109,7 +128,9 @@ pub fn match_rule_info(rules: &[CategoryRule], url: &str, filename: &str, mime: 
                         } else {
                             m.eq_ignore_ascii_case(pat)
                         }
-                    } else { false }
+                    } else {
+                        false
+                    }
                 }
                 MatchType::UrlContains => url.to_lowercase().contains(&pat.to_lowercase()),
             };
@@ -152,7 +173,11 @@ mod tests {
 
     #[test]
     fn test_domain_match() {
-        let rule = make_rule(MatchType::Domain, vec!["youtube.com", "bilibili.com"], "视频/");
+        let rule = make_rule(
+            MatchType::Domain,
+            vec!["youtube.com", "bilibili.com"],
+            "视频/",
+        );
         assert!(rule.matches("https://www.youtube.com/watch?v=123", "x.mp4", None));
         assert!(rule.matches("https://www.bilibili.com/video/av1", "x.mp4", None));
         assert!(!rule.matches("https://www.google.com/", "x.mp4", None));

@@ -48,7 +48,12 @@ pub struct TimeRange {
 impl TimeRange {
     #[allow(dead_code)]
     pub fn new(start_hour: u8, start_minute: u8, end_hour: u8, end_minute: u8) -> Self {
-        Self { start_hour, start_minute, end_hour, end_minute }
+        Self {
+            start_hour,
+            start_minute,
+            end_hour,
+            end_minute,
+        }
     }
 
     #[allow(dead_code)]
@@ -154,12 +159,17 @@ pub struct QueueManager {
     active_queue_id: String,
 }
 
-pub fn load_queues_report(path: &std::path::Path) -> Result<crate::storage::LoadReport<Vec<DownloadQueue>>, crate::storage::StoreError> {
+pub fn load_queues_report(
+    path: &std::path::Path,
+) -> Result<crate::storage::LoadReport<Vec<DownloadQueue>>, crate::storage::StoreError> {
     super::rules_persistence::load_records(path, "queues", |value| {
-        let queue: DownloadQueue = serde_json::from_value(value).map_err(|error| error.to_string())?;
+        let queue: DownloadQueue =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
         if queue.active_hours.as_ref().is_some_and(|hours| {
-            hours.start_hour >= 24 || hours.end_hour >= 24
-                || hours.start_minute >= 60 || hours.end_minute >= 60
+            hours.start_hour >= 24
+                || hours.end_hour >= 24
+                || hours.start_minute >= 60
+                || hours.end_minute >= 60
         }) {
             return Err("queue active hours exceed valid clock ranges".into());
         }
@@ -170,11 +180,7 @@ pub fn load_queues_report(path: &std::path::Path) -> Result<crate::storage::Load
 #[allow(dead_code)]
 impl QueueManager {
     pub fn new() -> Self {
-        let default_queue = Arc::new(Mutex::new(DownloadQueue::new(
-            "默认队列".to_string(),
-            3,
-            0,
-        )));
+        let default_queue = Arc::new(Mutex::new(DownloadQueue::new("默认队列".to_string(), 3, 0)));
         let default_id = default_queue.lock().id.clone();
         Self {
             queues: HashMap::from([(default_id.clone(), default_queue)]),
@@ -184,12 +190,17 @@ impl QueueManager {
     }
 
     /// Load from persisted file
-    pub fn load_from(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_from(
+        path: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let queues_vec = load_queues_report(path)?.data;
 
-        let default_queue_id = queues_vec.iter().filter(|q| !q.deleted)
+        let default_queue_id = queues_vec
+            .iter()
+            .filter(|q| !q.deleted)
             .min_by(|a, b| (a.priority, &a.id).cmp(&(b.priority, &b.id)))
-            .map(|q| q.id.clone()).unwrap_or_default();
+            .map(|q| q.id.clone())
+            .unwrap_or_default();
 
         let mut queues = HashMap::new();
         for q in queues_vec {
@@ -225,14 +236,24 @@ impl QueueManager {
     }
 
     /// Create a new queue
-    pub fn create_queue(&mut self, name: String, max_concurrent: u32, priority: Option<u32>) -> String {
+    pub fn create_queue(
+        &mut self,
+        name: String,
+        max_concurrent: u32,
+        priority: Option<u32>,
+    ) -> String {
         let priority = priority.unwrap_or_else(|| {
-            self.queues.values()
+            self.queues
+                .values()
                 .filter_map(|q| q.lock().priority.checked_add(1))
                 .max()
                 .unwrap_or(0)
         });
-        let queue = Arc::new(Mutex::new(DownloadQueue::new(name, max_concurrent, priority)));
+        let queue = Arc::new(Mutex::new(DownloadQueue::new(
+            name,
+            max_concurrent,
+            priority,
+        )));
         let id = queue.lock().id.clone();
         self.queues.insert(id.clone(), queue);
         id
@@ -252,13 +273,28 @@ impl QueueManager {
     }
 
     /// Update queue settings
-    pub async fn update_queue(&self, queue_id: &str, name: Option<String>, max_concurrent: Option<u32>, priority: Option<u32>, is_paused: Option<bool>) -> Result<(), String> {
+    pub async fn update_queue(
+        &self,
+        queue_id: &str,
+        name: Option<String>,
+        max_concurrent: Option<u32>,
+        priority: Option<u32>,
+        is_paused: Option<bool>,
+    ) -> Result<(), String> {
         let queue = self.queues.get(queue_id).ok_or("Queue not found")?;
         let mut q = queue.lock();
-        if let Some(n) = name { q.name = n; }
-        if let Some(m) = max_concurrent { q.max_concurrent = m; }
-        if let Some(p) = priority { q.priority = p; }
-        if let Some(paused) = is_paused { q.is_paused = paused; }
+        if let Some(n) = name {
+            q.name = n;
+        }
+        if let Some(m) = max_concurrent {
+            q.max_concurrent = m;
+        }
+        if let Some(p) = priority {
+            q.priority = p;
+        }
+        if let Some(paused) = is_paused {
+            q.is_paused = paused;
+        }
         Ok(())
     }
 
@@ -270,7 +306,11 @@ impl QueueManager {
     }
 
     /// Remove task from queue
-    pub async fn remove_task_from_queue(&self, queue_id: &str, task_id: &str) -> Result<(), String> {
+    pub async fn remove_task_from_queue(
+        &self,
+        queue_id: &str,
+        task_id: &str,
+    ) -> Result<(), String> {
         let queue = self.queues.get(queue_id).ok_or("Queue not found")?;
         queue.lock().remove_task(task_id);
         Ok(())
@@ -298,13 +338,25 @@ impl QueueManager {
     }
 
     /// Get active queues (non-deleted, non-paused) at given time
-    pub async fn get_active_queues(&self, weekday: chrono::Weekday, hour: u32, minute: u32) -> Vec<QueueSummary> {
+    pub async fn get_active_queues(
+        &self,
+        weekday: chrono::Weekday,
+        hour: u32,
+        minute: u32,
+    ) -> Vec<QueueSummary> {
         let mut active = Vec::new();
         for q in self.queues.values() {
             let q_guard = q.lock();
             if !q_guard.deleted && !q_guard.is_paused {
-                let day_match = q_guard.active_days.is_empty() || q_guard.active_days.contains(&DayOfWeek::from_chrono_weekday(weekday));
-                let time_match = q_guard.active_hours.as_ref().map(|r| r.is_active_at(hour, minute)).unwrap_or(true);
+                let day_match = q_guard.active_days.is_empty()
+                    || q_guard
+                        .active_days
+                        .contains(&DayOfWeek::from_chrono_weekday(weekday));
+                let time_match = q_guard
+                    .active_hours
+                    .as_ref()
+                    .map(|r| r.is_active_at(hour, minute))
+                    .unwrap_or(true);
                 if day_match && time_match {
                     active.push(QueueSummary::from(((*q).clone(), q_guard.task_ids.len())));
                 }
@@ -344,7 +396,10 @@ impl QueueManager {
 
     /// Get task count for a queue
     pub async fn get_queue_task_count(&self, queue_id: &str) -> usize {
-        self.queues.get(queue_id).map(|q| q.lock().task_ids.len()).unwrap_or(0)
+        self.queues
+            .get(queue_id)
+            .map(|q| q.lock().task_ids.len())
+            .unwrap_or(0)
     }
 }
 
@@ -382,10 +437,15 @@ mod tests {
         let manager = QueueManager::load_from(&path).unwrap();
         assert_eq!(manager.queues["queue-1"].lock().task_ids, vec!["task-1"]);
         manager.save_to(&path).await.unwrap();
-        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
         assert_eq!(disk["data"][0]["id"], "queue-1");
-        assert!(QueueManager::load_from(&path).unwrap().queues["queue-1"].lock().is_paused);
+        assert!(
+            QueueManager::load_from(&path).unwrap().queues["queue-1"]
+                .lock()
+                .is_paused
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -425,7 +485,9 @@ mod tests {
         let first = manager.create_queue("first".into(), 2, Some(1));
         let original_count = manager.queues.len();
 
-        assert!(manager.reorder_queues(vec![first.clone(), "missing".into()]).is_err());
+        assert!(manager
+            .reorder_queues(vec![first.clone(), "missing".into()])
+            .is_err());
         assert_eq!(manager.queues.len(), original_count);
         assert!(manager.queues.contains_key(&first));
         assert!(manager.queues.contains_key(&manager.default_queue_id));

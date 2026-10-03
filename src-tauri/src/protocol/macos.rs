@@ -64,10 +64,14 @@ pub fn status(bundle_id: &str) -> HandlerStatus {
             None
         } else {
             let uti = copy_cf_string(uti);
-            let Some(uti) = uti else { return torrent_status_none(magnet_current) };
+            let Some(uti) = uti else {
+                return torrent_status_none(magnet_current);
+            };
             let uti_ref = CFString::new(&uti);
-            let handler =
-                LSCopyDefaultRoleHandlerForContentType(uti_ref.as_concrete_TypeRef(), K_LS_ROLES_ALL);
+            let handler = LSCopyDefaultRoleHandlerForContentType(
+                uti_ref.as_concrete_TypeRef(),
+                K_LS_ROLES_ALL,
+            );
             copy_cf_string(handler)
         }
     };

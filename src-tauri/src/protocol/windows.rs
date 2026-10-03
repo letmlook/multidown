@@ -20,7 +20,12 @@ const SETTINGS_DEEPLINK: &str = "ms-settings:defaultapps?registeredAppUser=Multi
 
 // SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL)：文件关联变化后刷新壳
 extern "system" {
-    fn SHChangeNotify(w_event_id: u32, u_flags: u32, dw_item1: *mut std::ffi::c_void, dw_item2: *mut std::ffi::c_void);
+    fn SHChangeNotify(
+        w_event_id: u32,
+        u_flags: u32,
+        dw_item1: *mut std::ffi::c_void,
+        dw_item2: *mut std::ffi::c_void,
+    );
 }
 
 const SHCNE_ASSOCCHANGED: u32 = 0x0800_0000;
@@ -65,7 +70,8 @@ pub fn status(_bundle_id: &str) -> HandlerStatus {
         magnet_current: current,
         torrent_is_default: None,
         can_set_default: true,
-        hint: "保存后会注册为候选应用，并打开系统设置，请在「默认应用」中把 MAGNET 关联到 MultiDown",
+        hint:
+            "保存后会注册为候选应用，并打开系统设置，请在「默认应用」中把 MAGNET 关联到 MultiDown",
     }
 }
 
@@ -113,14 +119,22 @@ fn register_candidate() -> Result<(), String> {
     // 登记到 RegisteredApplications
     let reg_apps = hkcu
         .open_subkey_with_flags("Software\\RegisteredApplications", KEY_WRITE)
-        .or_else(|_| hkcu.create_subkey("Software\\RegisteredApplications").map(|(k, _)| k))
+        .or_else(|_| {
+            hkcu.create_subkey("Software\\RegisteredApplications")
+                .map(|(k, _)| k)
+        })
         .map_err(|e| format!("打开 RegisteredApplications 失败: {e}"))?;
     reg_apps
         .set_value(REGISTERED_APP_NAME, &CAPABILITIES_PATH)
         .map_err(|e| e.to_string())?;
 
     unsafe {
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, std::ptr::null_mut(), std::ptr::null_mut());
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED,
+            SHCNF_IDLIST,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
     }
     Ok(())
 }
@@ -157,6 +171,11 @@ fn unregister_candidate() {
         }
     }
     unsafe {
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, std::ptr::null_mut(), std::ptr::null_mut());
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED,
+            SHCNF_IDLIST,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
     }
 }

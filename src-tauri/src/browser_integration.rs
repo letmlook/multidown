@@ -203,9 +203,7 @@ fn platform_candidates() -> Vec<BrowserCandidate> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        open_extension_installers_with, BrowserCandidate, CommandLauncher,
-    };
+    use super::{open_extension_installers_with, BrowserCandidate, CommandLauncher};
     use std::path::{Path, PathBuf};
 
     #[derive(Default)]
@@ -230,12 +228,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut launcher = RecordingLauncher::default();
 
-        let error = open_extension_installers_with(
-            &path,
-            Vec::<BrowserCandidate>::new(),
-            &mut launcher,
-        )
-        .unwrap_err();
+        let error =
+            open_extension_installers_with(&path, Vec::<BrowserCandidate>::new(), &mut launcher)
+                .unwrap_err();
 
         assert_eq!(error, format!("扩展目录不存在: {}", path.display()));
         assert!(launcher.calls.is_empty());
@@ -248,12 +243,9 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         let mut launcher = RecordingLauncher::default();
 
-        let error = open_extension_installers_with(
-            &path,
-            Vec::<BrowserCandidate>::new(),
-            &mut launcher,
-        )
-        .unwrap_err();
+        let error =
+            open_extension_installers_with(&path, Vec::<BrowserCandidate>::new(), &mut launcher)
+                .unwrap_err();
 
         assert_eq!(
             error,
