@@ -1,7 +1,7 @@
 //! 计划任务（Scheduled Downloads）：定时下载、限速、队列计划
 
 use chrono::{DateTime, Datelike, Duration, Local, Weekday};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -38,7 +38,56 @@ enum RecurrenceWire {
     Daily,
     Weekdays,
     Weekends,
-    Weekly { days: Vec<Weekday> },
+    Weekly { days: Vec<WireWeekday> },
+}
+
+/// Stable cross-language weekday representation. The canonical writer emits
+/// lowercase RFC-style abbreviations, while the reader accepts older chrono
+/// title-case values written by previous desktop releases.
+#[derive(Debug, Clone, Copy)]
+struct WireWeekday(Weekday);
+
+impl Serialize for WireWeekday {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = match self.0 {
+            Weekday::Mon => "mon",
+            Weekday::Tue => "tue",
+            Weekday::Wed => "wed",
+            Weekday::Thu => "thu",
+            Weekday::Fri => "fri",
+            Weekday::Sat => "sat",
+            Weekday::Sun => "sun",
+        };
+        serializer.serialize_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireWeekday {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let weekday = match value.to_ascii_lowercase().as_str() {
+            "mon" => Weekday::Mon,
+            "tue" => Weekday::Tue,
+            "wed" => Weekday::Wed,
+            "thu" => Weekday::Thu,
+            "fri" => Weekday::Fri,
+            "sat" => Weekday::Sat,
+            "sun" => Weekday::Sun,
+            _ => {
+                return Err(D::Error::unknown_variant(
+                    &value,
+                    &["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                ))
+            }
+        };
+        Ok(Self(weekday))
+    }
 }
 
 impl From<RecurrenceWire> for Recurrence {
@@ -48,7 +97,9 @@ impl From<RecurrenceWire> for Recurrence {
             RecurrenceWire::Daily => Self::Daily,
             RecurrenceWire::Weekdays => Self::Weekdays,
             RecurrenceWire::Weekends => Self::Weekends,
-            RecurrenceWire::Weekly { days } => Self::Weekly(days),
+            RecurrenceWire::Weekly { days } => {
+                Self::Weekly(days.into_iter().map(|day| day.0).collect())
+            }
         }
     }
 }
@@ -60,7 +111,9 @@ impl From<Recurrence> for RecurrenceWire {
             Recurrence::Daily => Self::Daily,
             Recurrence::Weekdays => Self::Weekdays,
             Recurrence::Weekends => Self::Weekends,
-            Recurrence::Weekly(days) => Self::Weekly { days },
+            Recurrence::Weekly(days) => Self::Weekly {
+                days: days.into_iter().map(WireWeekday).collect(),
+            },
         }
     }
 }
@@ -502,6 +555,16 @@ pub fn load_schedule_store_report(
                 {
                     return Err("schedule time must be HH:MM within 00:00..23:59".into());
                 }
+                if matches!(rule.recurrence, Recurrence::Once)
+                    && !rule.scheduled_date.as_deref().is_some_and(|date| {
+                        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                            .is_ok_and(|parsed| parsed.format("%Y-%m-%d").to_string() == date)
+                    })
+                {
+                    return Err(
+                        "one-shot schedule requires scheduled_date in YYYY-MM-DD format".into(),
+                    );
+                }
                 Ok(rule)
             })();
             match parsed {
@@ -521,6 +584,26 @@ pub fn load_schedule_store_report(
 }
 
 fn normalize_legacy_recurrence(value: &mut serde_json::Value) {
+    // React originally encoded the one-shot date inside recurrence. Move it to
+    // the durable rule field before decoding; an explicit modern field wins.
+    let legacy_once_date = value
+        .get("recurrence")
+        .and_then(serde_json::Value::as_object)
+        .filter(|recurrence| {
+            recurrence.get("type").and_then(serde_json::Value::as_str) == Some("once")
+        })
+        .and_then(|recurrence| recurrence.get("date"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    if value
+        .get("scheduled_date")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        if let Some(date) = legacy_once_date {
+            value["scheduled_date"] = serde_json::Value::String(date);
+        }
+    }
     let Some(recurrence) = value.get_mut("recurrence") else {
         return;
     };
@@ -623,7 +706,7 @@ mod tests {
         assert_eq!(disk["schema_version"], 1);
         assert_eq!(
             disk["data"]["rules"][1]["recurrence"],
-            serde_json::json!({"type":"weekly","days":["Mon","Fri"]})
+            serde_json::json!({"type":"weekly","days":["mon","fri"]})
         );
         assert_eq!(load_schedule_rules(&dir).len(), 4);
         std::fs::remove_dir_all(dir).unwrap();
@@ -645,7 +728,7 @@ mod tests {
         assert_eq!(report.data.rules.len(), 1);
         assert_eq!(
             serde_json::to_value(&report.data.rules[0].recurrence).unwrap(),
-            serde_json::json!({"type":"weekly","days":["Mon","Fri"]})
+            serde_json::json!({"type":"weekly","days":["mon","fri"]})
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -658,7 +741,14 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(Recurrence::Weekly(vec![Weekday::Mon, Weekday::Wed])).unwrap(),
-            serde_json::json!({"type":"weekly","days":["Mon","Wed"]})
+            serde_json::json!({"type":"weekly","days":["mon","wed"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<Recurrence>(
+                serde_json::json!({"type":"weekly","days":["mon","wed"]}),
+            )
+            .unwrap(),
+            Recurrence::Weekly(vec![Weekday::Mon, Weekday::Wed])
         );
     }
 
@@ -697,6 +787,54 @@ mod tests {
         let restored = ScheduleManager::with_store_path(path, reloaded.state);
         restored.replace_rules(reloaded.rules).await;
         assert!(restored.tick(&now).await.unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_react_one_shot_date_migrates_and_fires_once() {
+        let dir = std::env::temp_dir().join(format!("schedules-react-once-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = schedule_rules_path(&dir);
+        std::fs::write(
+            &path,
+            r#"[{"id":"once","name":"Once","enabled":true,"schedule_type":"pause_all","recurrence":{"type":"once","date":"2026-09-28"},"start_time":"08:00"}]"#,
+        )
+        .unwrap();
+
+        let store = load_schedule_store_report(&path).unwrap().data;
+        assert_eq!(store.rules[0].scheduled_date.as_deref(), Some("2026-09-28"));
+        let manager = ScheduleManager::with_store_path(path, store.state);
+        manager.replace_rules(store.rules).await;
+        assert!(matches!(
+            manager
+                .tick(&local_time(2026, 9, 28, 8, 0))
+                .await
+                .unwrap()
+                .as_slice(),
+            [ScheduleEvent::PauseAll]
+        ));
+        assert!(manager
+            .tick(&local_time(2026, 9, 28, 8, 0))
+            .await
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_one_shot_date_wins_over_legacy_recurrence_date() {
+        let dir = std::env::temp_dir().join(format!("schedules-once-conflict-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = schedule_rules_path(&dir);
+        std::fs::write(
+            &path,
+            r#"[{"id":"once","name":"Once","enabled":true,"schedule_type":"pause_all","recurrence":{"type":"once","date":"2026-09-28"},"scheduled_date":"2026-09-29","start_time":"08:00"}]"#,
+        )
+        .unwrap();
+
+        let store = load_schedule_store_report(&path).unwrap().data;
+
+        assert_eq!(store.rules[0].scheduled_date.as_deref(), Some("2026-09-29"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

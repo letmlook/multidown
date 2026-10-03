@@ -96,6 +96,16 @@ type ScheduleFormRecurrence =
   | { type: "weekends" }
   | { type: "weekly"; days: string[] };
 
+const WEEKDAY_OPTIONS = [
+  ["mon", "周一"],
+  ["tue", "周二"],
+  ["wed", "周三"],
+  ["thu", "周四"],
+  ["fri", "周五"],
+  ["sat", "周六"],
+  ["sun", "周日"],
+] as const;
+
 interface ScheduleFormData {
   name: string;
   schedule_type: ScheduleType;
@@ -181,6 +191,8 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
     end_time: "",
     speed_limit_kbps: "",
   });
+  const weeklyDays =
+    scheduleForm.recurrence.type === "weekly" ? scheduleForm.recurrence.days : [];
 
   // ── Proxy management state ───────────────────────────────────────────────
   const [proxyList, setProxyList] = useState<ProxyConfig[]>([]);
@@ -1371,7 +1383,7 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                                 : task.schedule_type}
                             </td>
                             <td style={{ padding: "8px", color: "#666" }}>
-                              {task.recurrence.type === "once" ? `一次 (${task.recurrence.date ?? ""})`
+                              {task.recurrence.type === "once" ? `一次 (${task.scheduled_date ?? task.recurrence.date ?? ""})`
                                 : task.recurrence.type === "daily" ? "每天"
                                 : task.recurrence.type === "weekdays" ? "工作日"
                                 : task.recurrence.type === "weekends" ? "周末"
@@ -1772,6 +1784,31 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                   />
                 </div>
               )}
+              {scheduleForm.recurrence.type === "weekly" && (
+                <div className="form-group">
+                  <span>重复日期（至少选择一天）</span>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
+                    {WEEKDAY_OPTIONS.map(([day, label]) => (
+                      <label key={day} className="form-check-row" style={{ gap: 4 }}>
+                        <input
+                          type="checkbox"
+                          checked={weeklyDays.includes(day)}
+                          onChange={(e) =>
+                            setScheduleForm((form) => {
+                              if (form.recurrence.type !== "weekly") return form;
+                              const days = e.target.checked
+                                ? [...form.recurrence.days, day]
+                                : form.recurrence.days.filter((selected) => selected !== day);
+                              return { ...form, recurrence: { type: "weekly", days } };
+                            })
+                          }
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="form-group">
                 <label>开始时间（HH:MM）</label>
                 <input
@@ -1816,7 +1853,7 @@ export function OptionsModal({ open, onClose, initialTab }: OptionsModalProps) {
                 type="button"
                 className="btn btn-primary"
                 onClick={handleSaveSchedule}
-                disabled={!scheduleForm.name || !scheduleForm.start_time}
+                disabled={!scheduleForm.name || !scheduleForm.start_time || (scheduleForm.recurrence.type === "weekly" && weeklyDays.length === 0)}
               >
                 保存
               </button>

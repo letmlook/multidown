@@ -156,7 +156,8 @@ pub async fn probe_with_client(
         .map(String::from);
     let mut mime = mime_from_headers(&headers);
 
-    // 无 Content-Length 时部分服务器 HEAD 不返回，需 GET Range: bytes=0-0
+    // HEAD 可能省略长度或 MIME；任一缺失时用最小 Range GET 补齐，不丢弃
+    // HEAD 已知的字段。
     let mut total_bytes = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -168,7 +169,7 @@ pub async fn probe_with_client(
         .unwrap_or(false);
 
     let mut supports_range = accepts_ranges;
-    if total_bytes.is_none() {
+    if total_bytes.is_none() || mime.is_none() {
         let get_resp = apply_request_options(
             client.get(url.clone()).header("Range", "bytes=0-0"),
             options,
@@ -406,6 +407,41 @@ mod tests {
         );
         assert_eq!(normalized_mime(Some("   ")), None);
         assert_eq!(normalized_mime(None), None);
+    }
+
+    #[tokio::test]
+    async fn probe_fetches_mime_when_head_has_length_but_no_content_type() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 2048];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                request_tx.send(request.clone()).unwrap();
+                let response = if request.starts_with("HEAD ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/10\r\nContent-Type: Video/MP4; charset=UTF-8\r\nConnection: close\r\n\r\nx"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let result = probe(&format!("http://{address}/movie")).await.unwrap();
+
+        assert_eq!(result.total_bytes, Some(10));
+        assert_eq!(result.mime.as_deref(), Some("video/mp4"));
+        assert!(request_rx.recv().await.unwrap().starts_with("HEAD "));
+        let fallback = tokio::time::timeout(std::time::Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("probe must make a Range GET when HEAD lacks MIME")
+            .unwrap();
+        assert!(fallback.starts_with("GET ") && fallback.contains("Range: bytes=0-0"));
+        server.await.unwrap();
     }
 
     #[test]
