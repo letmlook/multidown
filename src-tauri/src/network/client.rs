@@ -9,6 +9,31 @@ pub enum Error {
     Request(#[from] reqwest::Error),
     #[error("Invalid URL: {0}")]
     Url(String),
+    #[error("Invalid HTTP range response: {0}")]
+    Protocol(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+    )
+)]
+pub enum ResumeError {
+    #[error("remote representation changed: expected ETag {expected:?}, received {actual:?}")]
+    EtagChanged {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
+    #[error(
+        "remote representation changed: expected Last-Modified {expected:?}, received {actual:?}"
+    )]
+    LastModifiedChanged {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
 }
 
 /// HTTP 认证配置（随任务持久化；前端 IPC 传参）
@@ -109,6 +134,37 @@ pub struct ProbeResult {
     /// Normalized response Content-Type for post-probe category rules.
     #[serde(default)]
     pub mime: Option<String>,
+}
+
+/// Ensure a partial download still refers to the same remote representation.
+/// Every validator that was persisted must still be present and byte-for-byte
+/// identical; losing a validator is not safe enough to append existing bytes.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+    )
+)]
+pub fn validate_resume_identity(
+    expected_etag: Option<&str>,
+    expected_last_modified: Option<&str>,
+    probe: &ProbeResult,
+) -> Result<(), ResumeError> {
+    if expected_etag != probe.etag.as_deref() && expected_etag.is_some() {
+        return Err(ResumeError::EtagChanged {
+            expected: expected_etag.map(str::to_owned),
+            actual: probe.etag.clone(),
+        });
+    }
+    if expected_last_modified != probe.last_modified.as_deref() && expected_last_modified.is_some()
+    {
+        return Err(ResumeError::LastModifiedChanged {
+            expected: expected_last_modified.map(str::to_owned),
+            actual: probe.last_modified.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn default_client() -> Client {
@@ -370,11 +426,55 @@ pub async fn open_range(
             last_modified,
         });
     }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        validate_content_range(&headers, start, end)?;
+    }
     Ok(RangeResponse::Body {
         resp,
         etag,
         last_modified,
     })
+}
+
+fn validate_content_range(
+    headers: &reqwest::header::HeaderMap,
+    expected_start: u64,
+    expected_end: u64,
+) -> Result<(), Error> {
+    let value = headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::Protocol("missing Content-Range".into()))?;
+    let (unit, range_and_total) = value
+        .trim()
+        .split_once(' ')
+        .ok_or_else(|| Error::Protocol(format!("malformed Content-Range {value:?}")))?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Err(Error::Protocol(format!(
+            "unexpected Content-Range unit {unit:?}"
+        )));
+    }
+    let (range, total) = range_and_total
+        .split_once('/')
+        .ok_or_else(|| Error::Protocol(format!("malformed Content-Range {value:?}")))?;
+    let (start, end) = range
+        .split_once('-')
+        .ok_or_else(|| Error::Protocol(format!("malformed Content-Range {value:?}")))?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| Error::Protocol(format!("malformed Content-Range {value:?}")))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| Error::Protocol(format!("malformed Content-Range {value:?}")))?;
+    let total = total
+        .parse::<u64>()
+        .map_err(|_| Error::Protocol(format!("malformed Content-Range {value:?}")))?;
+    if start != expected_start || end != expected_end || total <= end {
+        return Err(Error::Protocol(format!(
+            "Content-Range {value:?} does not match requested bytes {expected_start}-{expected_end}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -410,6 +510,30 @@ mod tests {
         assert!(json.contains("\"kind\":\"basic\""));
         let back: AuthConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, AuthConfig::Basic { .. }));
+    }
+
+    #[test]
+    fn resume_identity_rejects_changed_or_missing_persisted_validators() {
+        let probe = ProbeResult {
+            etag: Some("\"new\"".into()),
+            last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_resume_identity(Some("\"old\""), None, &probe),
+            Err(ResumeError::EtagChanged { .. })
+        ));
+        assert!(matches!(
+            validate_resume_identity(
+                Some("\"new\""),
+                Some("Tue, 20 Oct 2026 07:28:00 GMT"),
+                &probe
+            ),
+            Err(ResumeError::LastModifiedChanged { .. })
+        ));
+        let missing = ProbeResult::default();
+        assert!(validate_resume_identity(Some("\"old\""), None, &missing).is_err());
+        assert!(validate_resume_identity(None, None, &missing).is_ok());
     }
 
     fn headers_with(content_type: Option<&str>) -> reqwest::header::HeaderMap {

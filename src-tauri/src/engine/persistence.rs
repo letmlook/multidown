@@ -19,6 +19,8 @@ pub struct PersistedTaskV1 {
     pub downloaded_bytes: u64,
     #[serde(deserialize_with = "deserialize_recovery_status")]
     pub status: TaskStatus,
+    #[serde(default)]
+    pub error_message: Option<String>,
     #[serde(rename = "pending_segments")]
     pub pending_segments: Vec<(u64, u64)>,
     pub supports_range: bool,
@@ -166,7 +168,7 @@ impl Task {
             total_bytes: p.total_bytes,
             downloaded: Arc::new(AtomicU64::new(p.downloaded_bytes)),
             status: Arc::new(Mutex::new(p.status)),
-            error_message: Arc::new(Mutex::new(None)),
+            error_message: Arc::new(Mutex::new(p.error_message)),
             pending_segments: Arc::new(Mutex::new(VecDeque::from(p.pending_segments))),
             supports_range: p.supports_range,
             created_at: p.created_at,
@@ -201,6 +203,7 @@ impl PersistedTask {
             total_bytes: task.total_bytes,
             downloaded_bytes: task.downloaded.load(Ordering::Relaxed),
             status,
+            error_message: task.error_message.lock().await.clone(),
             pending_segments: pending,
             supports_range: task.supports_range,
             created_at: task.created_at,
@@ -396,6 +399,7 @@ mod tests {
         );
         futures_block_on(async {
             *task.status.lock().await = TaskStatus::Downloading;
+            *task.error_message.lock().await = Some("resume identity changed".into());
         });
         let snapshot = futures_block_on(PersistedTaskV1::from_task(&task));
         assert_eq!(snapshot.status, TaskStatus::Downloading);
@@ -403,6 +407,10 @@ mod tests {
         assert!(snapshot.seeding_started_at.is_none());
         let restored = tasks_from_json(&tasks_to_json(&[snapshot]).unwrap()).unwrap();
         assert_eq!(restored[0].status, TaskStatus::Recovering);
+        assert_eq!(
+            restored[0].error_message.as_deref(),
+            Some("resume identity changed")
+        );
         assert!(
             matches!(&restored[0].auth, Some(crate::network::AuthConfig::Basic { username, password }) if username == "user" && password == "password")
         );
@@ -452,6 +460,7 @@ mod tests {
         assert_eq!(t.total_bytes, Some(1048576));
         assert_eq!(t.downloaded_bytes, 65536);
         assert_eq!(t.status, TaskStatus::Paused);
+        assert!(t.error_message.is_none());
         assert_eq!(t.pending_segments, vec![(65536, 1048575)]);
         assert!(t.supports_range);
         assert_eq!(t.created_at, 1700000000);

@@ -11,8 +11,8 @@ use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskInfo, TaskStatus, TorrentMeta, TorrentStatsSnapshot};
 use crate::engine::writer::{run_file_writer, WriterMessage};
 use crate::network::{
-    build_client_from_options, probe, probe_with_options, AuthConfig, NetworkOptions, ProbeResult,
-    TokenBucket,
+    build_client_from_options, probe, probe_with_client, probe_with_options,
+    validate_resume_identity, AuthConfig, NetworkOptions, ProbeResult, RangeResponse, TokenBucket,
 };
 use crate::storage::{LoadReport, RecoveryWarning, StoreError};
 use crate::torrent::engine::TorrentRunState;
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::{mpsc, OnceCell, RwLock};
+use tokio::sync::{mpsc, oneshot, OnceCell, RwLock};
 
 /// 引擎级限制：来自应用设置，随 set_settings 实时更新
 #[derive(Debug, Clone)]
@@ -41,6 +41,35 @@ impl Default for EngineLimits {
             max_retries: 3,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+    )
+)]
+pub struct RecoverySummary {
+    pub started: usize,
+    pub restarted: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub failures: Vec<RecoveryFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+    )
+)]
+pub struct RecoveryFailure {
+    pub task_id: TaskId,
+    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1212,6 +1241,55 @@ impl Scheduler {
         }
         let active_slot = self.reserve_active_slot(task_id).await?;
 
+        self.start_http_download_with_slot(
+            task,
+            app_handle,
+            scheduler_for_save,
+            max_connections,
+            network_options.unwrap_or_default(),
+            active_slot,
+            &[TaskStatus::Pending, TaskStatus::Paused],
+            false,
+        )
+        .await
+    }
+
+    fn effective_network_options(
+        &self,
+        task: &Task,
+        mut network_options: NetworkOptions,
+    ) -> NetworkOptions {
+        network_options.auth = task.auth.clone().or(network_options.auth);
+        for (key, value) in &task.extra_headers {
+            network_options
+                .extra_headers
+                .push((key.clone(), value.clone()));
+        }
+        if let Some(app_data) = self.save_path.as_ref().and_then(|path| path.parent()) {
+            let store = crate::settings::proxy::load_proxy_store(app_data);
+            if let Some(config) = crate::settings::proxy::match_proxy_rule(&task.url, &store) {
+                if let Some(url) = config.to_authenticated_url() {
+                    network_options.proxy_url = Some(url);
+                }
+            }
+        }
+        network_options
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_http_download_with_slot(
+        &self,
+        task: Arc<Task>,
+        app_handle: Option<tauri::AppHandle>,
+        scheduler_for_save: Option<Arc<Scheduler>>,
+        max_connections: Option<usize>,
+        network_options: NetworkOptions,
+        active_slot: ActiveSlot,
+        expected_statuses: &[TaskStatus],
+        force_single_worker: bool,
+    ) -> Result<(), String> {
+        let task_id = task.id.clone();
+
         if let Some(parent) = std::path::Path::new(&task.save_path).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -1221,29 +1299,15 @@ impl Scheduler {
             .clone()
             .unwrap_or_else(|| Arc::new(self.clone()));
 
-        let n_workers = if task.supports_range {
+        let n_workers = if task.supports_range && !force_single_worker {
             max_connections.unwrap_or(8).clamp(1, 32)
         } else {
             1
         };
         let task_clone = task.clone();
-        let task_id_s = task_id.to_string();
+        let task_id_s = task_id.clone();
         let url = task.url.clone();
-        // 全局设置 + 任务级认证/请求头（任务级优先）
-        let mut net_opts = network_options.unwrap_or_default();
-        net_opts.auth = task.auth.clone().or(net_opts.auth);
-        for (k, v) in &task.extra_headers {
-            net_opts.extra_headers.push((k.clone(), v.clone()));
-        }
-        // 代理分流：按 URL 匹配域名规则，命中则覆盖全局代理
-        if let Some(app_data) = self.save_path.as_ref().and_then(|p| p.parent()) {
-            let store = crate::settings::proxy::load_proxy_store(app_data);
-            if let Some(cfg) = crate::settings::proxy::match_proxy_rule(&task.url, &store) {
-                if let Some(url) = cfg.to_authenticated_url() {
-                    net_opts.proxy_url = Some(url);
-                }
-            }
-        }
+        let net_opts = self.effective_network_options(&task, network_options);
         let client = match build_client_from_options(&net_opts) {
             Ok(c) => std::sync::Arc::new(c),
             Err(e) => {
@@ -1267,20 +1331,18 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        self.persist_status_transition(
-            task_id,
-            &[TaskStatus::Pending, TaskStatus::Paused],
-            TaskStatus::Downloading,
-        )
-        .await?;
 
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id_s.clone();
         let scheduler_clone = scheduler_self.clone();
         let max_retries = scheduler_self.limits.lock().max_retries;
 
-        tokio::spawn(async move {
+        let (start_tx, start_rx) = oneshot::channel();
+        let worker = tokio::spawn(async move {
             let _active_slot = active_slot;
+            if start_rx.await.is_err() {
+                return;
+            }
             let mut retry_attempts: u32 = 0;
             loop {
                 // 每轮尝试独立创建 writer 与通道：失败重试时不截断已有数据
@@ -1376,7 +1438,268 @@ impl Scheduler {
                 eprintln!("[persistence-error] HTTP completion: {error}");
             }
         });
+        if let Err(error) = self
+            .persist_status_transition(&task_id, expected_statuses, TaskStatus::Downloading)
+            .await
+        {
+            drop(start_tx);
+            let _ = worker.await;
+            return Err(error);
+        }
+        let _ = start_tx.send(());
         Ok(())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+        )
+    )]
+    async fn fail_http_recovery(&self, task_id: &str, message: String) -> Result<(), String> {
+        let persisted_message = message.clone();
+        let task = self
+            .persist_task_record_update(task_id, move |record| {
+                record.status = TaskStatus::Failed;
+                record.error_message = Some(persisted_message);
+            })
+            .await?;
+        *task.error_message.lock().await = Some(message);
+        *task.status.lock().await = TaskStatus::Failed;
+        Ok(())
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+        )
+    )]
+    async fn reset_http_recovery_for_restart(&self, task_id: &str) -> Result<Arc<Task>, String> {
+        let task = self
+            .persist_task_record_update(task_id, |record| {
+                record.downloaded_bytes = 0;
+                record.pending_segments = record
+                    .total_bytes
+                    .filter(|total| *total > 0)
+                    .map(|total| vec![(0, total - 1)])
+                    .unwrap_or_default();
+                record.etag = None;
+                record.last_modified = None;
+                record.error_message = None;
+            })
+            .await?;
+        task.reset_for_restart(None, None).await;
+        Ok(task)
+    }
+
+    /// Recover protocol tasks that were active when the previous process
+    /// stopped. Task 3 owns the protocol-neutral orchestration and HTTP branch;
+    /// the BitTorrent branch is deliberately extended by Task 4.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
+        )
+    )]
+    pub async fn recover_tasks(
+        &self,
+        app_handle: Option<tauri::AppHandle>,
+        max_connections: usize,
+        network_options: NetworkOptions,
+    ) -> RecoverySummary {
+        let candidates: Vec<Arc<Task>> = {
+            let tasks = self.tasks.lock().await;
+            let mut candidates = Vec::new();
+            for task in tasks.values() {
+                if !task.kind.is_torrent() && *task.status.lock().await == TaskStatus::Recovering {
+                    candidates.push(task.clone());
+                }
+            }
+            candidates.sort_by(|left, right| {
+                (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
+            });
+            candidates
+        };
+
+        let mut summary = RecoverySummary::default();
+        for mut task in candidates {
+            let task_id = task.id.clone();
+            let active_slot = match self.reserve_active_slot(&task_id).await {
+                Ok(slot) => slot,
+                Err(_) => {
+                    summary.skipped += 1;
+                    continue;
+                }
+            };
+            let effective_options = self.effective_network_options(&task, network_options.clone());
+            let client = match build_client_from_options(&effective_options) {
+                Ok(client) => client,
+                Err(error) => {
+                    let message = format!("HTTP recovery setup failed: {error}");
+                    if let Err(persist_error) =
+                        self.fail_http_recovery(&task_id, message.clone()).await
+                    {
+                        summary.failures.push(RecoveryFailure {
+                            task_id: task_id.clone(),
+                            message: format!("{message}; {persist_error}"),
+                        });
+                    } else {
+                        summary.failures.push(RecoveryFailure {
+                            task_id: task_id.clone(),
+                            message,
+                        });
+                    }
+                    summary.failed += 1;
+                    drop(active_slot);
+                    continue;
+                }
+            };
+            let probe = match probe_with_client(&client, &task.url, &effective_options).await {
+                Ok(probe) => probe,
+                Err(error) => {
+                    let message = format!("HTTP recovery probe failed: {error}");
+                    let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
+                    summary.failures.push(RecoveryFailure {
+                        task_id: task_id.clone(),
+                        message: persisted
+                            .err()
+                            .map(|error| format!("{message}; {error}"))
+                            .unwrap_or(message),
+                    });
+                    summary.failed += 1;
+                    drop(active_slot);
+                    continue;
+                }
+            };
+
+            let downloaded = task.downloaded_bytes();
+            let expected_etag = task.etag.lock().await.clone();
+            let expected_last_modified = task.last_modified.lock().await.clone();
+            let pending = task.pending_segments.lock().await.clone();
+            let invalid_total = task.total_bytes != probe.total_bytes;
+            let invalid_segments = task.total_bytes.is_none_or(|total| {
+                pending.is_empty()
+                    || pending
+                        .iter()
+                        .any(|(start, end)| start > end || *end >= total)
+            });
+            let identity_error = validate_resume_identity(
+                expected_etag.as_deref(),
+                expected_last_modified.as_deref(),
+                &probe,
+            )
+            .err();
+            if identity_error.is_some() || invalid_total || (downloaded > 0 && invalid_segments) {
+                let message = identity_error.map_or_else(
+                    || {
+                        if invalid_total {
+                            format!(
+                                "remote representation changed: expected length {:?}, received {:?}",
+                                task.total_bytes, probe.total_bytes
+                            )
+                        } else {
+                            "unsafe persisted segment state; explicit retry is required".into()
+                        }
+                    },
+                    |error| error.to_string(),
+                );
+                let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
+                summary.failures.push(RecoveryFailure {
+                    task_id: task_id.clone(),
+                    message: persisted
+                        .err()
+                        .map(|error| format!("{message}; {error}"))
+                        .unwrap_or(message),
+                });
+                summary.failed += 1;
+                drop(active_slot);
+                continue;
+            }
+
+            let target_exists = tokio::fs::try_exists(&task.save_path)
+                .await
+                .unwrap_or(false);
+            let mut restart = (downloaded == 0 && invalid_segments)
+                || (downloaded > 0 && (!probe.supports_range || !target_exists));
+            if downloaded > 0 && !restart {
+                let (start, _) = pending.front().expect("validated non-empty segments");
+                let if_range = expected_etag
+                    .as_deref()
+                    .or(expected_last_modified.as_deref());
+                match crate::network::open_range(
+                    &client,
+                    &task.url,
+                    *start,
+                    *start,
+                    if_range,
+                    &effective_options,
+                )
+                .await
+                {
+                    Ok(RangeResponse::Body { .. }) => {}
+                    Ok(RangeResponse::FileChanged { .. }) => restart = true,
+                    Err(error) => {
+                        let message = format!("HTTP recovery range validation failed: {error}");
+                        let persisted = self.fail_http_recovery(&task_id, message.clone()).await;
+                        summary.failures.push(RecoveryFailure {
+                            task_id: task_id.clone(),
+                            message: persisted
+                                .err()
+                                .map(|error| format!("{message}; {error}"))
+                                .unwrap_or(message),
+                        });
+                        summary.failed += 1;
+                        drop(active_slot);
+                        continue;
+                    }
+                }
+            }
+            if restart {
+                match self.reset_http_recovery_for_restart(&task_id).await {
+                    Ok(reset_task) => {
+                        task = reset_task;
+                        summary.restarted += 1;
+                    }
+                    Err(message) => {
+                        summary.failed += 1;
+                        summary.failures.push(RecoveryFailure {
+                            task_id: task_id.clone(),
+                            message,
+                        });
+                        drop(active_slot);
+                        continue;
+                    }
+                }
+            }
+
+            match self
+                .start_http_download_with_slot(
+                    task,
+                    app_handle.clone(),
+                    None,
+                    Some(max_connections),
+                    network_options.clone(),
+                    active_slot,
+                    &[TaskStatus::Recovering],
+                    restart,
+                )
+                .await
+            {
+                Ok(()) => summary.started += 1,
+                Err(message) => {
+                    summary.failed += 1;
+                    summary.failures.push(RecoveryFailure {
+                        task_id: task_id.clone(),
+                        message,
+                    });
+                }
+            }
+        }
+        summary
     }
 
     /// 启动种子任务：加入 BT 会话 + 轮询 stats 驱动任务状态。
@@ -2851,6 +3174,398 @@ mod tests {
     impl Drop for InitializationFixture {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    mod http_recovery {
+        use super::*;
+        use crate::engine::persistence::{save_tasks_to_file, PersistedTask};
+        use crate::engine::types::TaskKind;
+        use std::sync::atomic::Ordering;
+
+        const BODY: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+        struct RecoveryServer {
+            url: String,
+            requests: Arc<ParkingMutex<Vec<String>>>,
+            get_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+            handle: tokio::task::JoinHandle<()>,
+        }
+
+        impl RecoveryServer {
+            async fn spawn(etag: &str, last_modified: &str, supports_range: bool) -> Self {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let requests = Arc::new(ParkingMutex::new(Vec::new()));
+                let requests_for_server = requests.clone();
+                let etag = etag.to_string();
+                let last_modified = last_modified.to_string();
+                let get_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let delay_for_server = get_delay_ms.clone();
+                let handle = tokio::spawn(async move {
+                    while let Ok((mut stream, _)) = listener.accept().await {
+                        let requests = requests_for_server.clone();
+                        let etag = etag.clone();
+                        let last_modified = last_modified.clone();
+                        let delay = delay_for_server.clone();
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buffer = vec![0; 8192];
+                            let read = stream.read(&mut buffer).await.unwrap();
+                            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                            requests.lock().push(request.clone());
+                            let is_head = request.starts_with("HEAD ");
+                            let range = request
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("range")
+                                        .then(|| value.trim().strip_prefix("bytes="))
+                                        .flatten()
+                                })
+                                .and_then(|value| value.split_once('-'))
+                                .and_then(|(start, end)| {
+                                    Some((
+                                        start.trim().parse::<usize>().ok()?,
+                                        end.trim().parse::<usize>().ok()?,
+                                    ))
+                                });
+                            let if_range = request.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("if-range").then(|| value.trim())
+                            });
+                            let validator_matches = if_range
+                                .map(|value| value == etag || value == last_modified)
+                                .unwrap_or(true);
+                            let common = format!(
+                                "ETag: {etag}\r\nLast-Modified: {last_modified}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n"
+                            );
+                            if is_head {
+                                let accept_ranges = if supports_range {
+                                    "Accept-Ranges: bytes\r\n"
+                                } else {
+                                    ""
+                                };
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{accept_ranges}{common}\r\n",
+                                    BODY.len()
+                                );
+                                stream.write_all(response.as_bytes()).await.unwrap();
+                                return;
+                            }
+                            let delay_ms = delay.load(Ordering::Relaxed);
+                            if delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                            if supports_range && validator_matches {
+                                if let Some((start, end)) = range {
+                                    let body = &BODY[start..=end];
+                                    let response = format!(
+                                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\n{common}\r\n",
+                                        body.len(),
+                                        BODY.len()
+                                    );
+                                    stream.write_all(response.as_bytes()).await.unwrap();
+                                    stream.write_all(body).await.unwrap();
+                                    return;
+                                }
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{common}\r\n",
+                                BODY.len()
+                            );
+                            stream.write_all(response.as_bytes()).await.unwrap();
+                            stream.write_all(BODY).await.unwrap();
+                        });
+                    }
+                });
+                Self {
+                    url: format!("http://{address}/recovery.bin"),
+                    requests,
+                    get_delay_ms,
+                    handle,
+                }
+            }
+        }
+
+        impl Drop for RecoveryServer {
+            fn drop(&mut self) {
+                self.handle.abort();
+            }
+        }
+
+        fn recovery_record(
+            id: &str,
+            url: &str,
+            save_path: PathBuf,
+            status: TaskStatus,
+            expected_etag: Option<&str>,
+            expected_last_modified: Option<&str>,
+        ) -> PersistedTask {
+            PersistedTask {
+                id: id.into(),
+                url: url.into(),
+                save_path: save_path.to_string_lossy().into_owned(),
+                filename: save_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                total_bytes: Some(BODY.len() as u64),
+                downloaded_bytes: 10,
+                status,
+                error_message: None,
+                pending_segments: vec![(10, BODY.len() as u64 - 1)],
+                supports_range: true,
+                created_at: 1_700_000_000,
+                auth: None,
+                extra_headers: Vec::new(),
+                etag: expected_etag.map(str::to_owned),
+                last_modified: expected_last_modified.map(str::to_owned),
+                kind: TaskKind::Http,
+                torrent: None,
+                total_dynamic: 0,
+                completed_at: None,
+                seeding_started_at: None,
+            }
+        }
+
+        async fn scheduler_with_records(
+            fixture: &InitializationFixture,
+            records: &[PersistedTask],
+        ) -> Scheduler {
+            save_tasks_to_file(&fixture.paths().tasks, records)
+                .await
+                .unwrap();
+            let (scheduler, warnings) =
+                Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            scheduler
+        }
+
+        async fn wait_for_status(scheduler: &Scheduler, id: &str, expected: TaskStatus) {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if scheduler.get_task(id).await.unwrap().status == expected {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn http_recovery_resumes_valid_range_and_preserves_request_options() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("resume.bin");
+            std::fs::write(&target, &BODY[..10]).unwrap();
+            let mut record = recovery_record(
+                "resume",
+                &server.url,
+                target.clone(),
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+            );
+            record.auth = Some(AuthConfig::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            });
+            record.extra_headers = vec![("X-Recovery-Test".into(), "present".into())];
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 1);
+            assert_eq!(summary.restarted, 0, "{:?}", server.requests.lock());
+            assert_eq!(summary.failed, 0);
+            wait_for_status(&scheduler, "resume", TaskStatus::Completed).await;
+            assert_eq!(std::fs::read(target).unwrap(), BODY);
+            let requests = server.requests.lock().join("\n").to_ascii_lowercase();
+            assert!(requests.contains("authorization: basic dxnlcjpwyxnz"));
+            assert!(requests.contains("x-recovery-test: present"));
+            assert!(requests.contains("range: bytes=10-"));
+        }
+
+        #[tokio::test]
+        async fn http_recovery_rejects_changed_etag_or_last_modified_without_appending() {
+            for (id, etag, last_modified) in [
+                (
+                    "etag-changed",
+                    Some("\"old\""),
+                    Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+                ),
+                (
+                    "last-modified-changed",
+                    Some("\"stable\""),
+                    Some("Tue, 20 Oct 2026 07:28:00 GMT"),
+                ),
+            ] {
+                let fixture = InitializationFixture::new();
+                let server =
+                    RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true)
+                        .await;
+                let target = fixture.0.join(format!("{id}.bin"));
+                let original = b"partial-only";
+                std::fs::write(&target, original).unwrap();
+                let record = recovery_record(
+                    id,
+                    &server.url,
+                    target.clone(),
+                    TaskStatus::Downloading,
+                    etag,
+                    last_modified,
+                );
+                let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+                let summary = scheduler
+                    .recover_tasks(None, 1, NetworkOptions::default())
+                    .await;
+                assert_eq!(summary.started, 0);
+                assert_eq!(summary.failed, 1);
+                assert_eq!(summary.failures[0].task_id, id);
+                assert!(summary.failures[0].message.contains("changed"));
+                assert_eq!(
+                    scheduler.get_task(id).await.unwrap().status,
+                    TaskStatus::Failed
+                );
+                assert_eq!(std::fs::read(target).unwrap(), original);
+                let (restored, warnings) =
+                    Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+                assert!(warnings.is_empty());
+                let restored = restored.get_task(id).await.unwrap();
+                assert_eq!(restored.status, TaskStatus::Failed);
+                assert!(restored.error_message.unwrap().contains("changed"));
+            }
+        }
+
+        #[tokio::test]
+        async fn http_recovery_explicitly_restarts_when_range_is_unavailable() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", false).await;
+            let target = fixture.0.join("restart.bin");
+            std::fs::write(&target, b"partial-corrupt-tail").unwrap();
+            let record = recovery_record(
+                "restart",
+                &server.url,
+                target.clone(),
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+            );
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 4, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 1);
+            assert_eq!(summary.restarted, 1);
+            wait_for_status(&scheduler, "restart", TaskStatus::Completed).await;
+            assert_eq!(std::fs::read(target).unwrap(), BODY);
+        }
+
+        #[tokio::test]
+        async fn http_recovery_skips_paused_tasks_and_paused_queues_without_network_io() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let paused = recovery_record(
+                "paused-task",
+                &server.url,
+                fixture.0.join("paused-task.bin"),
+                TaskStatus::Paused,
+                Some("\"stable\""),
+                None,
+            );
+            let queued = recovery_record(
+                "paused-queue",
+                &server.url,
+                fixture.0.join("paused-queue.bin"),
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let scheduler = scheduler_with_records(&fixture, &[paused, queued]).await;
+            let queue_id = scheduler
+                .queue_manager
+                .lock()
+                .await
+                .default_queue_id
+                .clone();
+            scheduler.pause_queue(&queue_id).await.unwrap();
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 0);
+            assert_eq!(summary.skipped, 1);
+            assert_eq!(
+                scheduler.get_task("paused-task").await.unwrap().status,
+                TaskStatus::Paused
+            );
+            assert_eq!(
+                scheduler.get_task("paused-queue").await.unwrap().status,
+                TaskStatus::Recovering
+            );
+            assert!(server.requests.lock().is_empty());
+        }
+
+        #[tokio::test]
+        async fn http_recovery_respects_global_concurrency_before_network_probe() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            server.get_delay_ms.store(250, Ordering::Relaxed);
+            let records: Vec<_> = (0..2)
+                .map(|index| {
+                    let target = fixture.0.join(format!("limited-{index}.bin"));
+                    std::fs::write(&target, &BODY[..10]).unwrap();
+                    recovery_record(
+                        &format!("limited-{index}"),
+                        &server.url,
+                        target,
+                        TaskStatus::Downloading,
+                        Some("\"stable\""),
+                        None,
+                    )
+                })
+                .collect();
+            let scheduler = scheduler_with_records(&fixture, &records).await;
+            scheduler.update_from_settings(&crate::settings::AppSettings {
+                max_concurrent_tasks: 1,
+                ..Default::default()
+            });
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 1);
+            assert_eq!(summary.skipped, 1);
+            assert_eq!(
+                scheduler
+                    .list_downloads()
+                    .await
+                    .iter()
+                    .filter(|task| task.status == TaskStatus::Downloading)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                server
+                    .requests
+                    .lock()
+                    .iter()
+                    .filter(|r| r.starts_with("HEAD "))
+                    .count(),
+                1
+            );
         }
     }
 
