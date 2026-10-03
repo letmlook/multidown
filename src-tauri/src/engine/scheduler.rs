@@ -1245,6 +1245,7 @@ impl Scheduler {
                 let _ = task_clone.error_message.lock().await.insert(e.to_string());
                 let mut st = task_clone.status.lock().await;
                 *st = TaskStatus::Failed;
+                drop(st);
                 if let Some(app) = &app_handle {
                     let _ = app.emit(
                         "download-finished",
@@ -1255,10 +1256,8 @@ impl Scheduler {
                         ),
                     );
                 }
-                if let Some(s) = scheduler_for_save {
-                    if let Err(error) = s.save_tasks().await {
-                        eprintln!("[persistence-error] worker setup: {error}");
-                    }
+                if let Err(error) = scheduler_self.save_tasks().await {
+                    eprintln!("[persistence-error] worker setup: {error}");
                 }
                 return Ok(());
             }
@@ -1368,10 +1367,8 @@ impl Scheduler {
             if let Some(app) = app_handle_clone {
                 let _ = app.emit("download-progress", ());
             }
-            if let Some(s) = scheduler_for_save {
-                if let Err(error) = s.save_tasks().await {
-                    eprintln!("[persistence-error] HTTP completion: {error}");
-                }
+            if let Err(error) = scheduler_clone.save_tasks().await {
+                eprintln!("[persistence-error] HTTP completion: {error}");
             }
         });
         Ok(())
@@ -2799,6 +2796,26 @@ mod tests {
         (format!("http://{address}/race"), handle)
     }
 
+    async fn spawn_download_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = vec![0; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{address}/complete.bin"), handle)
+    }
+
     struct InitializationFixture(PathBuf);
 
     impl InitializationFixture {
@@ -3430,9 +3447,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_slot_is_released_when_worker_setup_fails() {
+    async fn worker_setup_failure_releases_slot_and_survives_reconstruction() {
         let fixture = InitializationFixture::new();
-        let (scheduler, _) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        let paths = fixture.paths();
+        let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
         let task_id = scheduler
             .create_task(
                 "https://example.com/setup-failure".into(),
@@ -3466,6 +3484,12 @@ mod tests {
         assert!(scheduler.active_task_counts.lock().is_empty());
         assert_eq!(
             scheduler.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Failed
+        );
+        let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            restored.get_task(&task_id).await.unwrap().status,
             TaskStatus::Failed
         );
     }
@@ -3675,6 +3699,70 @@ mod tests {
             TaskStatus::Paused
         );
         assert!(scheduler.active_task_counts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_started_http_completion_survives_scheduler_reconstruction() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        let (url, server) = spawn_download_server().await;
+        let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        let task_id = scheduler
+            .create_task(
+                url.clone(),
+                fixture.0.to_string_lossy().into_owned(),
+                Some("complete.bin".into()),
+                Some(ProbeResult {
+                    supports_range: false,
+                    total_bytes: Some(10),
+                    suggested_filename: "complete.bin".into(),
+                    final_url: url,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let batch_id = scheduler
+            .create_batch(
+                "Completion".into(),
+                vec![],
+                None,
+                None,
+                None,
+                Some(fixture.0.to_string_lossy().into_owned()),
+            )
+            .await
+            .unwrap();
+        scheduler
+            .add_task_to_batch(&batch_id, &task_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scheduler
+                .start_batch(&batch_id, None, 1, NetworkOptions::default())
+                .await
+                .unwrap(),
+            1
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if scheduler.get_task(&task_id).await.unwrap().status == TaskStatus::Completed {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local HTTP task should complete");
+
+        let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            restored.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Completed
+        );
+        server.abort();
     }
 
     #[test]
