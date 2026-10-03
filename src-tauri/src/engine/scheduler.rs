@@ -254,6 +254,8 @@ pub struct Scheduler {
     writer_test_join_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     task_retry_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    worker_test_panic_after_reservation: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct LifecycleSnapshot {
@@ -271,7 +273,7 @@ struct ActiveSlot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerFailureClass {
     RetryableTransport,
-    TerminalIntegrity,
+    Terminal,
 }
 
 #[derive(Debug)]
@@ -284,6 +286,87 @@ struct WorkerFailure {
 struct WorkerReport {
     completed_segments: Vec<(u64, u64)>,
     failure: Option<WorkerFailure>,
+}
+
+const RESERVATION_ACTIVE: u8 = 0;
+const RESERVATION_COMPLETED: u8 = 1;
+const RESERVATION_RETURNED: u8 = 2;
+
+#[derive(Debug)]
+struct SegmentReservation {
+    segment: (u64, u64),
+    accounted_bytes: std::sync::atomic::AtomicU64,
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl SegmentReservation {
+    fn new(segment: (u64, u64)) -> Self {
+        Self {
+            segment,
+            accounted_bytes: std::sync::atomic::AtomicU64::new(0),
+            state: std::sync::atomic::AtomicU8::new(RESERVATION_ACTIVE),
+        }
+    }
+
+    fn record_downloaded(&self, bytes: u64) {
+        self.accounted_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn rollback_attempt(&self, task: &Task) {
+        let bytes = self
+            .accounted_bytes
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if bytes > 0 {
+            task.sub_downloaded(bytes);
+        }
+    }
+
+    fn mark_completed(&self) {
+        self.state
+            .store(RESERVATION_COMPLETED, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_completed(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == RESERVATION_COMPLETED
+    }
+
+    async fn restore(&self, task: &Task) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                RESERVATION_ACTIVE,
+                RESERVATION_RETURNED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.rollback_attempt(task);
+        task.return_segment(self.segment.0, self.segment.1).await;
+        true
+    }
+}
+
+fn classify_network_error(error: &crate::network::NetworkError) -> WorkerFailureClass {
+    match error {
+        crate::network::NetworkError::Request(error) => match error.status() {
+            None => WorkerFailureClass::RetryableTransport,
+            Some(status)
+                if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error() =>
+            {
+                WorkerFailureClass::RetryableTransport
+            }
+            Some(_) => WorkerFailureClass::Terminal,
+        },
+        crate::network::NetworkError::Url(_) | crate::network::NetworkError::Protocol(_) => {
+            WorkerFailureClass::Terminal
+        }
+    }
 }
 
 async fn restore_completed_segments(task: &Task, completed: &[(u64, u64)]) {
@@ -382,6 +465,12 @@ impl Scheduler {
     fn install_task_retry_delay_ms(&self, delay_ms: u64) {
         self.task_retry_delay_ms
             .store(delay_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn install_worker_test_panic_after_reservation(&self) {
+        self.worker_test_panic_after_reservation
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn task_retry_delay(&self) -> std::time::Duration {
@@ -543,6 +632,10 @@ impl Scheduler {
             writer_test_join_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             task_retry_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(3_000)),
+            #[cfg(test)]
+            worker_test_panic_after_reservation: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         };
         scheduler.update_from_settings(&crate::settings::AppSettings::default());
         scheduler
@@ -1488,53 +1581,83 @@ impl Scheduler {
                     writer_handle.abort();
                 }
 
-                let mut handles = Vec::new();
-                for _ in 0..n_workers {
-                    let task_ref = task_clone.clone();
-                    let url_ref = url.clone();
-                    let tx_w = tx.clone();
-                    let ah = app_handle_clone.clone();
-                    let tid = task_id_clone.clone();
-                    let client_ref = client.clone();
-                    let retries = max_retries;
-                    let opts_ref = net_opts.clone();
-                    let bucket_ref = scheduler_clone.speed_limit.clone();
-                    handles.push(tokio::spawn(async move {
-                        run_worker(
-                            task_ref,
-                            &url_ref,
-                            tx_w,
-                            ah,
-                            &tid,
-                            &client_ref,
-                            retries,
-                            &opts_ref,
-                            &bucket_ref,
-                        )
-                        .await
-                    }));
-                }
                 let mut completed_segments = Vec::new();
                 let mut worker_failure: Option<WorkerFailure> = None;
-                for handle in handles {
-                    match handle.await {
-                        Ok(report) => {
-                            completed_segments.extend(report.completed_segments);
-                            if let Some(failure) = report.failure {
-                                let replace = worker_failure.as_ref().is_none_or(|current| {
-                                    current.class == WorkerFailureClass::RetryableTransport
-                                        && failure.class == WorkerFailureClass::TerminalIntegrity
-                                });
-                                if replace {
-                                    worker_failure = Some(failure);
+                loop {
+                    if worker_failure.is_some()
+                        || *task_clone.status.lock().await != TaskStatus::Downloading
+                    {
+                        break;
+                    }
+                    let mut handles = Vec::new();
+                    for _ in 0..n_workers {
+                        let Some(segment) = task_clone.take_next_segment() else {
+                            break;
+                        };
+                        let reservation = Arc::new(SegmentReservation::new(segment));
+                        let task_ref = task_clone.clone();
+                        let url_ref = url.clone();
+                        let tx_w = tx.clone();
+                        let ah = app_handle_clone.clone();
+                        let tid = task_id_clone.clone();
+                        let client_ref = client.clone();
+                        let retries = max_retries;
+                        let opts_ref = net_opts.clone();
+                        let bucket_ref = scheduler_clone.speed_limit.clone();
+                        let reservation_ref = reservation.clone();
+                        #[cfg(test)]
+                        let panic_after_reservation = scheduler_clone
+                            .worker_test_panic_after_reservation
+                            .swap(false, std::sync::atomic::Ordering::Relaxed);
+                        #[cfg(not(test))]
+                        let panic_after_reservation = false;
+                        let handle = tokio::spawn(async move {
+                            run_worker(
+                                task_ref,
+                                &url_ref,
+                                tx_w,
+                                ah,
+                                &tid,
+                                &client_ref,
+                                retries,
+                                &opts_ref,
+                                &bucket_ref,
+                                reservation_ref,
+                                panic_after_reservation,
+                            )
+                            .await
+                        });
+                        handles.push((reservation, handle));
+                    }
+                    if handles.is_empty() {
+                        break;
+                    }
+                    for (reservation, handle) in handles {
+                        match handle.await {
+                            Ok(report) => {
+                                completed_segments.extend(report.completed_segments);
+                                if let Some(failure) = report.failure {
+                                    let replace = worker_failure.as_ref().is_none_or(|current| {
+                                        current.class == WorkerFailureClass::RetryableTransport
+                                            && failure.class == WorkerFailureClass::Terminal
+                                    });
+                                    if replace {
+                                        worker_failure = Some(failure);
+                                    }
                                 }
                             }
-                        }
-                        Err(error) => {
-                            worker_failure = Some(WorkerFailure {
-                                class: WorkerFailureClass::TerminalIntegrity,
-                                message: format!("download worker task join failed: {error}"),
-                            });
+                            Err(error) => {
+                                if reservation.is_completed() {
+                                    completed_segments.push(reservation.segment);
+                                } else {
+                                    reservation.restore(&task_clone).await;
+                                }
+                                *task_clone.status.lock().await = TaskStatus::Failed;
+                                worker_failure = Some(WorkerFailure {
+                                    class: WorkerFailureClass::Terminal,
+                                    message: format!("download worker task join failed: {error}"),
+                                });
+                            }
                         }
                     }
                 }
@@ -3095,6 +3218,8 @@ impl Clone for Scheduler {
             writer_test_join_failure: self.writer_test_join_failure.clone(),
             #[cfg(test)]
             task_retry_delay_ms: self.task_retry_delay_ms.clone(),
+            #[cfg(test)]
+            worker_test_panic_after_reservation: self.worker_test_panic_after_reservation.clone(),
         }
     }
 }
@@ -3205,143 +3330,130 @@ async fn run_worker(
     max_retries: u32,
     net_opts: &NetworkOptions,
     bucket: &TokenBucket,
+    reservation: Arc<SegmentReservation>,
+    panic_after_reservation: bool,
 ) -> WorkerReport {
     use futures_util::StreamExt;
 
     let mut report = WorkerReport::default();
-    loop {
-        let status = *task.status.lock().await;
-        if status == TaskStatus::Paused
-            || status == TaskStatus::Cancelled
-            || status == TaskStatus::Completed
-            || status == TaskStatus::Failed
-        {
-            break;
-        }
-        let Some((start, end)) = task.take_next_segment() else {
-            break;
-        };
-        let etag = task.etag.lock().await.clone();
-        let last_modified = task.last_modified.lock().await.clone();
-        let if_range =
-            resume_validator(etag.as_deref(), last_modified.as_deref()).map(str::to_owned);
+    if *task.status.lock().await != TaskStatus::Downloading {
+        reservation.restore(&task).await;
+        return report;
+    }
+    assert!(
+        !panic_after_reservation,
+        "injected worker panic after segment reservation"
+    );
+    let (start, end) = reservation.segment;
+    let etag = task.etag.lock().await.clone();
+    let last_modified = task.last_modified.lock().await.clone();
+    let if_range = resume_validator(etag.as_deref(), last_modified.as_deref()).map(str::to_owned);
 
-        // 下载单个分段：网络错误按指数退避重试同一段，耗尽后才判任务失败；
-        // If-Range 未满足时必须失败，绝不能把新表示拼入旧文件。
-        let mut attempt: u32 = 0;
-        loop {
-            let mut written: u64 = 0;
-            let mut offset = start;
-            let outcome = match crate::network::open_range(
-                client,
-                url,
-                start,
-                end,
-                if_range.as_deref(),
-                net_opts,
-            )
-            .await
-            {
-                Ok(crate::network::RangeResponse::FileChanged) => {
-                    Err(crate::network::NetworkError::Protocol(
-                        "remote representation changed during download; explicit retry required"
-                            .into(),
-                    ))
-                }
-                Ok(crate::network::RangeResponse::Body {
-                    resp,
-                    etag,
-                    last_modified,
-                }) => {
-                    // 首个成功响应回填校验字段（探测未带 etag 的场景）
-                    task.set_validation(etag, last_modified).await;
-                    let mut stream = resp.bytes_stream();
-                    let mut stream_result: Result<(), crate::network::NetworkError> = Ok(());
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(chunk) => {
-                                let len = chunk.len() as u64;
-                                bucket.acquire(chunk.len()).await;
-                                if tx.send((offset, chunk)).await.is_err() {
-                                    stream_result = Err(crate::network::NetworkError::Protocol(
-                                        "download writer channel closed".into(),
-                                    ));
-                                    break;
-                                }
-                                offset += len;
-                                written += len;
-                                task.add_downloaded(len);
-                                task.set_speed_sample(task.downloaded_bytes());
-                                if let Some(app) = &app_handle {
-                                    let _ = app.emit("download-progress", ());
-                                }
-                            }
-                            Err(e) => {
-                                stream_result = Err(crate::network::NetworkError::from(e));
+    // 下载单个分段：网络错误按指数退避重试同一段，耗尽后才判任务失败；
+    // If-Range 未满足时必须失败，绝不能把新表示拼入旧文件。
+    let mut attempt: u32 = 0;
+    loop {
+        let mut written: u64 = 0;
+        let mut offset = start;
+        let outcome = match crate::network::open_range(
+            client,
+            url,
+            start,
+            end,
+            if_range.as_deref(),
+            net_opts,
+        )
+        .await
+        {
+            Ok(crate::network::RangeResponse::FileChanged) => {
+                Err(crate::network::NetworkError::Protocol(
+                    "remote representation changed during download; explicit retry required".into(),
+                ))
+            }
+            Ok(crate::network::RangeResponse::Body {
+                resp,
+                etag,
+                last_modified,
+            }) => {
+                // 首个成功响应回填校验字段（探测未带 etag 的场景）
+                task.set_validation(etag, last_modified).await;
+                let mut stream = resp.bytes_stream();
+                let mut stream_result: Result<(), crate::network::NetworkError> = Ok(());
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(chunk) => {
+                            let len = chunk.len() as u64;
+                            bucket.acquire(chunk.len()).await;
+                            if tx.send((offset, chunk)).await.is_err() {
+                                stream_result = Err(crate::network::NetworkError::Protocol(
+                                    "download writer channel closed".into(),
+                                ));
                                 break;
                             }
+                            offset += len;
+                            written += len;
+                            task.add_downloaded(len);
+                            reservation.record_downloaded(len);
+                            task.set_speed_sample(task.downloaded_bytes());
+                            if let Some(app) = &app_handle {
+                                let _ = app.emit("download-progress", ());
+                            }
+                        }
+                        Err(e) => {
+                            stream_result = Err(crate::network::NetworkError::from(e));
+                            break;
                         }
                     }
-                    match stream_result {
-                        Ok(()) if written == end - start + 1 => Ok(()),
-                        Ok(()) => Err(crate::network::NetworkError::Protocol(format!(
-                            "response body length {written} does not match requested range length {}",
-                            end - start + 1
-                        ))),
-                        Err(e) => Err(e),
-                    }
                 }
-                Err(e) => Err(e),
-            };
-
-            match outcome {
-                Ok(()) => {
-                    report.completed_segments.push((start, end));
-                    break;
+                match stream_result {
+                    Ok(()) if written == end - start + 1 => Ok(()),
+                    Ok(()) => Err(crate::network::NetworkError::Protocol(format!(
+                        "response body length {written} does not match requested range length {}",
+                        end - start + 1
+                    ))),
+                    Err(e) => Err(e),
                 }
-                Err(e) => {
-                    // 回退已计入的进度并重试整段
-                    if written > 0 {
-                        task.sub_downloaded(written);
-                    }
-                    let st = *task.status.lock().await;
-                    if st == TaskStatus::Paused
-                        || st == TaskStatus::Cancelled
-                        || st == TaskStatus::Failed
-                    {
-                        task.return_segment(start, end).await;
-                        if let Some(app) = &app_handle {
-                            let _ = app.emit("download-progress", ());
-                        }
-                        return report;
-                    }
-                    let retryable = matches!(&e, crate::network::NetworkError::Request(_));
-                    if retryable && attempt < max_retries {
-                        attempt += 1;
-                        let backoff =
-                            std::time::Duration::from_secs(1u64 << (attempt.min(3u32) - 1));
-                        tokio::time::sleep(backoff).await;
-                        continue;
-                    }
+            }
+            Err(e) => Err(e),
+        };
 
-                    task.return_segment(start, end).await;
-                    let failure = WorkerFailure {
-                        class: if retryable {
-                            WorkerFailureClass::RetryableTransport
-                        } else {
-                            WorkerFailureClass::TerminalIntegrity
-                        },
-                        message: e.to_string(),
-                    };
-                    *task.error_message.lock().await = Some(failure.message.clone());
-                    *task.status.lock().await = TaskStatus::Failed;
-                    report.failure = Some(failure);
+        match outcome {
+            Ok(()) => {
+                reservation.mark_completed();
+                report.completed_segments.push((start, end));
+                return report;
+            }
+            Err(e) => {
+                // 回退已计入的进度并重试整段。reservation 让 JoinError 也能做同样回退。
+                reservation.rollback_attempt(&task);
+                if *task.status.lock().await != TaskStatus::Downloading {
+                    reservation.restore(&task).await;
+                    if let Some(app) = &app_handle {
+                        let _ = app.emit("download-progress", ());
+                    }
                     return report;
                 }
+                let failure_class = classify_network_error(&e);
+                let retryable = failure_class == WorkerFailureClass::RetryableTransport;
+                if retryable && attempt < max_retries {
+                    attempt += 1;
+                    let backoff = std::time::Duration::from_secs(1u64 << (attempt.min(3u32) - 1));
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+
+                reservation.restore(&task).await;
+                let failure = WorkerFailure {
+                    class: failure_class,
+                    message: e.to_string(),
+                };
+                *task.error_message.lock().await = Some(failure.message.clone());
+                *task.status.lock().await = TaskStatus::Failed;
+                report.failure = Some(failure);
+                return report;
             }
         }
     }
-    report
 }
 
 // ── 单元测试 ────────────────────────────────────────────────────────────────
@@ -3441,12 +3553,22 @@ mod tests {
 
         const BODY: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
+        struct ActiveRangeGuard(Arc<AtomicUsize>);
+
+        impl Drop for ActiveRangeGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
         struct RecoveryServer {
             url: String,
             requests: Arc<ParkingMutex<Vec<String>>>,
             get_delay_ms: Arc<std::sync::atomic::AtomicU64>,
             reject_range_after: Arc<AtomicUsize>,
             transient_range_failures: Arc<AtomicUsize>,
+            failure_status: Arc<std::sync::atomic::AtomicU16>,
+            max_active_worker_ranges: Arc<AtomicUsize>,
             handle: tokio::task::JoinHandle<()>,
         }
 
@@ -3464,6 +3586,12 @@ mod tests {
                 let reject_for_server = reject_range_after.clone();
                 let transient_range_failures = Arc::new(AtomicUsize::new(0));
                 let transient_failures_for_server = transient_range_failures.clone();
+                let failure_status = Arc::new(std::sync::atomic::AtomicU16::new(503));
+                let failure_status_for_server = failure_status.clone();
+                let active_worker_ranges = Arc::new(AtomicUsize::new(0));
+                let max_active_worker_ranges = Arc::new(AtomicUsize::new(0));
+                let active_ranges_for_server = active_worker_ranges.clone();
+                let max_ranges_for_server = max_active_worker_ranges.clone();
                 let range_request_count = Arc::new(AtomicUsize::new(0));
                 let handle = tokio::spawn(async move {
                     while let Ok((mut stream, _)) = listener.accept().await {
@@ -3473,6 +3601,9 @@ mod tests {
                         let delay = delay_for_server.clone();
                         let reject_after = reject_for_server.clone();
                         let transient_failures = transient_failures_for_server.clone();
+                        let injected_status = failure_status_for_server.clone();
+                        let active_ranges = active_ranges_for_server.clone();
+                        let max_ranges = max_ranges_for_server.clone();
                         let range_count = range_request_count.clone();
                         tokio::spawn(async move {
                             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3525,6 +3656,12 @@ mod tests {
                                 stream.write_all(response.as_bytes()).await.unwrap();
                                 return;
                             }
+                            let _active_range_guard =
+                                range_ordinal.filter(|ordinal| *ordinal > 0).map(|_| {
+                                    let active = active_ranges.fetch_add(1, Ordering::Relaxed) + 1;
+                                    max_ranges.fetch_max(active, Ordering::Relaxed);
+                                    ActiveRangeGuard(active_ranges.clone())
+                                });
                             let transient_failure = range_ordinal.is_some_and(|ordinal| {
                                 ordinal > 0
                                     && transient_failures
@@ -3534,8 +3671,9 @@ mod tests {
                                         .is_ok()
                             });
                             if transient_failure {
+                                let status = injected_status.load(Ordering::Relaxed);
                                 let response = format!(
-                                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n{common}\r\n"
+                                    "HTTP/1.1 {status} Injected Failure\r\nContent-Length: 0\r\n{common}\r\n"
                                 );
                                 stream.write_all(response.as_bytes()).await.unwrap();
                                 return;
@@ -3573,6 +3711,8 @@ mod tests {
                     get_delay_ms,
                     reject_range_after,
                     transient_range_failures,
+                    failure_status,
+                    max_active_worker_ranges,
                     handle,
                 }
             }
@@ -3697,21 +3837,109 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn http_recovery_retries_only_transient_transport_failures() {
+        async fn http_recovery_caller_claims_preserve_worker_concurrency_and_terminate() {
             let fixture = InitializationFixture::new();
             let server =
                 RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
-            server.transient_range_failures.store(2, Ordering::Relaxed);
-            let target = fixture.0.join("transient-retry.bin");
+            server.get_delay_ms.store(50, Ordering::Relaxed);
+            let target = fixture.0.join("concurrent-reservations.bin");
             write_preallocated_prefix(&target, &BODY[..10]);
-            let record = recovery_record(
-                "transient-retry",
+            let mut record = recovery_record(
+                "concurrent-reservations",
                 &server.url,
                 target.clone(),
                 TaskStatus::Downloading,
                 Some("\"stable\""),
                 None,
             );
+            record.pending_segments = vec![(10, 22), (23, 35)];
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+
+            let summary = scheduler
+                .recover_tasks(None, 2, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            wait_for_status(&scheduler, "concurrent-reservations", TaskStatus::Completed).await;
+            assert_eq!(std::fs::read(target).unwrap(), BODY);
+            assert_eq!(server.max_active_worker_ranges.load(Ordering::Relaxed), 2);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !scheduler.active_task_counts.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn http_recovery_retries_only_transient_transport_failures() {
+            for status in [408, 429, 503] {
+                let fixture = InitializationFixture::new();
+                let server =
+                    RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true)
+                        .await;
+                server.failure_status.store(status, Ordering::Relaxed);
+                server.transient_range_failures.store(2, Ordering::Relaxed);
+                let id = format!("transient-{status}");
+                let target = fixture.0.join(format!("{id}.bin"));
+                write_preallocated_prefix(&target, &BODY[..10]);
+                let record = recovery_record(
+                    &id,
+                    &server.url,
+                    target.clone(),
+                    TaskStatus::Downloading,
+                    Some("\"stable\""),
+                    None,
+                );
+                let scheduler = scheduler_with_records(&fixture, &[record]).await;
+                scheduler.limits.lock().max_retries = 1;
+                scheduler.install_task_retry_delay_ms(20);
+
+                let summary = scheduler
+                    .recover_tasks(None, 1, NetworkOptions::default())
+                    .await;
+
+                assert_eq!(summary.started, 1, "status {status}");
+                wait_for_status(&scheduler, &id, TaskStatus::Completed).await;
+                assert_eq!(std::fs::read(target).unwrap(), BODY, "status {status}");
+                let range_requests = server
+                    .requests
+                    .lock()
+                    .iter()
+                    .filter(|request| request.to_ascii_lowercase().contains("range: bytes=10-"))
+                    .count();
+                assert_eq!(
+                    range_requests,
+                    4,
+                    "status {status}: {:?}",
+                    server.requests.lock()
+                );
+                let task = scheduler.tasks.lock().await[&id].clone();
+                assert!(task.pending_segments.lock().await.is_empty());
+                assert_eq!(task.downloaded_bytes(), BODY.len() as u64);
+                assert!(task.error_message.lock().await.is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn http_recovery_does_not_retry_permanent_404() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            server.failure_status.store(404, Ordering::Relaxed);
+            server.transient_range_failures.store(10, Ordering::Relaxed);
+            let target = fixture.0.join("permanent-404.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "permanent-404",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let paths = fixture.paths();
             let scheduler = scheduler_with_records(&fixture, &[record]).await;
             scheduler.limits.lock().max_retries = 1;
             scheduler.install_task_retry_delay_ms(20);
@@ -3721,19 +3949,119 @@ mod tests {
                 .await;
 
             assert_eq!(summary.started, 1);
-            wait_for_status(&scheduler, "transient-retry", TaskStatus::Completed).await;
-            assert_eq!(std::fs::read(target).unwrap(), BODY);
+            wait_for_status(&scheduler, "permanent-404", TaskStatus::Failed).await;
+            let requests_after_failure = server.requests.lock().len();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(server.requests.lock().len(), requests_after_failure);
             let range_requests = server
                 .requests
                 .lock()
                 .iter()
                 .filter(|request| request.to_ascii_lowercase().contains("range: bytes=10-"))
                 .count();
-            assert_eq!(range_requests, 4, "{:?}", server.requests.lock());
-            let task = scheduler.tasks.lock().await["transient-retry"].clone();
-            assert!(task.pending_segments.lock().await.is_empty());
-            assert_eq!(task.downloaded_bytes(), BODY.len() as u64);
-            assert!(task.error_message.lock().await.is_none());
+            assert_eq!(range_requests, 2, "{:?}", server.requests.lock());
+            let task = scheduler.tasks.lock().await["permanent-404"].clone();
+            assert_eq!(*task.status.lock().await, TaskStatus::Failed);
+            assert!(task
+                .error_message
+                .lock()
+                .await
+                .as_deref()
+                .is_some_and(|error| error.contains("404")));
+            assert_eq!(task.downloaded_bytes(), 10);
+            assert_eq!(
+                task.pending_segments
+                    .lock()
+                    .await
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![(10, BODY.len() as u64 - 1)]
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !scheduler.active_task_counts.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty());
+            let restored = restored.get_task("permanent-404").await.unwrap();
+            assert_eq!(restored.status, TaskStatus::Failed);
+            assert!(restored
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains("404")));
+        }
+
+        #[tokio::test]
+        async fn http_recovery_retries_503_then_persists_exhausted_failure() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            server.failure_status.store(503, Ordering::Relaxed);
+            server.transient_range_failures.store(10, Ordering::Relaxed);
+            let target = fixture.0.join("exhausted-503.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "exhausted-503",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let paths = fixture.paths();
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+            scheduler.limits.lock().max_retries = 1;
+            scheduler.install_task_retry_delay_ms(20);
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                while !scheduler.active_task_counts.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let range_requests = server
+                .requests
+                .lock()
+                .iter()
+                .filter(|request| request.to_ascii_lowercase().contains("range: bytes=10-"))
+                .count();
+            assert_eq!(range_requests, 5, "{:?}", server.requests.lock());
+            let task = scheduler.tasks.lock().await["exhausted-503"].clone();
+            assert_eq!(*task.status.lock().await, TaskStatus::Failed);
+            assert!(task
+                .error_message
+                .lock()
+                .await
+                .as_deref()
+                .is_some_and(|error| error.contains("503")));
+            assert_eq!(task.downloaded_bytes(), 10);
+            assert_eq!(
+                task.pending_segments
+                    .lock()
+                    .await
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![(10, BODY.len() as u64 - 1)]
+            );
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty());
+            let restored = restored.get_task("exhausted-503").await.unwrap();
+            assert_eq!(restored.status, TaskStatus::Failed);
+            assert!(restored
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains("503")));
         }
 
         #[tokio::test]
@@ -4120,6 +4448,79 @@ mod tests {
             let restored = restored.get_task("writer-panic").await.unwrap();
             assert_eq!(restored.status, TaskStatus::Failed);
             assert!(restored.error_message.unwrap().contains("join failed"));
+        }
+
+        #[tokio::test]
+        async fn http_recovery_worker_panic_restores_caller_visible_reservation() {
+            let fixture = InitializationFixture::new();
+            let server =
+                RecoveryServer::spawn("\"stable\"", "Wed, 21 Oct 2026 07:28:00 GMT", true).await;
+            let target = fixture.0.join("worker-panic.bin");
+            write_preallocated_prefix(&target, &BODY[..10]);
+            let record = recovery_record(
+                "worker-panic",
+                &server.url,
+                target,
+                TaskStatus::Downloading,
+                Some("\"stable\""),
+                None,
+            );
+            let paths = fixture.paths();
+            let scheduler = scheduler_with_records(&fixture, &[record]).await;
+            scheduler.limits.lock().max_retries = 1;
+            scheduler.install_task_retry_delay_ms(20);
+            scheduler.install_worker_test_panic_after_reservation();
+
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+
+            assert_eq!(summary.started, 1);
+            wait_for_status(&scheduler, "worker-panic", TaskStatus::Failed).await;
+            let requests_after_failure = server.requests.lock().len();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(server.requests.lock().len(), requests_after_failure);
+            let task = scheduler.tasks.lock().await["worker-panic"].clone();
+            assert_eq!(*task.status.lock().await, TaskStatus::Failed);
+            assert!(task
+                .error_message
+                .lock()
+                .await
+                .as_deref()
+                .is_some_and(|error| error.contains("worker task join failed")));
+            assert_eq!(task.downloaded_bytes(), 10);
+            assert_eq!(
+                task.pending_segments
+                    .lock()
+                    .await
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![(10, BODY.len() as u64 - 1)]
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !scheduler.active_task_counts.lock().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty());
+            let restored = restored.get_task("worker-panic").await.unwrap();
+            assert_eq!(restored.status, TaskStatus::Failed);
+            assert!(restored
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains("worker task join failed")));
+            let record = crate::engine::persistence::load_tasks_report(&fixture.paths().tasks)
+                .unwrap()
+                .data
+                .into_iter()
+                .find(|record| record.id == "worker-panic")
+                .unwrap();
+            assert_eq!(record.downloaded_bytes, 10);
+            assert_eq!(record.pending_segments, vec![(10, BODY.len() as u64 - 1)]);
         }
 
         #[tokio::test]
