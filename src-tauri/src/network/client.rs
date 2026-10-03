@@ -176,23 +176,24 @@ pub async fn probe_with_client(
         )
         .send()
         .await?;
-        // The server's response to an actual Range request is authoritative.
-        // Some servers advertise `Accept-Ranges: bytes` on HEAD but ignore the
-        // Range header and return a full 200 response instead.
-        supports_range = get_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
         if mime.is_none() {
             mime = mime_from_headers(get_resp.headers());
         }
+        // The fallback response, not a HEAD advertisement, decides support.
+        supports_range = false;
         if get_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            supports_range = true;
-            if let Some(v) = get_resp.headers().get("content-range") {
-                if let Ok(s) = v.to_str() {
-                    if let Some(t) = s.split('/').nth(1) {
-                        total_bytes = t.trim().parse::<u64>().ok();
-                    }
-                }
+            // A 206 only proves support when it exactly answers our
+            // `Range: bytes=0-0` request with a usable positive total.
+            if let Some(total) = range_zero_total(get_resp.headers()) {
+                supports_range = true;
+                // A validated Content-Range is authoritative over a stale
+                // Content-Length supplied by the preceding HEAD response.
+                total_bytes = Some(total);
+            } else {
+                supports_range = false;
             }
         } else if get_resp.status() == reqwest::StatusCode::OK {
+            // The server ignored the requested Range header.
             total_bytes = get_resp
                 .headers()
                 .get("content-length")
@@ -248,6 +249,22 @@ fn normalized_mime(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase)
+}
+
+/// Validates the only Content-Range form accepted for the probe request:
+/// `Range: bytes=0-0` must yield `bytes 0-0/<positive total>`.
+fn range_zero_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get("content-range")?.to_str().ok()?.trim();
+    let (unit, range_and_total) = value.split_once(' ')?;
+    if unit != "bytes" {
+        return None;
+    }
+    let (range, total) = range_and_total.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    if start != "0" || end != "0" {
+        return None;
+    }
+    total.parse::<u64>().ok().filter(|total| *total > 0)
 }
 
 /// `.torrent` 响应的判定（抽成纯函数便于单测）。
@@ -474,6 +491,82 @@ mod tests {
         assert_eq!(result.total_bytes, Some(10));
         assert_eq!(result.mime.as_deref(), Some("video/mp4"));
         assert!(!result.supports_range);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_invalid_206_content_ranges() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for content_range in [
+            None,
+            Some("broken"),
+            Some("bytes 1-1/10"),
+            Some("bytes 0-1/10"),
+            Some("bytes 0-0/*"),
+            Some("bytes 0-0/0"),
+            Some("bytes 0-0/not-a-number"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let content_range = content_range.map(str::to_owned);
+            let case = content_range.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0; 2048];
+                    let read = stream.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    let response = if request.starts_with("HEAD ") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        assert!(request.contains("Range: bytes=0-0"));
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n{}Content-Type: Video/MP4\r\nConnection: close\r\n\r\nx",
+                            content_range
+                                .as_deref()
+                                .map(|value| format!("Content-Range: {value}\r\n"))
+                                .unwrap_or_default()
+                        )
+                    };
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+
+            let result = probe(&format!("http://{address}/movie")).await.unwrap();
+
+            assert!(!result.supports_range, "{case:?}");
+            assert_eq!(result.total_bytes, Some(10), "{case:?}");
+            assert_eq!(result.mime.as_deref(), Some("video/mp4"));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_exact_206_content_range_and_uses_its_total() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 2048];
+                let read = stream.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                let response = if request.starts_with("HEAD ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                } else {
+                    assert!(request.contains("Range: bytes=0-0"));
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/12\r\nContent-Type: Video/MP4\r\nConnection: close\r\n\r\nx"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let result = probe(&format!("http://{address}/movie")).await.unwrap();
+
+        assert!(result.supports_range);
+        assert_eq!(result.total_bytes, Some(12));
         server.await.unwrap();
     }
 
