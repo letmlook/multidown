@@ -2125,7 +2125,9 @@ pub fn run() {
                             }
                         }
                         let _ = app_tick.emit("download-progress", ());
-                        sched_tick.save_tasks().await;
+                        if let Err(error) = sched_tick.save_tasks().await {
+                            eprintln!("[persistence-error] schedule tick: {error}");
+                        }
                     }
                 });
             }
@@ -2713,7 +2715,9 @@ pub fn run() {
                     let list = sched_clone.list_downloads().await;
                     let has_downloading = list.iter().any(|t| t.status == TaskStatus::Downloading);
                     if has_downloading {
-                        sched_clone.save_tasks().await;
+                        if let Err(error) = sched_clone.save_tasks().await {
+                            eprintln!("[persistence-error] periodic snapshot: {error}");
+                        }
                     }
                 }
             });

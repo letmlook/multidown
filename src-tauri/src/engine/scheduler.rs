@@ -1,7 +1,7 @@
 //! 任务调度：创建/暂停/恢复/取消，启动多连接下载
 //! 与队列管理器集成，支持多队列并发控制
 
-use crate::engine::batch::BatchManager;
+use crate::engine::batch::{BatchJob, BatchManager};
 use crate::engine::persistence::{save_tasks_to_file, PersistedTask};
 use crate::engine::queue::{GlobalQueueManager, QueueSummary};
 use crate::engine::rules::{match_rule, CategoryRule};
@@ -215,12 +215,61 @@ pub struct Scheduler {
     torrent_engine: Arc<OnceCell<Arc<crate::torrent::engine::TorrentEngine>>>,
     /// 最近一次应用设置快照（做种策略等运行时读取）
     settings: Arc<ParkingMutex<crate::settings::AppSettings>>,
+    #[cfg(test)]
+    admission_test_barrier: Arc<ParkingMutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(test)]
+    persistence_test_failures: Arc<ParkingMutex<std::collections::VecDeque<&'static str>>>,
+}
+
+struct LifecycleSnapshot {
+    tasks: HashMap<TaskId, Arc<Task>>,
+    task_records: Vec<PersistedTask>,
+    queues: crate::engine::queue::QueueManager,
+    batches: Vec<BatchJob>,
+}
+
+struct ActiveSlot {
+    counts: Arc<ParkingMutex<HashMap<String, usize>>>,
+    queue_id: String,
+}
+
+impl Drop for ActiveSlot {
+    fn drop(&mut self) {
+        let mut counts = self.counts.lock();
+        if let Some(count) = counts.get_mut(&self.queue_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.queue_id);
+            }
+        }
+    }
 }
 
 /// 重复链接创建被拒绝时的错误标记；前端据此弹确认框后以 force 重试
 pub const ERR_DUPLICATE_ASK: &str = "DUPLICATE_ASK";
 
 impl Scheduler {
+    #[cfg(test)]
+    fn install_admission_test_barrier(&self, participants: usize) {
+        *self.admission_test_barrier.lock() =
+            Some(Arc::new(tokio::sync::Barrier::new(participants)));
+    }
+
+    #[cfg(test)]
+    fn install_persistence_test_failures(&self, domains: &[&'static str]) {
+        *self.persistence_test_failures.lock() = domains.iter().copied().collect();
+    }
+
+    #[cfg(test)]
+    fn inject_persistence_failure(&self, domain: &'static str) -> Result<(), String> {
+        let mut failures = self.persistence_test_failures.lock();
+        if failures.front().copied() == Some(domain) {
+            failures.pop_front();
+            return Err(format!("injected {domain} persistence failure"));
+        }
+        Ok(())
+    }
+
     pub fn initialize(
         paths: SchedulerPaths,
         settings: crate::settings::AppSettings,
@@ -342,6 +391,12 @@ impl Scheduler {
             torrent_cfg: Arc::new(ParkingMutex::new(None)),
             torrent_engine: Arc::new(OnceCell::new()),
             settings: Arc::new(ParkingMutex::new(crate::settings::AppSettings::default())),
+            #[cfg(test)]
+            admission_test_barrier: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            persistence_test_failures: Arc::new(ParkingMutex::new(
+                std::collections::VecDeque::new(),
+            )),
         };
         scheduler.update_from_settings(&crate::settings::AppSettings::default());
         scheduler
@@ -420,7 +475,7 @@ impl Scheduler {
             .select_files(task_id, &files)
             .await
             .map_err(|e| e.to_string())?;
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(())
     }
 
@@ -452,18 +507,153 @@ impl Scheduler {
         Ok(scheduler)
     }
 
-    /// 将当前任务列表保存到 save_path（若已配置）
-    pub async fn save_tasks(&self) {
-        let path = match &self.save_path {
-            Some(p) => p.clone(),
-            None => return,
-        };
+    async fn task_records(&self) -> Vec<PersistedTask> {
         let tasks = self.tasks.lock().await;
         let mut snapshots: Vec<PersistedTask> = Vec::new();
         for t in tasks.values() {
             snapshots.push(PersistedTask::from_task(t).await);
         }
-        let _ = save_tasks_to_file(&path, &snapshots).await;
+        snapshots
+    }
+
+    async fn persist_task_records(&self, snapshots: &[PersistedTask]) -> Result<(), String> {
+        #[cfg(test)]
+        self.inject_persistence_failure("tasks")?;
+        let Some(path) = &self.save_path else {
+            return Ok(());
+        };
+        save_tasks_to_file(path, snapshots)
+            .await
+            .map_err(|error| format!("task persistence failed ({}): {error}", path.display()))
+    }
+
+    /// 将当前任务列表保存到 save_path（若已配置）。
+    pub async fn save_tasks(&self) -> Result<(), String> {
+        let snapshots = self.task_records().await;
+        self.persist_task_records(&snapshots).await
+    }
+
+    async fn lifecycle_snapshot(&self) -> LifecycleSnapshot {
+        let tasks = self.tasks.lock().await.clone();
+        let task_records = self.task_records().await;
+        let queues = self.queue_manager.lock().await.clone();
+        let batches = self.batch_manager.list_jobs_full().await;
+        LifecycleSnapshot {
+            tasks,
+            task_records,
+            queues,
+            batches,
+        }
+    }
+
+    fn transaction_error(primary: String, rollback: Vec<String>) -> String {
+        if rollback.is_empty() {
+            primary
+        } else {
+            format!(
+                "{primary}; rollback persistence failed: {}",
+                rollback.join("; ")
+            )
+        }
+    }
+
+    async fn commit_created_tasks(
+        &self,
+        new_tasks: Vec<Arc<Task>>,
+        queue_id: &str,
+        batch: Option<BatchJob>,
+        replaced_task_ids: &[TaskId],
+    ) -> Result<Vec<TaskId>, String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let previous = self.lifecycle_snapshot().await;
+        let ids: Vec<_> = new_tasks.iter().map(|task| task.id.clone()).collect();
+        let includes_batch = batch.is_some();
+        if !self
+            .queue_manager
+            .lock()
+            .await
+            .queues
+            .contains_key(queue_id)
+        {
+            return Err("Queue not found".into());
+        }
+
+        {
+            let mut tasks = self.tasks.lock().await;
+            for task_id in replaced_task_ids {
+                tasks.remove(task_id);
+            }
+            for task in new_tasks {
+                tasks.insert(task.id.clone(), task);
+            }
+        }
+        {
+            let manager = self.queue_manager.lock().await;
+            for queue in manager.queues.values() {
+                let mut queue = queue.lock();
+                for task_id in replaced_task_ids {
+                    queue.remove_task(task_id);
+                }
+            }
+            let queue = manager
+                .queues
+                .get(queue_id)
+                .ok_or_else(|| "Queue not found".to_string())?;
+            let mut queue = queue.lock();
+            for id in &ids {
+                queue.add_task(id.clone());
+            }
+        }
+        if let Some(batch) = batch {
+            self.batch_manager.add_job(batch).await;
+        }
+
+        let current_task_records = self.task_records().await;
+        if let Err(primary) = self.persist_task_records(&current_task_records).await {
+            *self.tasks.lock().await = previous.tasks;
+            *self.queue_manager.lock().await = previous.queues;
+            self.batch_manager.replace_jobs(previous.batches).await;
+            return Err(primary);
+        }
+
+        let queue_result = {
+            let manager = self.queue_manager.lock().await;
+            self.persist_queues(&manager).await
+        };
+        if let Err(primary) = queue_result {
+            let rollback = self
+                .persist_task_records(&previous.task_records)
+                .await
+                .err()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if rollback.is_empty() {
+                *self.tasks.lock().await = previous.tasks;
+            }
+            *self.queue_manager.lock().await = previous.queues;
+            self.batch_manager.replace_jobs(previous.batches).await;
+            return Err(Self::transaction_error(primary, rollback));
+        }
+
+        if includes_batch {
+            if let Err(primary) = self.persist_batches().await {
+                let mut rollback = Vec::new();
+                if let Err(error) = self.persist_queues(&previous.queues).await {
+                    rollback.push(error);
+                } else {
+                    *self.queue_manager.lock().await = previous.queues;
+                }
+                if let Err(error) = self.persist_task_records(&previous.task_records).await {
+                    rollback.push(error);
+                } else {
+                    *self.tasks.lock().await = previous.tasks;
+                }
+                self.batch_manager.replace_jobs(previous.batches).await;
+                return Err(Self::transaction_error(primary, rollback));
+            }
+        }
+
+        Ok(ids)
     }
 
     #[allow(dead_code)]
@@ -497,16 +687,12 @@ impl Scheduler {
     }
 
     /// 按设置中的 duplicate_action 处理重复链接。
-    /// 返回 Err 表示拒绝创建；Ok(true) 表示需要重命名（在探测解析出文件名后应用）。
-    async fn handle_duplicate(&self, existing_id: &TaskId) -> Result<bool, String> {
+    /// 返回 Err 表示拒绝创建；成功时分别给出是否重命名和待原子替换的旧任务。
+    fn duplicate_resolution(&self, existing_id: &TaskId) -> Result<(bool, Option<TaskId>), String> {
         let action = self.duplicate_action.lock().clone();
         match action.as_str() {
-            "overwrite" => {
-                // 移除旧任务记录后重新创建；新任务下载时会截断旧文件
-                self.remove_task(existing_id).await?;
-                Ok(false)
-            }
-            "rename" => Ok(true),
+            "overwrite" => Ok((false, Some(existing_id.clone()))),
+            "rename" => Ok((true, None)),
             "skip" => Err("重复下载：已存在相同地址的任务".to_string()),
             // ask：返回特殊标记，交互端弹确认后以 force 重新调用；非交互端按 skip 处理
             _ => Err(ERR_DUPLICATE_ASK.to_string()),
@@ -544,24 +730,17 @@ impl Scheduler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_task_internal(
+    async fn prepare_http_task(
         &self,
         url: String,
         save_dir: String,
         filename: Option<String>,
         probe_result: Option<ProbeResult>,
-        force: bool,
+        rename_needed: bool,
         auth: Option<AuthConfig>,
         extra_headers: Vec<(String, String)>,
         auto_categorize: bool,
-    ) -> Result<TaskId, String> {
-        // 重复检测放在探测之前，避免多余的网络请求；重命名延后到文件名解析完成后应用
-        let mut rename_needed = false;
-        if !force {
-            if let Some(existing_id) = self.find_duplicate(&url).await {
-                rename_needed = self.handle_duplicate(&existing_id).await?;
-            }
-        }
+    ) -> Result<Task, String> {
         let (supports_range, total_bytes, suggested_filename, validation) = match probe_result {
             Some(p) => (
                 p.supports_range,
@@ -609,16 +788,53 @@ impl Scheduler {
         if let Some((etag, last_modified)) = validation {
             task.set_validation(etag, last_modified).await;
         }
+        Ok(task)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_task_internal(
+        &self,
+        url: String,
+        save_dir: String,
+        filename: Option<String>,
+        probe_result: Option<ProbeResult>,
+        force: bool,
+        auth: Option<AuthConfig>,
+        extra_headers: Vec<(String, String)>,
+        auto_categorize: bool,
+    ) -> Result<TaskId, String> {
+        // 重复检测放在探测之前，避免多余的网络请求；重命名延后到文件名解析完成后应用
+        let mut rename_needed = false;
+        let mut replaced_task_ids = Vec::new();
+        if !force {
+            if let Some(existing_id) = self.find_duplicate(&url).await {
+                let resolution = self.duplicate_resolution(&existing_id)?;
+                rename_needed = resolution.0;
+                replaced_task_ids.extend(resolution.1);
+            }
+        }
+        let task = self
+            .prepare_http_task(
+                url,
+                save_dir,
+                filename,
+                probe_result,
+                rename_needed,
+                auth,
+                extra_headers,
+                auto_categorize,
+            )
+            .await?;
         let id = task.id.clone();
 
-        // Auto-assign new tasks to the initialized default queue and make the
-        // membership durable before reporting creation success.
         let default_queue_id = self.queue_manager.lock().await.default_queue_id.clone();
-        self.persist_task_queue_assignment(&id, &default_queue_id)
-            .await?;
-
-        self.tasks.lock().await.insert(id.clone(), Arc::new(task));
-        self.save_tasks().await;
+        self.commit_created_tasks(
+            vec![Arc::new(task)],
+            &default_queue_id,
+            None,
+            &replaced_task_ids,
+        )
+        .await?;
         Ok(id)
     }
 
@@ -657,11 +873,12 @@ impl Scheduler {
         // 本地可得的 info hash：调用方传入，或磁力链接解析（不联网）
         let local_info_hash = info_hash.or_else(|| magnet.as_ref().map(|m| m.info_hash.clone()));
 
+        let mut replaced_task_ids = Vec::new();
         if !force {
             // 种子按 info hash 去重，而不是按 URL —— 同一资源的磁力链接参数可能不同
             let key = local_info_hash.clone().unwrap_or_else(|| input.clone());
             if let Some(existing_id) = self.find_duplicate_torrent(&key).await {
-                self.handle_duplicate(&existing_id).await?;
+                replaced_task_ids.extend(self.duplicate_resolution(&existing_id)?.1);
             }
         }
 
@@ -686,11 +903,13 @@ impl Scheduler {
             let id = task.id.clone();
 
             let default_queue_id = self.queue_manager.lock().await.default_queue_id.clone();
-            self.persist_task_queue_assignment(&id, &default_queue_id)
-                .await?;
-
-            self.tasks.lock().await.insert(id.clone(), Arc::new(task));
-            self.save_tasks().await;
+            self.commit_created_tasks(
+                vec![Arc::new(task)],
+                &default_queue_id,
+                None,
+                &replaced_task_ids,
+            )
+            .await?;
             return Ok(id);
         };
 
@@ -740,11 +959,13 @@ impl Scheduler {
         let id = task.id.clone();
 
         let default_queue_id = self.queue_manager.lock().await.default_queue_id.clone();
-        self.persist_task_queue_assignment(&id, &default_queue_id)
-            .await?;
-
-        self.tasks.lock().await.insert(id.clone(), Arc::new(task));
-        self.save_tasks().await;
+        self.commit_created_tasks(
+            vec![Arc::new(task)],
+            &default_queue_id,
+            None,
+            &replaced_task_ids,
+        )
+        .await?;
         Ok(id)
     }
 
@@ -766,26 +987,29 @@ impl Scheduler {
         None
     }
 
-    /// Check if a queue can start more tasks based on its concurrency limit
-    async fn can_start_for_queue(&self, queue_id: &str) -> Result<bool, String> {
+    /// Atomically validate queue policy and reserve one global/queue slot.
+    async fn reserve_active_slot(&self, task_id: &str) -> Result<ActiveSlot, String> {
         use chrono::{Datelike, Timelike};
 
-        // 全局并发上限来自设置
-        let global_max = self.limits.lock().max_concurrent_tasks;
+        #[cfg(test)]
+        let admission_barrier = { self.admission_test_barrier.lock().clone() };
+        #[cfg(test)]
+        if let Some(barrier) = admission_barrier {
+            barrier.wait().await;
+        }
 
-        // Get current active count for this queue
-        let active_count = {
-            let counts = self.active_task_counts.lock();
-            *counts.get(queue_id).unwrap_or(&0)
-        };
-
-        // Apply the queue limit as well as the global limit.
+        // Queue policy mutations also take this lock, so pause/delete cannot
+        // interleave between validation and slot reservation.
+        let _transaction = self.lifecycle_persist_lock.lock().await;
+        let manager = self.queue_manager.lock().await;
+        let queue_id = manager
+            .get_task_queue(task_id)
+            .await
+            .unwrap_or_else(|| manager.default_queue_id.clone());
         let queue_max = {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
             let queue = manager
                 .queues
-                .get(queue_id)
+                .get(&queue_id)
                 .ok_or_else(|| "Queue not found".to_string())?;
             let queue = queue.lock();
             if queue.deleted {
@@ -800,28 +1024,20 @@ impl Scheduler {
             }
             queue.max_concurrent as usize
         };
+        drop(manager);
 
-        // Check against both global and queue limits
-        let total_active: usize = {
-            let counts = self.active_task_counts.lock();
-            counts.values().sum()
-        };
-
-        Ok(active_count < queue_max && total_active < global_max)
-    }
-
-    /// Increment active task count for a queue
-    async fn increment_active(&self, queue_id: &str) {
+        let global_max = self.limits.lock().max_concurrent_tasks;
         let mut counts = self.active_task_counts.lock();
-        *counts.entry(queue_id.to_string()).or_insert(0) += 1;
-    }
-
-    /// Decrement active task count for a queue
-    async fn decrement_active(&self, queue_id: &str) {
-        let mut counts = self.active_task_counts.lock();
-        if let Some(c) = counts.get_mut(queue_id) {
-            *c = c.saturating_sub(1);
+        let queue_active = *counts.get(&queue_id).unwrap_or(&0);
+        let total_active: usize = counts.values().sum();
+        if queue_active >= queue_max || total_active >= global_max {
+            return Err("已达到最大并发任务数上限".into());
         }
+        *counts.entry(queue_id.clone()).or_insert(0) += 1;
+        Ok(ActiveSlot {
+            counts: self.active_task_counts.clone(),
+            queue_id,
+        })
     }
 
     pub async fn start_download(
@@ -846,21 +1062,6 @@ impl Scheduler {
             }
         }
 
-        // Determine which queue this task belongs to
-        let queue_id = {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
-            manager
-                .get_task_queue(task_id)
-                .await
-                .unwrap_or_else(|| manager.default_queue_id.clone())
-        };
-
-        // Check queue can accept more tasks
-        if !self.can_start_for_queue(&queue_id).await? {
-            return Err("已达到最大并发任务数上限".to_string());
-        }
-
         let tasks = self.tasks.clone();
         let task = tasks
             .lock()
@@ -869,15 +1070,19 @@ impl Scheduler {
             .cloned()
             .ok_or_else(|| "任务不存在".to_string())?;
         {
+            let status = task.status.lock().await;
+            if *status != TaskStatus::Pending && *status != TaskStatus::Paused {
+                return Err("任务状态不允许开始".to_string());
+            }
+        }
+        let active_slot = self.reserve_active_slot(task_id).await?;
+        {
             let mut st = task.status.lock().await;
             if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
                 return Err("任务状态不允许开始".to_string());
             }
             *st = TaskStatus::Downloading;
         }
-
-        // Mark this queue as having an active task
-        self.increment_active(&queue_id).await;
 
         if let Some(parent) = std::path::Path::new(&task.save_path).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -887,7 +1092,6 @@ impl Scheduler {
         let scheduler_self = scheduler_for_save
             .clone()
             .unwrap_or_else(|| Arc::new(self.clone()));
-        let queue_id_clone = queue_id.clone();
 
         let n_workers = if task.supports_range {
             max_connections.unwrap_or(8).clamp(1, 32)
@@ -928,9 +1132,10 @@ impl Scheduler {
                         ),
                     );
                 }
-                scheduler_self.decrement_active(&queue_id_clone).await;
                 if let Some(s) = scheduler_for_save {
-                    s.save_tasks().await;
+                    if let Err(error) = s.save_tasks().await {
+                        eprintln!("[persistence-error] worker setup: {error}");
+                    }
                 }
                 return Ok(());
             }
@@ -939,10 +1144,10 @@ impl Scheduler {
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id_s.clone();
         let scheduler_clone = scheduler_self.clone();
-        let queue_id_final = queue_id.clone();
         let max_retries = scheduler_self.limits.lock().max_retries;
 
         tokio::spawn(async move {
+            let _active_slot = active_slot;
             let mut retry_attempts: u32 = 0;
             loop {
                 // 每轮尝试独立创建 writer 与通道：失败重试时不截断已有数据
@@ -1031,13 +1236,13 @@ impl Scheduler {
                 break;
             }
 
-            // Decrement active count on final completion
-            scheduler_clone.decrement_active(&queue_id_final).await;
             if let Some(app) = app_handle_clone {
                 let _ = app.emit("download-progress", ());
             }
             if let Some(s) = scheduler_for_save {
-                s.save_tasks().await;
+                if let Err(error) = s.save_tasks().await {
+                    eprintln!("[persistence-error] HTTP completion: {error}");
+                }
             }
         });
         Ok(())
@@ -1055,27 +1260,22 @@ impl Scheduler {
     ) -> Result<(), String> {
         let task_id = task.id.clone();
 
-        let queue_id = {
-            let qm = &self.queue_manager;
-            let manager = qm.lock().await;
-            manager
-                .get_task_queue(&task_id)
-                .await
-                .unwrap_or_else(|| manager.default_queue_id.clone())
-        };
-        if !self.can_start_for_queue(&queue_id).await? {
-            return Err("已达到最大并发任务数上限".to_string());
-        }
         let was_paused;
+        {
+            let st = task.status.lock().await;
+            if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
+                return Err("任务状态不允许开始".to_string());
+            }
+            was_paused = *st == TaskStatus::Paused;
+        }
+        let active_slot = self.reserve_active_slot(&task_id).await?;
         {
             let mut st = task.status.lock().await;
             if *st != TaskStatus::Pending && *st != TaskStatus::Paused {
                 return Err("任务状态不允许开始".to_string());
             }
-            was_paused = *st == TaskStatus::Paused;
             *st = TaskStatus::Downloading;
         }
-        self.increment_active(&queue_id).await;
 
         let scheduler_self = scheduler_for_save
             .clone()
@@ -1086,8 +1286,9 @@ impl Scheduler {
             ($msg:expr) => {{
                 *task.error_message.lock().await = Some($msg);
                 *task.status.lock().await = TaskStatus::Failed;
-                self.decrement_active(&queue_id).await;
-                scheduler_self.save_tasks().await;
+                if let Err(error) = scheduler_self.save_tasks().await {
+                    eprintln!("[persistence-error] torrent failure: {error}");
+                }
                 if let Some(app) = &app_handle {
                     let _ = app.emit(
                         "download-finished",
@@ -1173,9 +1374,9 @@ impl Scheduler {
         }
 
         let app_handle_clone = app_handle.clone();
-        let queue_id_final = queue_id.clone();
         let selected = meta.selected_files.clone();
         tokio::spawn(async move {
+            let _active_slot = active_slot;
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // 做种计时起点（ratio / time 策略在完成后继续轮询，到点暂停）
@@ -1284,11 +1485,12 @@ impl Scheduler {
                 }
             }
 
-            scheduler_self.decrement_active(&queue_id_final).await;
             if let Some(app) = &app_handle_clone {
                 let _ = app.emit("download-progress", ());
             }
-            scheduler_self.save_tasks().await;
+            if let Err(error) = scheduler_self.save_tasks().await {
+                eprintln!("[persistence-error] torrent completion: {error}");
+            }
         });
 
         Ok(())
@@ -1341,7 +1543,7 @@ impl Scheduler {
                 .ok_or_else(|| "任务不存在".to_string())?
         };
         Self::reset_failed_task(&task).await?;
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1364,7 +1566,7 @@ impl Scheduler {
             }
         }
         drop(tasks);
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(n)
     }
 
@@ -1430,7 +1632,7 @@ impl Scheduler {
                 }
             }
         }
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1475,7 +1677,7 @@ impl Scheduler {
             }
             tasks.remove(task_id);
         }
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1509,7 +1711,7 @@ impl Scheduler {
                 tasks.remove(id);
             }
         }
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(to_remove.len())
     }
 
@@ -1539,7 +1741,7 @@ impl Scheduler {
         pt.url = probe_result.final_url;
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, Arc::new(Task::from_persisted(pt)));
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1572,7 +1774,7 @@ impl Scheduler {
             .to_string();
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, Arc::new(Task::from_persisted(pt)));
-        self.save_tasks().await;
+        self.save_tasks().await?;
         Ok(())
     }
 
@@ -1677,6 +1879,8 @@ impl Scheduler {
         &self,
         manager: &crate::engine::queue::QueueManager,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        self.inject_persistence_failure("queues")?;
         if let Some(path) = &self.queue_store_path {
             manager.save_to(path).await.map_err(|error| {
                 format!("queue persistence failed ({}): {error}", path.display())
@@ -1760,7 +1964,7 @@ impl Scheduler {
         urls: Vec<String>,
         template: Option<String>,
         start_index: Option<usize>,
-        _queue_id: Option<String>,
+        queue_id: Option<String>,
         save_dir: Option<String>,
     ) -> Result<String, String> {
         let template = template.unwrap_or_default();
@@ -1772,6 +1976,12 @@ impl Scheduler {
             save_dir,
         );
         let dir = batch.save_dir.clone().unwrap_or_default();
+        let target_queue = match queue_id {
+            Some(queue_id) => queue_id,
+            None => self.queue_manager.lock().await.default_queue_id.clone(),
+        };
+        let mut prepared = Vec::new();
+        let mut replaced_task_ids = Vec::new();
         for (i, url) in batch.urls.clone().iter().enumerate() {
             let filename = if template.is_empty() {
                 None
@@ -1782,32 +1992,43 @@ impl Scheduler {
                     batch.start_index + i,
                 ))
             };
-            if let Ok(id) = self
-                .create_task_internal(
+            let rename_needed = if let Some(existing_id) = self.find_duplicate(url).await {
+                match self.duplicate_resolution(&existing_id) {
+                    Ok((rename, replacement)) => {
+                        replaced_task_ids.extend(replacement);
+                        rename
+                    }
+                    Err(_) => {
+                        batch.added_count = i + 1;
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
+            if let Ok(task) = self
+                .prepare_http_task(
                     url.clone(),
                     dir.clone(),
                     filename,
                     None,
-                    false,
+                    rename_needed,
                     None,
                     Vec::new(),
                     true,
                 )
                 .await
             {
-                batch.task_ids.push(id);
+                batch.task_ids.push(task.id.clone());
+                prepared.push(Arc::new(task));
             }
             batch.added_count = i + 1;
         }
         let id = batch.id.clone();
-        let _transaction = self.lifecycle_persist_lock.lock().await;
-        let previous = self.batch_manager.list_jobs_full().await;
-        self.batch_manager.add_job(batch).await;
-        if let Err(error) = self.persist_batches().await {
-            self.batch_manager.replace_jobs(previous).await;
-            return Err(error);
-        }
-        self.save_tasks().await;
+        replaced_task_ids.sort();
+        replaced_task_ids.dedup();
+        self.commit_created_tasks(prepared, &target_queue, Some(batch), &replaced_task_ids)
+            .await?;
         Ok(id)
     }
 
@@ -1914,6 +2135,8 @@ impl Scheduler {
     }
 
     async fn persist_batches(&self) -> Result<(), String> {
+        #[cfg(test)]
+        self.inject_persistence_failure("batches")?;
         let Some(path) = &self.batch_store_path else {
             return Ok(());
         };
@@ -2161,6 +2384,10 @@ impl Clone for Scheduler {
             torrent_cfg: self.torrent_cfg.clone(),
             torrent_engine: self.torrent_engine.clone(),
             settings: self.settings.clone(),
+            #[cfg(test)]
+            admission_test_barrier: self.admission_test_barrier.clone(),
+            #[cfg(test)]
+            persistence_test_failures: self.persistence_test_failures.clone(),
         }
     }
 }
@@ -2399,6 +2626,38 @@ async fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn spawn_probe_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = vec![0; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://{address}/file.bin"), handle)
+    }
+
+    async fn spawn_hanging_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.push(stream);
+            }
+        });
+        (format!("http://{address}/race"), handle)
+    }
 
     struct InitializationFixture(PathBuf);
 
@@ -2835,6 +3094,239 @@ mod tests {
         assert_eq!(
             restored.batch_manager.list_jobs_full().await.len(),
             before.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn task_creation_is_atomic_when_each_store_fails() {
+        for failed_store in ["tasks", "queues"] {
+            let fixture = InitializationFixture::new();
+            let paths = fixture.paths();
+            let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+            let failed_path = if failed_store == "tasks" {
+                &paths.tasks
+            } else {
+                &paths.queues
+            };
+            std::fs::create_dir(failed_path).unwrap();
+
+            let result = scheduler
+                .create_task(
+                    format!("https://example.com/{failed_store}.bin"),
+                    fixture.0.to_string_lossy().into_owned(),
+                    Some(format!("{failed_store}.bin")),
+                    Some(ProbeResult {
+                        supports_range: true,
+                        total_bytes: Some(10),
+                        suggested_filename: format!("{failed_store}.bin"),
+                        final_url: format!("https://example.com/{failed_store}.bin"),
+                        ..Default::default()
+                    }),
+                )
+                .await;
+
+            assert!(result.is_err(), "{failed_store} write reported success");
+            assert!(scheduler.list_downloads().await.is_empty());
+            assert!(scheduler
+                .queue_manager
+                .lock()
+                .await
+                .queues
+                .values()
+                .all(|queue| queue.lock().task_ids.is_empty()));
+            std::fs::remove_dir(failed_path).unwrap();
+            let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{failed_store}: {warnings:?}");
+            assert!(restored.list_downloads().await.is_empty());
+            assert!(restored
+                .queue_manager
+                .lock()
+                .await
+                .queues
+                .values()
+                .all(|queue| queue.lock().task_ids.is_empty()));
+        }
+    }
+
+    #[tokio::test]
+    async fn compensation_failure_reports_primary_and_rollback_and_keeps_known_durable_state() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        scheduler.install_persistence_test_failures(&["queues", "tasks"]);
+
+        let error = scheduler
+            .create_task(
+                "https://example.com/rollback.bin".into(),
+                fixture.0.to_string_lossy().into_owned(),
+                Some("rollback.bin".into()),
+                Some(ProbeResult {
+                    supports_range: true,
+                    total_bytes: Some(10),
+                    suggested_filename: "rollback.bin".into(),
+                    final_url: "https://example.com/rollback.bin".into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("injected queues persistence failure"));
+        assert!(error.contains("rollback persistence failed"));
+        assert!(error.contains("injected tasks persistence failure"));
+        assert_eq!(scheduler.list_downloads().await.len(), 1);
+        assert!(scheduler
+            .queue_manager
+            .lock()
+            .await
+            .queues
+            .values()
+            .all(|queue| queue.lock().task_ids.is_empty()));
+        assert_eq!(
+            crate::engine::persistence::load_tasks_report(&paths.tasks)
+                .unwrap()
+                .data
+                .len(),
+            1
+        );
+        assert!(!paths.queues.exists());
+    }
+
+    #[tokio::test]
+    async fn batch_creation_rolls_back_tasks_queues_and_batch_when_batch_store_fails() {
+        let fixture = InitializationFixture::new();
+        let paths = fixture.paths();
+        let (scheduler, _) = Scheduler::initialize(paths.clone(), Default::default()).unwrap();
+        std::fs::create_dir(&paths.batches).unwrap();
+        let (url, server) = spawn_probe_server().await;
+
+        let result = scheduler
+            .create_batch(
+                "Atomic".into(),
+                vec![url],
+                None,
+                None,
+                None,
+                Some(fixture.0.to_string_lossy().into_owned()),
+            )
+            .await;
+
+        server.abort();
+        assert!(result.is_err());
+        assert!(scheduler.list_downloads().await.is_empty());
+        assert!(scheduler.list_batches().await.is_empty());
+        assert!(scheduler
+            .queue_manager
+            .lock()
+            .await
+            .queues
+            .values()
+            .all(|queue| queue.lock().task_ids.is_empty()));
+        std::fs::remove_dir(&paths.batches).unwrap();
+        let (restored, warnings) = Scheduler::initialize(paths, Default::default()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(restored.list_downloads().await.is_empty());
+        assert!(restored.list_batches().await.is_empty());
+        assert!(restored
+            .queue_manager
+            .lock()
+            .await
+            .queues
+            .values()
+            .all(|queue| queue.lock().task_ids.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_starts_reserve_only_one_slot_at_limit_one() {
+        let fixture = InitializationFixture::new();
+        let (scheduler, _) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        scheduler.update_from_settings(&crate::settings::AppSettings {
+            max_concurrent_tasks: 1,
+            ..Default::default()
+        });
+        let queue_id = scheduler
+            .queue_manager
+            .lock()
+            .await
+            .default_queue_id
+            .clone();
+        scheduler
+            .update_queue(&queue_id, None, None, Some(1), None)
+            .await
+            .unwrap();
+        let (url, server) = spawn_hanging_server().await;
+        let mut ids = Vec::new();
+        for index in 0..2 {
+            ids.push(
+                scheduler
+                    .create_task(
+                        format!("{url}-{index}"),
+                        fixture.0.to_string_lossy().into_owned(),
+                        Some(format!("race-{index}")),
+                        Some(ProbeResult {
+                            supports_range: false,
+                            total_bytes: Some(10),
+                            suggested_filename: format!("race-{index}"),
+                            final_url: format!("{url}-{index}"),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        scheduler.install_admission_test_barrier(2);
+        let (first, second) = tokio::join!(
+            scheduler.start_download(&ids[0], None, None, Some(1), None),
+            scheduler.start_download(&ids[1], None, None, Some(1), None),
+        );
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert_eq!(
+            scheduler.active_task_counts.lock().values().sum::<usize>(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_slot_is_released_when_worker_setup_fails() {
+        let fixture = InitializationFixture::new();
+        let (scheduler, _) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+        let task_id = scheduler
+            .create_task(
+                "https://example.com/setup-failure".into(),
+                fixture.0.to_string_lossy().into_owned(),
+                Some("setup-failure".into()),
+                Some(ProbeResult {
+                    supports_range: false,
+                    total_bytes: Some(10),
+                    suggested_filename: "setup-failure".into(),
+                    final_url: "https://example.com/setup-failure".into(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        scheduler
+            .start_download(
+                &task_id,
+                None,
+                None,
+                Some(1),
+                Some(NetworkOptions {
+                    proxy_url: Some("://invalid proxy".into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(scheduler.active_task_counts.lock().is_empty());
+        assert_eq!(
+            scheduler.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Failed
         );
     }
 
