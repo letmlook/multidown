@@ -161,6 +161,7 @@ pub fn load_batches_report(path: &std::path::Path) -> Result<crate::storage::Loa
     })
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "wired by scheduler lifecycle persistence"))]
 pub async fn save_batches(path: &std::path::Path, batches: &[BatchJobRecord]) -> std::io::Result<()> {
     crate::storage::save_store(path, 1, &batches).map_err(std::io::Error::other)
 }
@@ -717,7 +718,7 @@ mod tests {
             assert!(serde_json::from_value::<BatchJobRecord>(raw.clone()).is_err());
             let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
             assert_eq!(rejected[0]["value"].get(cursor_key), Some(&serde_json::Value::Null));
-            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(path.with_extension("json.bak")).unwrap(), original);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -781,7 +782,7 @@ mod tests {
             assert_eq!(report.warnings[0].record_key.as_deref(), Some("invalid"));
             let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
             assert_eq!(rejected[0]["value"][cursor_key], 2);
-            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read(path.with_extension("json.bak")).unwrap(), original);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }

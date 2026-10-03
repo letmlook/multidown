@@ -45,6 +45,8 @@ pub enum StoreError {
     UnsupportedVersion(u32),
     #[error("invalid store envelope: {0}")]
     InvalidEnvelope(String),
+    #[error("migration write failed: {0}")]
+    Migration(#[source] Box<StoreError>),
     #[error("{domain}: {message}; preserved at {recovery_path}")]
     Corrupt {
         domain: String,
@@ -53,7 +55,7 @@ pub enum StoreError {
     },
 }
 
-pub fn load_store<T>(
+pub fn load_store<T: Serialize>(
     path: &Path,
     domain: &'static str,
     migrate: impl FnOnce(u32, Value) -> Result<(T, Vec<RecoveryWarning>), StoreError>,
@@ -106,6 +108,11 @@ pub fn load_store<T>(
         }
         Some(recovery)
     };
+    if schema_version == 0 {
+        // Quarantine must exist before rejected legacy records leave the current file.
+        // Keep write failures distinct from a missing source on the first run.
+        save_store(path, 1, &data).map_err(|error| StoreError::Migration(Box::new(error)))?;
+    }
     Ok(LoadReport {
         data,
         warnings,
@@ -345,6 +352,39 @@ mod tests {
     }
 
     #[test]
+    fn migration_on_read_preserves_legacy_backup_and_rewrites_once() {
+        let fixture = Fixture::new();
+        let original = b"[\n  \"legacy\"\n]\n";
+        fs::write(fixture.path(), original).unwrap();
+        let report = load_store(&fixture.path(), "tasks", |_, data| Ok((data, vec![]))).unwrap();
+        assert!(report.migrated);
+        assert_eq!(report.schema_version, 0);
+        let disk: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"], json!(["legacy"]));
+        assert_eq!(fs::read(fixture.0.join("tasks.json.bak")).unwrap(), original);
+        let second = load_store(&fixture.path(), "tasks", |_, data| Ok((data, vec![]))).unwrap();
+        assert!(!second.migrated);
+        assert_eq!(second.schema_version, 1);
+        assert!(!fixture.0.join("tasks.json.bak.1").exists());
+    }
+
+    #[test]
+    fn migration_on_read_propagates_write_failure_and_keeps_legacy_source() {
+        let fixture = Fixture::new();
+        let original = b"[\"legacy\"]";
+        fs::write(fixture.path(), original).unwrap();
+        FAIL_REPLACE.with(|flag| flag.set(true));
+        let result = load_store(&fixture.path(), "tasks", |_, data| Ok((data, vec![])));
+        FAIL_REPLACE.with(|flag| flag.set(false));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("migration write failed") && error.contains("injected replace failure"));
+        assert_eq!(fs::read(fixture.path()).unwrap(), original);
+        assert_eq!(fs::read(fixture.0.join("tasks.json.bak")).unwrap(), original);
+        assert!(!fs::read_dir(&fixture.0).unwrap().any(|entry| entry.unwrap().path().extension().is_some_and(|ext| ext == "tmp")));
+    }
+
+    #[test]
     fn version_one_envelope_round_trips() {
         let fixture = Fixture::new();
         save_store(&fixture.path(), 1, &vec!["task"]).unwrap();
@@ -441,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_records_preserve_valid_data_and_quarantine_rejected_value() {
+    fn migration_on_read_preserves_mixed_record_evidence_and_rewrites_valid_records() {
         let fixture = Fixture::new();
         fs::write(fixture.path(), r#"["valid",42]"#).unwrap();
         let report = load_store(&fixture.path(), "tasks", |_, data| {
@@ -481,9 +521,12 @@ mod tests {
             .get("rejected_value")
             .is_none());
         assert_eq!(
-            fs::read_to_string(fixture.path()).unwrap(),
+            fs::read_to_string(fixture.0.join("tasks.json.bak")).unwrap(),
             r#"["valid",42]"#
         );
+        let disk: Value = serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"], json!(["valid"]));
     }
 
     #[test]

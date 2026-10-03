@@ -62,6 +62,17 @@ pub(crate) fn recover_load<T: Default>(
 ) -> Result<T, String> {
     match report {
         Ok(mut report) => {
+            if report.migrated || report.recovery_path.is_some() {
+                eprintln!("[persistence-audit] {}", serde_json::json!({
+                    "event": "store_loaded",
+                    "domain": domain,
+                    "source_path": path,
+                    "source_schema_version": report.schema_version,
+                    "migrated_to_schema": report.migrated.then_some(1),
+                    "recovery_path": report.recovery_path,
+                    "warning_count": report.warnings.len(),
+                }));
+            }
             // Loaders may generate fresh quarantine IDs; the UI needs stable IDs across reloads.
             for (index, warning) in report.warnings.iter_mut().enumerate() {
                 warning.id = format!("{domain}:record:{index}");
@@ -2203,8 +2214,8 @@ mod tests {
         let fixture = InitializationFixture::new();
         std::fs::write(fixture.0.join("tasks.json"), b"{truncated").unwrap();
         fixture.write("queues.json", serde_json::json!({"wrong":"shape"}));
-        fixture.write("batches.json", serde_json::json!([{"id":"invalid-batch"}]));
-        fixture.write("category_rules.json", serde_json::json!([{"id":"invalid-rule"}]));
+        fixture.write("batches.json", serde_json::json!({"schema_version":1,"written_at":"2026-10-03T00:00:00Z","data":[{"id":"invalid-batch"}]}));
+        fixture.write("category_rules.json", serde_json::json!({"schema_version":1,"written_at":"2026-10-03T00:00:00Z","data":[{"id":"invalid-rule"}]}));
         let (_, warnings) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
         assert_eq!(warnings.len(), 4);
         let (_, repeated) = Scheduler::initialize(fixture.paths(), Default::default()).unwrap();

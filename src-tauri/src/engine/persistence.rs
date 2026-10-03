@@ -2,7 +2,9 @@
 
 use crate::engine::task::Task;
 use crate::engine::types::{TaskId, TaskKind, TaskStatus, TorrentMeta};
-use crate::storage::{LoadReport, RecoveryWarning, StoreError, VersionedEnvelope};
+use crate::storage::{LoadReport, RecoveryWarning, StoreError};
+#[cfg(test)]
+use crate::storage::VersionedEnvelope;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
@@ -61,6 +63,7 @@ fn deserialize_recovery_status<'de, D: serde::Deserializer<'de>>(
     TaskStatus::deserialize(deserializer).map(recovery_status)
 }
 
+#[cfg(test)]
 pub fn tasks_to_json(tasks: &[PersistedTask]) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&VersionedEnvelope {
         schema_version: 1,
@@ -69,6 +72,7 @@ pub fn tasks_to_json(tasks: &[PersistedTask]) -> Result<String, serde_json::Erro
     })
 }
 
+#[cfg(test)]
 pub fn tasks_from_json(s: &str) -> Result<Vec<PersistedTask>, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(s)?;
     let (version, data) = if value.get("schema_version").is_some() {
@@ -322,9 +326,6 @@ mod tests {
         let directory = TestDirectory::new();
         let path = directory.path().join("tasks.json");
         std::fs::write(&path, fixture.to_string()).unwrap();
-        let tasks = load_tasks_from_file(&path).unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].filename, "big.zip");
         let report = load_tasks_report(&path).unwrap();
         assert_eq!(report.schema_version, 0);
         assert!(report.migrated);
@@ -334,6 +335,14 @@ mod tests {
         assert!(!warning.contains("private"));
         let quarantined = std::fs::read_to_string(report.recovery_path.unwrap()).unwrap();
         assert!(quarantined.contains("private"));
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bak")).unwrap(), fixture.to_string());
+        let tasks = load_tasks_from_file(&path).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].filename, "big.zip");
+        let reloaded = load_tasks_report(&path).unwrap();
+        assert_eq!(reloaded.schema_version, 1);
+        assert!(!reloaded.migrated);
+        assert!(reloaded.warnings.is_empty());
         assert!(std::fs::read_dir(directory.path())
             .unwrap()
             .any(|entry| entry

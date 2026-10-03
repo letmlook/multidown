@@ -20,7 +20,7 @@ mod tests {
         assert_eq!(quarantined[0]["value"]["match_type"], "unknown");
         assert_eq!(quarantined[1]["value"]["name"], "Duplicate");
         assert_eq!(quarantined[2]["value"], 42);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bak")).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -59,7 +59,7 @@ use crate::storage::{load_store, save_store, LoadReport, RecoveryWarning, StoreE
 use serde_json::Value;
 
 /// Decode records independently so one rejected record cannot discard its peers.
-pub(crate) fn load_records<T>(
+pub(crate) fn load_records<T: serde::Serialize>(
     path: &Path,
     domain: &'static str,
     decode: impl Fn(Value) -> Result<T, String>,
