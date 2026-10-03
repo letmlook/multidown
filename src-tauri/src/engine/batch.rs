@@ -41,19 +41,67 @@ pub struct BatchJob {
 
 /// Durable batch inputs and task membership. Progress summaries are recomputed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "BatchJobRecordWire")]
 pub struct BatchJobRecord {
     pub id: String,
     pub name: String,
     pub urls: Vec<String>,
-    #[serde(default)]
     pub template: String,
-    #[serde(default)]
     pub start_index: usize,
     pub save_dir: Option<String>,
     pub task_ids: Vec<String>,
     pub created_at: i64,
-    #[serde(default = "pending_batch_status")]
     pub status: BatchStatus,
+    /// Dispatch cursor: attempted URLs, including unsuccessful task creation.
+    pub next_url_index: usize,
+}
+
+#[derive(Deserialize)]
+struct BatchJobRecordWire {
+    id: String,
+    name: String,
+    urls: Vec<String>,
+    #[serde(default)]
+    template: String,
+    #[serde(default)]
+    start_index: usize,
+    save_dir: Option<String>,
+    task_ids: Vec<String>,
+    created_at: i64,
+    #[serde(default = "pending_batch_status")]
+    status: BatchStatus,
+    next_url_index: Option<usize>,
+    added_count: Option<usize>,
+}
+
+impl TryFrom<BatchJobRecordWire> for BatchJobRecord {
+    type Error = String;
+
+    fn try_from(record: BatchJobRecordWire) -> Result<Self, Self::Error> {
+        for (key, cursor) in [
+            ("next_url_index", record.next_url_index),
+            ("added_count", record.added_count),
+        ] {
+            if cursor.is_some_and(|index| index > record.urls.len()) {
+                return Err(format!("{key} exceeds batch URL count"));
+            }
+        }
+        let next_url_index = record.next_url_index
+            .or(record.added_count)
+            .unwrap_or_else(|| record.task_ids.len().min(record.urls.len()));
+        Ok(Self {
+            id: record.id,
+            name: record.name,
+            urls: record.urls,
+            template: record.template,
+            start_index: record.start_index,
+            save_dir: record.save_dir,
+            task_ids: record.task_ids,
+            created_at: record.created_at,
+            status: record.status,
+            next_url_index,
+        })
+    }
 }
 
 fn pending_batch_status() -> BatchStatus {
@@ -72,6 +120,7 @@ impl From<&BatchJob> for BatchJobRecord {
             task_ids: job.task_ids.clone(),
             created_at: job.created_at,
             status: job.status,
+            next_url_index: job.added_count,
         }
     }
 }
@@ -80,7 +129,7 @@ impl From<BatchJobRecord> for BatchJob {
     fn from(record: BatchJobRecord) -> Self {
         Self {
             total_count: record.urls.len(),
-            added_count: record.task_ids.len().min(record.urls.len()),
+            added_count: record.next_url_index,
             id: record.id,
             name: record.name,
             urls: record.urls,
@@ -622,6 +671,70 @@ fn probe_batch(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn dispatch_cursor_survives_restart_when_one_task_creation_failed() {
+        let dir = std::env::temp_dir().join(format!("batch-cursor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = batches_path(&dir);
+        let mut job = BatchJob::new(
+            "Files".into(),
+            vec!["https://example.com/a".into(), "https://example.com/b".into(), "https://example.com/c".into()],
+            "file_{n}".into(), 7, Some("/files".into()),
+        );
+        job.added_count = 2;
+        job.task_ids = vec!["successful-task".into()];
+        save_batches(&path, &[BatchJobRecord::from(&job)]).await.unwrap();
+        let restored: BatchJob = load_batches_report(&path).unwrap().data.remove(0).into();
+        assert_eq!(restored.added_count, 2);
+        assert_eq!(restored.remaining(), 1);
+        assert_eq!(restored.urls[restored.added_count], "https://example.com/c");
+        assert_eq!(apply_filename_template(&restored.template, &restored.urls[restored.added_count], restored.added_count + restored.start_index), "file_9");
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["data"][0]["next_url_index"], 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_added_count_restores_cursor_independently_of_task_membership() {
+        let record: BatchJobRecord = serde_json::from_str(r#"{"id":"legacy","name":"Files","urls":["https://example.com/a","https://example.com/b","https://example.com/c"],"save_dir":"/files","task_ids":["task-1"],"created_at":1700000000,"added_count":2}"#).unwrap();
+        let job: BatchJob = record.into();
+        assert_eq!(job.added_count, 2);
+        assert_eq!(job.remaining(), 1);
+        assert_eq!(serde_json::to_value(BatchJobRecord::from(&job)).unwrap()["next_url_index"], 2);
+    }
+
+    #[test]
+    fn explicit_out_of_bounds_cursors_are_quarantined_per_batch() {
+        for cursor_key in ["next_url_index", "added_count"] {
+            let dir = std::env::temp_dir().join(format!("batch-invalid-cursor-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = batches_path(&dir);
+            let mut invalid = serde_json::json!({"id":"invalid","name":"Bad","urls":["https://example.com/a"],"task_ids":[],"created_at":1700000000});
+            invalid[cursor_key] = serde_json::json!(2);
+            let valid = serde_json::json!({"id":"valid","name":"Good","urls":["https://example.com/a"],"task_ids":["task-1"],"created_at":1700000000,"next_url_index":1});
+            let original = serde_json::to_vec(&serde_json::json!([valid, invalid])).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let report = load_batches_report(&path).unwrap();
+            assert_eq!(report.data.len(), 1, "{cursor_key}");
+            assert_eq!(report.data[0].id, "valid");
+            assert_eq!(report.warnings.len(), 1);
+            assert_eq!(report.warnings[0].record_key.as_deref(), Some("invalid"));
+            let rejected: serde_json::Value = serde_json::from_slice(&std::fs::read(report.recovery_path.unwrap()).unwrap()).unwrap();
+            assert_eq!(rejected[0]["value"][cursor_key], 2);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_cursor_uses_bounded_membership_and_new_cursor_wins_over_legacy() {
+        let fallback: BatchJobRecord = serde_json::from_str(r#"{"id":"fallback","name":"Files","urls":["https://example.com/a"],"task_ids":["task-1","task-2"],"created_at":1700000000}"#).unwrap();
+        let job: BatchJob = fallback.into();
+        assert_eq!(job.added_count, 1);
+        assert_eq!(serde_json::to_value(BatchJobRecord::from(&job)).unwrap()["next_url_index"], 1);
+        let explicit: BatchJobRecord = serde_json::from_str(r#"{"id":"explicit","name":"Files","urls":["https://example.com/a","https://example.com/b"],"task_ids":["task-1"],"created_at":1700000000,"next_url_index":2,"added_count":1}"#).unwrap();
+        assert_eq!(BatchJob::from(explicit).added_count, 2);
+    }
+    #[tokio::test]
     async fn minimal_batch_fixture_round_trips_and_quarantines_summary_only_record() {
         let dir = std::env::temp_dir().join(format!("batches-recovery-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -644,6 +757,7 @@ mod tests {
         assert_eq!(reloaded.data[0].task_ids, vec!["task-1"]);
         let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(disk["schema_version"], 1);
+        assert_eq!(disk["data"][0]["next_url_index"], 1);
         for field in ["total_count", "added_count", "task_count", "completed_count", "failed_count"] {
             assert!(disk["data"][0].get(field).is_none());
         }
