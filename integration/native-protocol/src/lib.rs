@@ -291,6 +291,156 @@ impl NativeResponse {
     }
 }
 
+/// Tauri 应用标识符（tauri.conf.json `identifier`），端口文件位于
+/// 应用数据目录下。
+pub const APP_IDENTIFIER: &str = "com.multidown.app";
+pub const PORT_FILE_NAME: &str = "native_host_port.txt";
+/// 桌面端握手标记：test_connection 的应答必须携带它才算连接成功。
+pub const DESKTOP_HANDSHAKE: &str = "multidown";
+
+/// 平台区分。端口文件位置必须与 Tauri 的 `app_data_dir` 完全一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Windows,
+    MacOS,
+    Linux,
+}
+
+/// 解析各平台端口文件路径。
+///
+/// - Windows: `{home}/AppData/Roaming/{identifier}/native_host_port.txt`
+/// - macOS:   `{home}/Library/Application Support/{identifier}/native_host_port.txt`
+/// - Linux:   `{data_home | home/.local/share}/{identifier}/native_host_port.txt`
+///
+/// `data_home` 对应 `XDG_DATA_HOME`；Tauri 的 Linux 数据目录遵循同一规则，
+/// 桌面端与 Native Host 必须解析到同一个文件。
+pub fn port_file_path(platform: Platform, home: &std::path::Path, data_home: Option<&std::path::Path>) -> std::path::PathBuf {
+    let base = match platform {
+        Platform::Windows => home.join("AppData/Roaming"),
+        Platform::MacOS => home.join("Library/Application Support"),
+        Platform::Linux => data_home
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".local/share")),
+    };
+    base.join(APP_IDENTIFIER).join(PORT_FILE_NAME)
+}
+
+/// 读取端口文件。文件缺失、内容不是 1-65535 的十进制端口、或端口为 0
+/// （历史写入过占位值）都返回 `None`——调用方必须把它当作"桌面未就绪"。
+pub fn read_port_file(path: &std::path::Path) -> Option<u16> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let port = text.trim().parse::<u16>().ok()?;
+    (port != 0).then_some(port)
+}
+
+/// 与桌面端建立 TCP 并完成握手：发送 `test_connection` 请求，
+/// 应答必须是 `{"ok":true,"handshake":"multidown",...}`。
+/// 端口文件过期、端口被别的进程占用等情况都会在这里被拒绝。
+pub fn connect_and_handshake(
+    port: u16,
+    request_id: &str,
+    io_timeout: std::time::Duration,
+) -> Result<(), NativeError> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let address = format!("127.0.0.1:{port}");
+    let mut stream = std::net::TcpStream::connect(&address).map_err(|error| {
+        NativeError::new(
+            NativeErrorCode::DesktopUnavailable,
+            format!("connect {address} failed: {error}"),
+        )
+    })?;
+    stream
+        .set_read_timeout(Some(io_timeout))
+        .map_err(|error| NativeError::new(NativeErrorCode::DesktopError, error.to_string()))?;
+    stream
+        .set_write_timeout(Some(io_timeout))
+        .map_err(|error| NativeError::new(NativeErrorCode::DesktopError, error.to_string()))?;
+
+    let request = NativeRequest {
+        version: PROTOCOL_VERSION,
+        request_id: request_id.to_string(),
+        payload: NativePayload::TestConnection,
+    };
+    let line = serde_json::to_string(&request)
+        .map_err(|error| NativeError::new(NativeErrorCode::DesktopError, error.to_string()))?;
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.write_all(b"\n"))
+        .and_then(|_| stream.flush())
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::DesktopUnavailable,
+                format!("handshake write failed: {error}"),
+            )
+        })?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    reader
+        .read_line(&mut reply)
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::DesktopUnavailable,
+                format!("handshake read failed: {error}"),
+            )
+        })?;
+    validate_handshake_reply(reply.as_bytes())
+}
+
+/// 校验桌面端握手应答：`ok` 为真且携带 multidown 握手标记。
+pub fn validate_handshake_reply(bytes: &[u8]) -> Result<(), NativeError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        NativeError::new(
+            NativeErrorCode::DesktopError,
+            format!("handshake reply is not json: {error}"),
+        )
+    })?;
+    let ok = value.get("ok").and_then(serde_json::Value::as_bool);
+    let marker = value.get("handshake").and_then(serde_json::Value::as_str);
+    if ok == Some(true) && marker == Some(DESKTOP_HANDSHAKE) {
+        Ok(())
+    } else {
+        Err(NativeError::new(
+            NativeErrorCode::DesktopError,
+            format!("unexpected handshake reply: ok={ok:?} handshake={marker:?}"),
+        ))
+    }
+}
+
+/// 确保桌面端可达：先尝试现有端口文件，失败则通过 OS 拉起 `multidown://open`
+/// 并在预算时间内轮询"新鲜"的 TCP 握手。过期的端口文件永远不会被当成成功。
+///
+/// `launch` 只会被调用一次（首次失败时）；调用方负责它的平台实现。
+pub fn ensure_desktop_connection(
+    port_file: &std::path::Path,
+    launch: impl Fn(),
+    request_id: &str,
+    budget: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<u16, NativeError> {
+    let started = std::time::Instant::now();
+    let mut launched = false;
+    loop {
+        if let Some(port) = read_port_file(port_file) {
+            if connect_and_handshake(port, request_id, std::time::Duration::from_secs(1)).is_ok() {
+                return Ok(port);
+            }
+        }
+        if !launched {
+            launch();
+            launched = true;
+        }
+        if started.elapsed() >= budget {
+            return Err(NativeError::new(
+                NativeErrorCode::DesktopUnavailable,
+                "desktop did not become reachable within the launch budget",
+            ));
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,4 +576,191 @@ mod tests {
         assert!(rendered.contains("[redacted"), "{rendered}");
         assert!(rendered.contains("https://example.com/a.bin"), "{rendered}");
     }
+    mod discovery {
+        use super::*;
+        use std::io::{BufReader, BufRead, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        fn listener_thread_once(reply: &'static str) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    // 回应前先确认请求确实是 test_connection 信封
+                    assert!(line.contains("\"action\":\"test_connection\""), "{line}");
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(reply.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            port
+        }
+
+        #[test]
+        fn port_file_paths_match_tauri_app_data_dir_per_platform() {
+            let home = std::path::Path::new("/Users/x");
+            let file = "native_host_port.txt";
+            assert_eq!(
+                port_file_path(Platform::MacOS, home, None),
+                home.join(format!("Library/Application Support/{APP_IDENTIFIER}/{file}"))
+            );
+            let win_home = std::path::Path::new("C:/Users/x");
+            assert_eq!(
+                port_file_path(Platform::Windows, win_home, None),
+                win_home.join(format!("AppData/Roaming/{APP_IDENTIFIER}/{file}"))
+            );
+            let linux_home = std::path::Path::new("/home/x");
+            assert_eq!(
+                port_file_path(Platform::Linux, linux_home, None),
+                linux_home.join(format!(".local/share/{APP_IDENTIFIER}/{file}"))
+            );
+            let xdg = std::path::Path::new("/custom/xdg/data");
+            assert_eq!(
+                port_file_path(Platform::Linux, linux_home, Some(xdg)),
+                xdg.join(format!("{APP_IDENTIFIER}/{file}"))
+            );
+        }
+
+        #[test]
+        fn read_port_file_rejects_missing_malformed_and_zero_ports() {
+            let dir = std::env::temp_dir().join(format!("native-proto-port-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("port.txt");
+
+            assert_eq!(read_port_file(&path), None, "missing file");
+
+            for (content, expected) in [
+                ("abc", None),
+                ("0", None),
+                ("70000", None),
+                ("-1", None),
+                ("", None),
+            ] {
+                std::fs::write(&path, content).unwrap();
+                assert_eq!(read_port_file(&path), expected, "content={content:?}");
+            }
+
+            std::fs::write(&path, " 4242 \n").unwrap();
+            assert_eq!(read_port_file(&path), Some(4242));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn handshake_accepts_the_documented_desktop_reply() {
+            let port = listener_thread_once("{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n");
+            connect_and_handshake(port, "req-hs", Duration::from_secs(2)).unwrap();
+        }
+
+        #[test]
+        fn handshake_replies_without_the_marker_are_rejected() {
+            for reply in [
+                "{\"ok\":true}\n",
+                "{\"ok\":true,\"handshake\":\"other-app\"}\n",
+                "{\"ok\":false,\"handshake\":\"multidown\"}\n",
+                "not json\n",
+            ] {
+                let port = listener_thread_once(reply);
+                let error = connect_and_handshake(port, "req-hs", Duration::from_secs(2)).unwrap_err();
+                assert_eq!(error.code, NativeErrorCode::DesktopError, "{reply}");
+            }
+        }
+
+        #[test]
+        fn refused_connections_report_desktop_unavailable() {
+            // 绑定后立刻释放：端口存在但没有服务在监听
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let dead_port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let error = connect_and_handshake(dead_port, "req-x", Duration::from_secs(1)).unwrap_err();
+            assert_eq!(error.code, NativeErrorCode::DesktopUnavailable);
+        }
+
+        #[test]
+        fn ensure_desktop_connection_launches_once_and_uses_the_fresh_port() {
+            let dir = std::env::temp_dir().join(format!("native-proto-ensure-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let port_file = dir.join("port.txt");
+            // 过期端口文件：指向已关闭的端口，绝不能被当成成功
+            let stale = TcpListener::bind("127.0.0.1:0").unwrap();
+            let stale_port = stale.local_addr().unwrap().port();
+            drop(stale);
+            std::fs::write(&port_file, stale_port.to_string()).unwrap();
+
+            let live = TcpListener::bind("127.0.0.1:0").unwrap();
+            let live_port = live.local_addr().unwrap().port();
+            std::thread::spawn(move || {
+                if let Ok((stream, _)) = live.accept() {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    let _ = reader.read_line(&mut line);
+                    let mut stream = reader.into_inner();
+                    let _ = stream.write_all(b"{\"ok\":true,\"handshake\":\"multidown\"}\n");
+                    let _ = stream.flush();
+                }
+            });
+            // 拉起稍后完成：先延迟写新端口文件
+            let writer_file = port_file.clone();
+            let launch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let launch_counter = launch_count.clone();
+            let launch = move || {
+                launch_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                std::fs::write(&writer_file, live_port.to_string()).unwrap();
+            };
+
+            let port = ensure_desktop_connection(
+                &port_file,
+                launch,
+                "req-ensure",
+                Duration::from_secs(5),
+                Duration::from_millis(40),
+            )
+            .unwrap();
+            assert_eq!(port, live_port, "必须使用新鲜端口而不是过期端口");
+            assert_eq!(
+                launch_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "拉起只发生一次"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn ensure_desktop_connection_times_out_when_nothing_listens() {
+            let dir = std::env::temp_dir().join(format!("native-proto-timeout-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let port_file = dir.join("port.txt");
+            std::fs::write(&port_file, "1").unwrap(); // 永远连不上的端口
+
+            let launch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let launch_counter = launch_count.clone();
+            let launch = move || {
+                launch_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            };
+
+            let error = ensure_desktop_connection(
+                &port_file,
+                launch,
+                "req-timeout",
+                Duration::from_millis(400),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, NativeErrorCode::DesktopUnavailable);
+            assert_eq!(
+                launch_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "超时路径同样只拉起一次"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
 }

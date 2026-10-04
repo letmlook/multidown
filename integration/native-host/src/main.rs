@@ -10,7 +10,10 @@ use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use native_protocol::{DownloadPayload, NativeErrorCode, NativePayload, NativeRequest};
+use native_protocol::{
+    connect_and_handshake, ensure_desktop_connection, read_port_file, DownloadPayload,
+    NativeErrorCode, NativePayload, NativeRequest, Platform,
+};
 
 // 调试日志函数
 fn debug_log(message: &str, data: Option<&str>) {
@@ -81,40 +84,64 @@ fn log_file_path() -> Option<std::path::PathBuf> {
     }
 }
 
-fn port_file_path() -> Option<std::path::PathBuf> {
+/// 与桌面端 Tauri `app_data_dir` 一致的端口文件路径。
+/// 平台 home 的解析必须与 Tauri 的目录约定一致：
+/// Windows = USERPROFILE（AppData/Roaming 由共享 crate 拼接），
+/// macOS = HOME，Linux = HOME + XDG_DATA_HOME。
+fn resolve_platform() -> Platform {
+    if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOS
+    } else {
+        Platform::Linux
+    }
+}
+
+fn env_home() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        std::env::var("APPDATA").ok().map(|d| {
-            std::path::PathBuf::from(d)
-                .join("com.multidown.app")
-                .join("native_host_port.txt")
-        })
+        std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+}
+
+fn port_file_path() -> Option<std::path::PathBuf> {
+    let home = env_home()?;
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from);
+    Some(native_protocol::port_file_path(
+        resolve_platform(),
+        &home,
+        data_home.as_deref(),
+    ))
+}
+
+/// 通过 OS 拉起 multidown://open 深链（open_app 的平台实现）。
+fn launch_desktop_app() {
     #[cfg(target_os = "macos")]
-    {
-        std::env::var("HOME").ok().map(|d| {
-            std::path::PathBuf::from(d)
-                .join("Library")
-                .join("Application Support")
-                .join("com.multidown.app")
-                .join("native_host_port.txt")
-        })
-    }
+    let result = std::process::Command::new("open")
+        .arg("multidown://open")
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/c", "start", "", "multidown://open"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn();
     #[cfg(target_os = "linux")]
-    {
-        let dir = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| std::path::PathBuf::from(h).join(".config"))
-            })?;
-        Some(dir.join("com.multidown.app").join("native_host_port.txt"))
-    }
+    let result = std::process::Command::new("xdg-open")
+        .arg("multidown://open")
+        .spawn();
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+    match result {
+        Ok(_) => debug_log("已通过深链拉起桌面应用", Some("multidown://open")),
+        Err(e) => debug_log("深链拉起失败", Some(&e.to_string())),
     }
 }
 
@@ -173,23 +200,13 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
         )),
     );
 
-    let port = match port_file_path() {
-        Some(p) => {
-            debug_log("读取端口文件", Some(&p.to_string_lossy()));
-            match std::fs::read_to_string(p) {
-                Ok(s) => {
-                    let port = s.trim().parse::<u16>().unwrap_or(0);
-                    debug_log("获取到端口", Some(&port.to_string()));
-                    port
-                }
-                Err(e) => {
-                    debug_log("读取端口文件失败", Some(&e.to_string()));
-                    0
-                }
-            }
+    let port = match port_file_path().and_then(|p| read_port_file(&p)) {
+        Some(port) => {
+            debug_log("获取到端口", Some(&port.to_string()));
+            port
         }
         None => {
-            debug_log("无法获取端口文件路径", None);
+            debug_log("端口文件缺失或无效", None);
             0
         }
     };
@@ -318,10 +335,9 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
 
 /// 转发主程序的捕获配置（总开关 + 域名黑名单），供扩展端过滤
 fn handle_get_config_message(stdout: &mut impl Write) -> bool {
-    let port = match port_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(s) => s.trim().parse::<u16>().unwrap_or(0),
-        None => 0,
-    };
+    let port = port_file_path()
+        .and_then(|p| read_port_file(&p))
+        .unwrap_or(0);
     if port == 0 {
         // 主程序未运行：按默认开启处理，由扩展端继续尝试
         let body = serde_json::json!({
@@ -396,10 +412,9 @@ fn handle_get_config_message(stdout: &mut impl Write) -> bool {
 fn handle_open_window_message(url: &str, stdout: &mut impl Write) -> bool {
     let url = url.to_string();
 
-    let port = match port_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(s) => s.trim().parse::<u16>().unwrap_or(0),
-        None => 0,
-    };
+    let port = port_file_path()
+        .and_then(|p| read_port_file(&p))
+        .unwrap_or(0);
     if port == 0 {
         send_response(
             stdout,
@@ -483,6 +498,67 @@ fn handle_open_window_message(url: &str, stdout: &mut impl Write) -> bool {
     true
 }
 
+/// test_connection：端口文件有效且桌面握手通过才算已连接。
+/// 过期端口文件（桌面已退出但文件残留）在这里被拒绝。
+fn handle_test_connection(stdout: &mut impl Write) -> bool {
+    let Some(port_file) = port_file_path() else {
+        debug_log("无法获取端口文件路径", None);
+        send_response(stdout, false, "无法确定端口文件位置");
+        return false;
+    };
+    let Some(port) = read_port_file(&port_file) else {
+        debug_log("端口文件缺失或无效", Some(&port_file.to_string_lossy()));
+        send_response(
+            stdout,
+            false,
+            "Multidown 未运行或未就绪，请先启动 Multidown",
+        );
+        return false;
+    };
+    match connect_and_handshake(port, "test-connection", std::time::Duration::from_secs(2)) {
+        Ok(()) => {
+            debug_log("桌面握手成功", Some(&port.to_string()));
+            send_response(stdout, true, "已连接");
+            true
+        }
+        Err(error) => {
+            debug_log("桌面握手失败", Some(&format!("{:?}", error.code)));
+            send_response(
+                stdout,
+                false,
+                "Multidown 未运行或未就绪，请先启动 Multidown",
+            );
+            false
+        }
+    }
+}
+
+/// open_app：通过深链拉起桌面应用，并在预算时间内等待新鲜的握手成功。
+fn handle_open_app(stdout: &mut impl Write) -> bool {
+    let Some(port_file) = port_file_path() else {
+        send_response(stdout, false, "无法确定端口文件位置");
+        return false;
+    };
+    match ensure_desktop_connection(
+        &port_file,
+        launch_desktop_app,
+        "open-app",
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_millis(400),
+    ) {
+        Ok(port) => {
+            debug_log("open_app 成功", Some(&port.to_string()));
+            send_response(stdout, true, "已启动 Multidown");
+            true
+        }
+        Err(error) => {
+            debug_log("open_app 超时", Some(&format!("{:?}", error.code)));
+            send_response(stdout, false, "无法启动应用，请手动启动 Multidown");
+            false
+        }
+    }
+}
+
 fn main() {
     debug_log("本地主机启动", None);
 
@@ -542,10 +618,11 @@ fn main() {
                     debug_log("处理配置查询命令", None);
                     handle_get_config_message(&mut stdout);
                 }
-                // 这两个动作的完整处理器由传输生命周期 Task 2 提供
-                NativePayload::TestConnection | NativePayload::OpenApp => {
-                    debug_log("动作尚未实现", Some("port discovery task"));
-                    send_response(&mut stdout, false, "action not implemented yet");
+                NativePayload::TestConnection => {
+                    handle_test_connection(&mut stdout);
+                }
+                NativePayload::OpenApp => {
+                    handle_open_app(&mut stdout);
                 }
             }
         }

@@ -50,8 +50,12 @@ function sendToNativeHost(action, data, useNative = true) {
         }
       });
 
-      const message = JSON.stringify({ action, ...data });
-      debugLog('发送 Native Host 消息', { action, data: data });
+      // 协议 v1：请求携带版本与请求 ID，Host 会原样回显请求 ID
+      const request_id = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const message = JSON.stringify({ version: 1, request_id, action, ...data });
+      debugLog('发送 Native Host 消息', { request_id, action, data });
       port.postMessage(message);
     } catch (e) {
       debugLog('Native Host 连接异常', { error: e.message });

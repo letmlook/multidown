@@ -2415,7 +2415,12 @@ pub fn run() {
                                     ),
                                 }
                             } else {
-                                debug_log(&app_handle_clone, "消息格式无效", Some(&error.to_string()));
+                                // 错误文本可能内嵌输入片段，日志只记错误码
+                                debug_log(
+                                    &app_handle_clone,
+                                    "消息格式无效",
+                                    Some(&format!("{:?}", error.code)),
+                                );
                                 let _ = writer
                                     .write_all(b"{\"ok\":false,\"error\":\"invalid message format\"}\n")
                                     .await;
@@ -2562,12 +2567,26 @@ pub fn run() {
                             let _ = writer.shutdown().await;
                         }
 
-                        // test_connection / open_app 的完整处理器由端口发现任务提供
-                        other @ (native_protocol::NativePayload::TestConnection
-                        | native_protocol::NativePayload::OpenApp) => {
-                            debug_log(&app_handle_clone, "动作尚未实现", Some(&format!("{:?}", other.action())));
+                        // 握手应答必须携带 multidown 标记；Native Host 的
+                        // connect_and_handshake 会校验它，防止别的进程碰巧
+                        // 占用了端口文件里的端口被误判为桌面端。
+                        native_protocol::NativePayload::TestConnection => {
+                            debug_log(&app_handle_clone, "处理握手请求", None);
                             let _ = writer
-                                .write_all(b"{\"ok\":false,\"error\":\"action not implemented yet\"}\n")
+                                .write_all(
+                                    b"{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n",
+                                )
+                                .await;
+                            let _ = writer.shutdown().await;
+                        }
+                        // TCP 连接本身就是"应用已运行"的证明；深链拉起由
+                        // Native Host 侧负责，这里只需确认存活。
+                        native_protocol::NativePayload::OpenApp => {
+                            debug_log(&app_handle_clone, "处理 open_app 请求", None);
+                            let _ = writer
+                                .write_all(
+                                    b"{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n",
+                                )
                                 .await;
                             let _ = writer.shutdown().await;
                         }
