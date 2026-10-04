@@ -9,6 +9,9 @@ use std::fs::OpenOptions;
 use std::io::BufWriter;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+// Windows 拉起深链时需要 CommandExt 才能设置 creation_flags
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use native_protocol::{
     connect_and_handshake, ensure_desktop_connection, read_port_file, DownloadPayload,
