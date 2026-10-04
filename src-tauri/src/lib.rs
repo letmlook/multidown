@@ -698,8 +698,14 @@ async fn delete_proxy_rule(app: tauri::AppHandle, id: String) -> Result<(), Stri
 // 调试日志函数
 fn debug_log(app: &tauri::AppHandle, message: &str, data: Option<&str>) {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    // 日志出口统一脱敏：调用点误传整条 URL / 原始行也不会泄漏
     let log_message = match data {
-        Some(d) => format!("[{}] [Multidown Main] {}: {}", timestamp, message, d),
+        Some(d) => format!(
+            "[{}] [Multidown Main] {}: {}",
+            timestamp,
+            message,
+            native_protocol::sanitize_log_data(d)
+        ),
         None => format!("[{}] [Multidown Main] {}", timestamp, message),
     };
 
@@ -767,6 +773,46 @@ fn app_settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Strin
         .app_data_dir()
         .map_err(|e| e.to_string())
         .map(|p| settings_path(&p))
+}
+
+/// 浏览器扩展握手用的端口文件路径。
+///
+/// 目录来自 Tauri 自己的 `app_data_dir()`（它才是各平台目录的权威），文件名
+/// 取自共享协议 crate 的 `PORT_FILE_NAME`：两侧只靠这个常量对齐，改名时
+/// 编译期就能发现不一致，而不是握手静默失败。
+fn native_port_file_path(app_data: &std::path::Path) -> std::path::PathBuf {
+    app_data.join(native_protocol::PORT_FILE_NAME)
+}
+
+/// 桌面端 → Native Host 的成功应答。`request_id` 必须回显，否则 Host 无法把
+/// 应答关联回请求（见共享 crate 的 `NativeResponse`）。
+fn native_reply_ok(request_id: &str, data: serde_json::Value) -> Vec<u8> {
+    native_protocol::NativeResponse::ok(request_id, data).to_line()
+}
+
+/// 桌面端 → Native Host 的失败应答。
+fn native_reply_error(
+    request_id: &str,
+    code: native_protocol::NativeErrorCode,
+    message: &str,
+) -> Vec<u8> {
+    native_protocol::NativeResponse::error(
+        request_id,
+        native_protocol::NativeError::new(code, message),
+    )
+    .to_line()
+}
+
+/// 握手应答。`multidown` 标记必须随应答下发，Host 的
+/// `connect_and_handshake` 会校验它，防止别的进程碰巧占用了端口文件里的端口。
+fn native_handshake_reply(request_id: &str) -> Vec<u8> {
+    native_reply_ok(
+        request_id,
+        serde_json::json!({
+            "handshake": native_protocol::DESKTOP_HANDSHAKE,
+            "protocol": native_protocol::PROTOCOL_VERSION,
+        }),
+    )
 }
 
 /// 供浏览器扩展 Native Host 使用的默认保存目录（与 get_default_download_dir 一致）
@@ -1748,6 +1794,165 @@ fn register_native_host(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod native_protocol_replies_tests {
+    use super::{
+        native_handshake_reply, native_port_file_path, native_reply_error, native_reply_ok,
+    };
+    use native_protocol::{NativeErrorCode, Platform, APP_IDENTIFIER, PORT_FILE_NAME};
+
+    /// 调用日志函数时禁止出现的实参形状。
+    ///
+    /// 逐段拼接而非写字面量：这样本模块自己就不会含有这些字符串，扫描因此可以
+    /// 覆盖整个文件（不做任何"跳过测试模块"的解析），而不会把自己判成违规。
+    fn banned_log_arguments() -> Vec<String> {
+        [
+            ["Some", "(u)"],
+            ["Some", "(&u)"],
+            ["Some", "(&line)"],
+            ["Some", "(line)"],
+            ["Some", "(&raw_url)"],
+        ]
+        .iter()
+        .map(|parts| parts.concat())
+        .collect()
+    }
+
+    /// 扫描源码里每个 `debug_log(...)` 调用的实参文本。
+    fn log_call_arguments(source: &str) -> Vec<String> {
+        let mut calls = Vec::new();
+        let mut rest = source;
+        while let Some(index) = rest.find("debug_log(") {
+            let after = &rest[index + "debug_log(".len()..];
+            let end = after.find(");").expect("日志调用缺少右括号");
+            calls.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        calls
+    }
+
+    /// I4a：应用写出的端口文件必须与共享 crate 的解析器逐平台一致。
+    ///
+    /// 应用侧的目录来自 Tauri 的 `app_data_dir()`，这里按各平台规则复现那个
+    /// 目录；Windows 复现的是 `%APPDATA%\com.multidown.app`（漫游目录被重定向
+    /// 时它不在 `%USERPROFILE%` 下），因此必须与传 `%APPDATA%` 的 Host 一致。
+    #[test]
+    fn app_port_file_path_matches_the_shared_resolver_on_every_platform() {
+        for (platform, home, data_home, app_data) in [
+            (
+                Platform::MacOS,
+                std::path::Path::new("/Users/x"),
+                None,
+                std::path::Path::new("/Users/x/Library/Application Support/com.multidown.app"),
+            ),
+            (
+                Platform::Windows,
+                std::path::Path::new("C:/Users/x/AppData/Roaming"),
+                None,
+                std::path::Path::new("C:/Users/x/AppData/Roaming/com.multidown.app"),
+            ),
+            (
+                Platform::Linux,
+                std::path::Path::new("/home/x"),
+                None,
+                std::path::Path::new("/home/x/.local/share/com.multidown.app"),
+            ),
+            (
+                Platform::Linux,
+                std::path::Path::new("/home/x"),
+                Some(std::path::Path::new("/custom/xdg")),
+                std::path::Path::new("/custom/xdg/com.multidown.app"),
+            ),
+        ] {
+            let shared = native_protocol::port_file_path(platform, home, data_home);
+            assert_eq!(native_port_file_path(app_data), shared, "{platform:?}");
+        }
+    }
+
+    /// I4b：Windows 的端口文件跟着 `%APPDATA%` 走。重定向的漫游目录不在
+    /// `%USERPROFILE%\AppData\Roaming` 下，解析结果必须跟着 APPDATA 移动。
+    #[test]
+    fn windows_port_file_follows_appdata_not_userprofile() {
+        let relocated = std::path::Path::new("D:/Roaming/Redirected");
+        let app_data = relocated.join(APP_IDENTIFIER);
+        let resolved = native_port_file_path(&app_data);
+        assert_eq!(
+            resolved,
+            relocated.join(APP_IDENTIFIER).join(PORT_FILE_NAME)
+        );
+        let rendered = resolved.to_string_lossy().replace('\\', "/");
+        assert!(!rendered.contains("AppData/Roaming"), "{rendered}");
+        // 与 Host 传 %APPDATA% 的解析结果逐字一致
+        assert_eq!(
+            resolved,
+            native_protocol::port_file_path(Platform::Windows, relocated, None)
+        );
+    }
+
+    /// I4a：文件名必须来自共享常量，而不是各处手写的字面量。
+    #[test]
+    fn port_file_name_comes_from_the_shared_crate() {
+        assert_eq!(PORT_FILE_NAME, "native_host_port.txt");
+        let literal = ["join(\"", PORT_FILE_NAME, "\")"].concat();
+        assert!(
+            !include_str!("lib.rs").contains(&literal),
+            "端口文件名必须走 native_protocol::PORT_FILE_NAME"
+        );
+    }
+
+    /// I5：应用发出的每一行应答都回显请求 ID，且能被共享 crate 解析。
+    #[test]
+    fn replies_echo_the_request_id_and_parse_as_native_responses() {
+        let success = native_reply_ok("req-1", serde_json::json!({}));
+        assert_eq!(success.last(), Some(&b'\n'));
+        let parsed = native_protocol::NativeResponse::parse(&success).unwrap();
+        assert_eq!(parsed.request_id, "req-1");
+        assert!(parsed.ok);
+
+        let failure = native_reply_error("req-2", NativeErrorCode::DesktopError, "磁盘已满");
+        let parsed = native_protocol::NativeResponse::parse(&failure).unwrap();
+        assert_eq!(parsed.request_id, "req-2");
+        assert!(!parsed.ok);
+        let error = parsed.error.expect("失败应答必须带结构化错误");
+        assert_eq!(error.code, NativeErrorCode::DesktopError);
+        assert_eq!(error.message, "磁盘已满");
+    }
+
+    /// I5：握手应答带标记，能通过 Host 侧的握手校验。
+    #[test]
+    fn handshake_reply_carries_the_marker_and_the_request_id() {
+        let reply = native_handshake_reply("req-handshake");
+        let parsed = native_protocol::NativeResponse::parse(&reply).unwrap();
+        assert_eq!(parsed.request_id, "req-handshake");
+        assert!(parsed.ok);
+        native_protocol::validate_handshake_reply(&reply).unwrap();
+    }
+
+    /// I1：调用点不得把完整 URL 或原始行交给日志函数。
+    #[test]
+    fn log_call_sites_never_pass_a_raw_url_or_line() {
+        let calls = log_call_arguments(include_str!("lib.rs"));
+        assert!(calls.len() >= 10, "只扫描到 {} 个日志调用", calls.len());
+        for pattern in banned_log_arguments() {
+            for call in &calls {
+                assert!(
+                    !call.contains(&pattern),
+                    "日志调用不得直接传入敏感值 {pattern}：{call}"
+                );
+            }
+        }
+    }
+
+    /// I1：误传整条 URL / 请求头时日志数据依然不含敏感值。
+    #[test]
+    fn log_data_redacts_urls_and_credentials() {
+        let url = native_protocol::sanitize_log_data("https://cdn.example.com/f?sig=SECRET");
+        assert!(!url.contains("SECRET"), "{url}");
+        let cookie = native_protocol::sanitize_log_data("Cookie: session=SECRET");
+        assert!(!cookie.contains("SECRET"), "{cookie}");
+    }
+}
+
+#[cfg(test)]
 mod native_messaging_manifest_tests {
     use super::{chromium_manifest_content, firefox_manifest_content, CHROMIUM_EXTENSION_ID};
 
@@ -2346,7 +2551,7 @@ pub fn run() {
                 Ok(d) => d,
                 Err(_) => std::path::PathBuf::new(),
             };
-            let port_file = app_data.join("native_host_port.txt");
+            let port_file = native_port_file_path(&app_data);
             let app_handle_clone = app_handle.clone();
 
             debug_log(&app_handle, "启动TCP服务器", None);
@@ -2422,7 +2627,13 @@ pub fn run() {
                         Ok(request) => request,
                         Err(error) => {
                             if line.starts_with("http://") || line.starts_with("https://") {
-                                debug_log(&app_handle_clone, "非 JSON 输入，作为简单URL处理", Some(&line));
+                                // 这一行就是完整下载 URL，签名 token 在 query 里：
+                                // 日志只记 scheme://host 与字节数
+                                debug_log(
+                                    &app_handle_clone,
+                                    "非 JSON 输入，作为简单URL处理",
+                                    Some(&native_protocol::url_log_hint(&line)),
+                                );
                                 native_protocol::NativeRequest {
                                     version: native_protocol::PROTOCOL_VERSION,
                                     request_id: String::new(),
@@ -2441,13 +2652,19 @@ pub fn run() {
                                     Some(&format!("{:?}", error.code)),
                                 );
                                 let _ = writer
-                                    .write_all(b"{\"ok\":false,\"error\":\"invalid message format\"}\n")
+                                    .write_all(&native_reply_error(
+                                        "",
+                                        native_protocol::NativeErrorCode::InvalidPayload,
+                                        "invalid message format",
+                                    ))
                                     .await;
                                 let _ = writer.shutdown().await;
                                 continue;
                             }
                         }
                     };
+                    // 应答必须回显请求 ID：先于 payload 取用
+                    let request_id = request.request_id;
                     let action = request.payload.action();
                     debug_log(&app_handle_clone, "处理动作", Some(&format!("{action:?}")));
 
@@ -2458,16 +2675,16 @@ pub fn run() {
                                 .ok()
                                 .and_then(|p| load_settings(&p).ok())
                                 .unwrap_or_default();
-                            let resp = serde_json::json!({
-                                "ok": true,
-                                "config": {
-                                    "capture_enabled": settings.capture_enabled,
-                                    "domain_blacklist": settings.capture_domain_blacklist,
-                                }
-                            });
-                            let _ = writer
-                                .write_all(format!("{}\n", resp).as_bytes())
-                                .await;
+                            let resp = native_reply_ok(
+                                &request_id,
+                                serde_json::json!({
+                                    "config": {
+                                        "capture_enabled": settings.capture_enabled,
+                                        "domain_blacklist": settings.capture_domain_blacklist,
+                                    }
+                                }),
+                            );
+                            let _ = writer.write_all(&resp).await;
                             let _ = writer.shutdown().await;
                         }
                         native_protocol::NativePayload::Download(download) => {
@@ -2479,13 +2696,22 @@ pub fn run() {
                                     || u.starts_with("magnet:")
                                     || crate::torrent::detect::sniff(u).is_torrent() =>
                                 {
-                                    debug_log(&app_handle_clone, "获取到下载URL", Some(u));
+                                    // 只记录 scheme://host：签名 token 在 query 里
+                                    debug_log(
+                                        &app_handle_clone,
+                                        "获取到下载URL",
+                                        Some(&native_protocol::url_log_hint(u)),
+                                    );
                                     u.to_string()
                                 }
                                 _ => {
                                     debug_log(&app_handle_clone, "缺少或无效的URL", None);
                                     let _ = writer
-                                        .write_all(b"{\"ok\":false,\"error\":\"missing or invalid url\"}\n")
+                                        .write_all(&native_reply_error(
+                                            &request_id,
+                                            native_protocol::NativeErrorCode::InvalidPayload,
+                                            "missing or invalid url",
+                                        ))
                                         .await;
                                     let _ = writer.shutdown().await;
                                     continue;
@@ -2524,7 +2750,13 @@ pub fn run() {
 
                             if task_tx.send(TaskMessage::Download(download_task)).is_err() {
                                 debug_log(&app_handle_clone, "发送任务失败", None);
-                                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
+                                let _ = writer
+                                    .write_all(&native_reply_error(
+                                        &request_id,
+                                        native_protocol::NativeErrorCode::DesktopError,
+                                        "internal",
+                                    ))
+                                    .await;
                                 let _ = writer.shutdown().await;
                                 continue;
                             }
@@ -2534,15 +2766,23 @@ pub fn run() {
                             let response = match resp_rx.await {
                                 Ok(Ok(())) => {
                                     debug_log(&app_handle_clone, "任务处理成功", None);
-                                    b"{\"ok\":true}\n".to_vec()
+                                    native_reply_ok(&request_id, serde_json::json!({}))
                                 }
                                 Ok(Err(e)) => {
                                     debug_log(&app_handle_clone, "任务处理失败", Some(&e));
-                                    format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::to_string(&e).unwrap_or_else(|_| "\"unknown\"".to_string())).into_bytes()
+                                    native_reply_error(
+                                        &request_id,
+                                        native_protocol::NativeErrorCode::DesktopError,
+                                        &e,
+                                    )
                                 }
                                 Err(e) => {
                                     debug_log(&app_handle_clone, "任务处理超时", Some(&e.to_string()));
-                                    b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec()
+                                    native_reply_error(
+                                        &request_id,
+                                        native_protocol::NativeErrorCode::DesktopError,
+                                        "timeout",
+                                    )
                                 }
                             };
 
@@ -2552,7 +2792,11 @@ pub fn run() {
                         }
 
                         native_protocol::NativePayload::OpenWindow { url } => {
-                            debug_log(&app_handle_clone, "处理打开窗口请求", Some(&url));
+                            debug_log(
+                                &app_handle_clone,
+                                "处理打开窗口请求",
+                                Some(&native_protocol::url_log_hint(&url)),
+                            );
 
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let open_window_task = OpenWindowTask {
@@ -2562,7 +2806,13 @@ pub fn run() {
 
                             if task_tx.send(TaskMessage::OpenWindow(open_window_task)).is_err() {
                                 debug_log(&app_handle_clone, "发送打开窗口任务失败", None);
-                                let _ = writer.write_all(b"{\"ok\":false,\"error\":\"internal\"}\n").await;
+                                let _ = writer
+                                    .write_all(&native_reply_error(
+                                        &request_id,
+                                        native_protocol::NativeErrorCode::DesktopError,
+                                        "internal",
+                                    ))
+                                    .await;
                                 let _ = writer.shutdown().await;
                                 continue;
                             }
@@ -2570,15 +2820,23 @@ pub fn run() {
                             let response = match resp_rx.await {
                                 Ok(Ok(())) => {
                                     debug_log(&app_handle_clone, "打开窗口成功", None);
-                                    b"{\"ok\":true}\n".to_vec()
+                                    native_reply_ok(&request_id, serde_json::json!({}))
                                 }
                                 Ok(Err(e)) => {
                                     debug_log(&app_handle_clone, "打开窗口失败", Some(&e));
-                                    format!("{{\"ok\":false,\"error\":{}}}\n", serde_json::to_string(&e).unwrap_or_else(|_| "\"unknown\"".to_string())).into_bytes()
+                                    native_reply_error(
+                                        &request_id,
+                                        native_protocol::NativeErrorCode::DesktopError,
+                                        &e,
+                                    )
                                 }
                                 Err(e) => {
                                     debug_log(&app_handle_clone, "打开窗口超时", Some(&e.to_string()));
-                                    b"{\"ok\":false,\"error\":\"timeout\"}\n".to_vec()
+                                    native_reply_error(
+                                        &request_id,
+                                        native_protocol::NativeErrorCode::DesktopError,
+                                        "timeout",
+                                    )
                                 }
                             };
 
@@ -2592,9 +2850,7 @@ pub fn run() {
                         native_protocol::NativePayload::TestConnection => {
                             debug_log(&app_handle_clone, "处理握手请求", None);
                             let _ = writer
-                                .write_all(
-                                    b"{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n",
-                                )
+                                .write_all(&native_handshake_reply(&request_id))
                                 .await;
                             let _ = writer.shutdown().await;
                         }
@@ -2603,9 +2859,7 @@ pub fn run() {
                         native_protocol::NativePayload::OpenApp => {
                             debug_log(&app_handle_clone, "处理 open_app 请求", None);
                             let _ = writer
-                                .write_all(
-                                    b"{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n",
-                                )
+                                .write_all(&native_handshake_reply(&request_id))
                                 .await;
                             let _ = writer.shutdown().await;
                         }
@@ -2665,7 +2919,11 @@ pub fn run() {
                                 continue;
                             }
                             if domain_blacklisted(&url, &settings.capture_domain_blacklist) {
-                                debug_log(&app_worker, "URL 命中捕获黑名单，已拒绝", Some(&url));
+                                debug_log(
+                                    &app_worker,
+                                    "URL 命中捕获黑名单，已拒绝",
+                                    Some(&native_protocol::url_log_hint(&url)),
+                                );
                                 let _ = responder.send(Err("该域名已被捕获黑名单过滤".to_string()));
                                 continue;
                             }
