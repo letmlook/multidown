@@ -2392,22 +2392,25 @@ pub fn run() {
 
                     debug_log(&app_handle_clone, "接收到消息", Some(&line));
 
-                    // 解析消息
-                    let msg: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&line) {
-                        Ok(m) => {
-                            debug_log(&app_handle_clone, "消息解析成功", Some(&m.to_string()));
-                            m
-                        }
-                        Err(e) => {
-                            // 尝试作为简单URL处理
+                    // 共享协议 crate 是唯一的解析权威；裸 URL 直连作为
+                    // download 动作的兼容输入保留。
+                    let request = match native_protocol::NativeRequest::parse(line.as_bytes()) {
+                        Ok(request) => request,
+                        Err(error) => {
                             if line.starts_with("http://") || line.starts_with("https://") {
-                                debug_log(&app_handle_clone, "消息解析失败，作为简单URL处理", Some(&e.to_string()));
-                                serde_json::json!({
-                                    "action": "download",
-                                    "url": line
-                                })
+                                debug_log(&app_handle_clone, "非 JSON 输入，作为简单URL处理", Some(&line));
+                                native_protocol::NativeRequest {
+                                    version: native_protocol::PROTOCOL_VERSION,
+                                    request_id: String::new(),
+                                    payload: native_protocol::NativePayload::Download(
+                                        native_protocol::DownloadPayload {
+                                            url: line.clone(),
+                                            ..Default::default()
+                                        },
+                                    ),
+                                }
                             } else {
-                                debug_log(&app_handle_clone, "消息格式无效", Some(&e.to_string()));
+                                debug_log(&app_handle_clone, "消息格式无效", Some(&error.to_string()));
                                 let _ = writer
                                     .write_all(b"{\"ok\":false,\"error\":\"invalid message format\"}\n")
                                     .await;
@@ -2416,12 +2419,11 @@ pub fn run() {
                             }
                         }
                     };
+                    let action = request.payload.action();
+                    debug_log(&app_handle_clone, "处理动作", Some(&format!("{action:?}")));
 
-                    let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("download");
-                    debug_log(&app_handle_clone, "处理动作", Some(action));
-
-                    match action {
-                        "get_config" => {
+                    match request.payload {
+                        native_protocol::NativePayload::GetConfig => {
                             // 下发捕获配置给扩展（总开关 + 域名黑名单）
                             let settings = app_settings_path(&app_handle_clone)
                                 .ok()
@@ -2439,24 +2441,19 @@ pub fn run() {
                                 .await;
                             let _ = writer.shutdown().await;
                         }
-                        "download" => {
+                        native_protocol::NativePayload::Download(download) => {
                             // 放行 http(s)、磁力链接与 .torrent URL（种子由任务创建路径分流）
-                            let url = msg
-                                .get("url")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| {
-                                    s.starts_with("http://")
-                                        || s.starts_with("https://")
-                                        || s.starts_with("magnet:")
-                                        || crate::torrent::detect::sniff(s).is_torrent()
-                                });
-
-                            let url = match url {
-                                Some(u) => {
+                            let raw_url = download.url.clone();
+                            let url = match raw_url.as_str() {
+                                u if u.starts_with("http://")
+                                    || u.starts_with("https://")
+                                    || u.starts_with("magnet:")
+                                    || crate::torrent::detect::sniff(u).is_torrent() =>
+                                {
                                     debug_log(&app_handle_clone, "获取到下载URL", Some(u));
                                     u.to_string()
                                 }
-                                None => {
+                                _ => {
                                     debug_log(&app_handle_clone, "缺少或无效的URL", None);
                                     let _ = writer
                                         .write_all(b"{\"ok\":false,\"error\":\"missing or invalid url\"}\n")
@@ -2466,13 +2463,16 @@ pub fn run() {
                                 }
                             };
 
-                            let filename = msg.get("filename").and_then(|v| v.as_str()).map(String::from);
-                            let referer = msg.get("referer").and_then(|v| v.as_str()).map(String::from);
-                            let user_agent = msg.get("user_agent").and_then(|v| v.as_str()).map(String::from);
-                            let cookie = msg.get("cookie").and_then(|v| v.as_str()).map(String::from);
-                            let post_data = msg.get("post_data").and_then(|v| v.as_str()).map(String::from);
-                            let save_path = msg.get("save_path").and_then(|v| v.as_str()).map(String::from);
-                            let open_window = msg.get("open_window").and_then(|v| v.as_bool()).unwrap_or(true);
+                            let native_protocol::DownloadPayload {
+                                filename,
+                                referer,
+                                user_agent,
+                                cookie,
+                                post_data,
+                                save_path,
+                                open_window,
+                                ..
+                            } = download;
 
                             debug_log(&app_handle_clone, "下载参数", Some(&format!("filename: {:?}, referer: {:?}, open_window: {:?}", filename, referer, open_window)));
 
@@ -2518,13 +2518,12 @@ pub fn run() {
                             let _ = writer.shutdown().await;
                         }
 
-                        "open_window" => {
-                            let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            debug_log(&app_handle_clone, "处理打开窗口请求", Some(url));
+                        native_protocol::NativePayload::OpenWindow { url } => {
+                            debug_log(&app_handle_clone, "处理打开窗口请求", Some(&url));
 
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let open_window_task = OpenWindowTask {
-                                url: url.to_string(),
+                                url,
                                 responder: resp_tx,
                             };
 
@@ -2554,10 +2553,12 @@ pub fn run() {
                             let _ = writer.shutdown().await;
                         }
 
-                        _ => {
-                            debug_log(&app_handle_clone, "未知动作", Some(action));
+                        // test_connection / open_app 的完整处理器由端口发现任务提供
+                        other @ (native_protocol::NativePayload::TestConnection
+                        | native_protocol::NativePayload::OpenApp) => {
+                            debug_log(&app_handle_clone, "动作尚未实现", Some(&format!("{:?}", other.action())));
                             let _ = writer
-                                .write_all(b"{\"ok\":false,\"error\":\"unknown action\"}\n")
+                                .write_all(b"{\"ok\":false,\"error\":\"action not implemented yet\"}\n")
                                 .await;
                             let _ = writer.shutdown().await;
                         }

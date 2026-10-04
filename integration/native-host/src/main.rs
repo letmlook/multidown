@@ -10,6 +10,10 @@ use std::net::TcpStream;
 use std::fs::OpenOptions;
 use std::io::BufWriter;
 
+use native_protocol::{
+    DownloadPayload, NativeErrorCode, NativeRequest, NativePayload,
+};
+
 // 调试日志函数
 fn debug_log(message: &str, data: Option<&str>) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
@@ -127,39 +131,33 @@ fn send_response(stdout: &mut impl Write, ok: bool, message: &str) {
     let _ = stdout.flush();
 }
 
-fn handle_download_message(msg: &serde_json::Value, stdout: &mut impl Write) -> bool {
+fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) -> bool {
     debug_log("开始处理下载消息", None);
-    
-    let url = msg
-        .get("url")
-        .and_then(|v| v.as_str())
-        .filter(|s| {
-            s.starts_with("http://")
-                || s.starts_with("https://")
-                || s.starts_with("magnet:")
-                || s.to_lowercase().ends_with(".torrent")
-        });
 
-    let url = match url {
-        Some(u) => {
+    let url = match download.url.as_str() {
+        u if u.starts_with("http://")
+            || u.starts_with("https://")
+            || u.starts_with("magnet:")
+            || u.to_lowercase().ends_with(".torrent") =>
+        {
             debug_log("获取到下载URL", Some(u));
             u.to_string()
         }
-        None => {
+        _ => {
             debug_log("缺少或无效的URL", None);
             send_response(stdout, false, "missing or invalid url");
             return false;
         }
     };
 
-    let filename = msg.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-    let referer = msg.get("referer").and_then(|v| v.as_str()).unwrap_or("");
-    let user_agent = msg.get("user_agent").and_then(|v| v.as_str()).unwrap_or("");
-    let cookie = msg.get("cookie").and_then(|v| v.as_str()).unwrap_or("");
-    let post_data = msg.get("post_data").and_then(|v| v.as_str()).unwrap_or("");
-    let save_path = msg.get("save_path").and_then(|v| v.as_str()).unwrap_or("");
-    let open_window = msg.get("open_window").and_then(|v| v.as_bool()).unwrap_or(true);
-    
+    let filename = download.filename.as_deref().unwrap_or("");
+    let referer = download.referer.as_deref().unwrap_or("");
+    let user_agent = download.user_agent.as_deref().unwrap_or("");
+    let cookie = download.cookie.as_deref().unwrap_or("");
+    let post_data = download.post_data.as_deref().unwrap_or("");
+    let save_path = download.save_path.as_deref().unwrap_or("");
+    let open_window = download.open_window;
+
     debug_log("下载参数", Some(&format!("filename: {}, referer: {}, open_window: {}", filename, referer, open_window)));
 
     let port = match port_file_path() {
@@ -299,7 +297,7 @@ fn handle_download_message(msg: &serde_json::Value, stdout: &mut impl Write) -> 
 }
 
 /// 转发主程序的捕获配置（总开关 + 域名黑名单），供扩展端过滤
-fn handle_get_config_message(_msg: &serde_json::Value, stdout: &mut impl Write) -> bool {
+fn handle_get_config_message(stdout: &mut impl Write) -> bool {
     let port = match port_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(s) => s.trim().parse::<u16>().unwrap_or(0),
         None => 0,
@@ -375,8 +373,8 @@ fn handle_get_config_message(_msg: &serde_json::Value, stdout: &mut impl Write) 
     }
 }
 
-fn handle_open_window_message(msg: &serde_json::Value, stdout: &mut impl Write) -> bool {
-    let url = msg.get("url").and_then(|v| v.as_str()).unwrap_or("");
+fn handle_open_window_message(url: &str, stdout: &mut impl Write) -> bool {
+    let url = url.to_string();
     
     let port = match port_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(s) => s.trim().parse::<u16>().unwrap_or(0),
@@ -493,39 +491,39 @@ fn main() {
         return;
     }
 
-    debug_log("解析JSON消息", None);
-    let msg: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&payload) {
-        Ok(m) => {
-            debug_log("JSON解析成功", Some(&m.to_string()));
-            m
+    debug_log("解析协议请求", None);
+    // 共享协议 crate 是唯一的解析权威；动作分发与负载提取全部走类型。
+    match NativeRequest::parse(&payload) {
+        Err(error) => {
+            debug_log("请求解析失败", Some(&error.to_string()));
+            let message = match error.code {
+                NativeErrorCode::UnknownAction => "unknown action",
+                NativeErrorCode::UnsupportedVersion => "unsupported protocol version",
+                _ => "invalid json",
+            };
+            send_response(&mut stdout, false, message);
         }
-        Err(e) => {
-            debug_log("JSON解析失败", Some(&e.to_string()));
-            send_response(&mut stdout, false, "invalid json");
-            return;
-        }
-    };
-
-    // 处理不同类型的命令
-    let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("download");
-    debug_log("处理命令", Some(action));
-
-    match action {
-        "download" => {
-            debug_log("处理下载命令", None);
-            handle_download_message(&msg, &mut stdout);
-        }
-        "open_window" => {
-            debug_log("处理打开窗口命令", None);
-            handle_open_window_message(&msg, &mut stdout);
-        }
-        "get_config" => {
-            debug_log("处理配置查询命令", None);
-            handle_get_config_message(&msg, &mut stdout);
-        }
-        _ => {
-            debug_log("未知命令", Some(action));
-            send_response(&mut stdout, false, "unknown action");
+        Ok(request) => {
+            debug_log("处理命令", Some(&format!("{:?}", request.payload.action())));
+            match request.payload {
+                NativePayload::Download(download) => {
+                    debug_log("处理下载命令", None);
+                    handle_download_message(&download, &mut stdout);
+                }
+                NativePayload::OpenWindow { url } => {
+                    debug_log("处理打开窗口命令", None);
+                    handle_open_window_message(&url, &mut stdout);
+                }
+                NativePayload::GetConfig => {
+                    debug_log("处理配置查询命令", None);
+                    handle_get_config_message(&mut stdout);
+                }
+                // 这两个动作的完整处理器由传输生命周期 Task 2 提供
+                NativePayload::TestConnection | NativePayload::OpenApp => {
+                    debug_log("动作尚未实现", Some("port discovery task"));
+                    send_response(&mut stdout, false, "action not implemented yet");
+                }
+            }
         }
     }
     

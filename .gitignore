@@ -10,6 +10,7 @@ src-tauri/target/
 src-tauri/WixTools/
 
 integration/native-host/target/
+integration/native-protocol/target/
 integration/extension/node_modules/
 integration/extension/dist/
 

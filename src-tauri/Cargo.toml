@@ -28,6 +28,8 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native Messaging 线上协议的共享定义（与 integration/native-host 共用）
+native-protocol = { path = "../integration/native-protocol" }
 reqwest = { version = "0.12", features = ["stream", "json"] }
 tokio = { version = "1", features = ["fs", "io-util", "sync", "rt-multi-thread", "net", "macros", "time"] }
 uuid = { version = "1", features = ["v4", "serde"] }

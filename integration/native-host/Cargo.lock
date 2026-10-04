@@ -127,6 +127,15 @@ name = "multidown-native-host"
 version = "0.3.0"
 dependencies = [
  "chrono",
+ "native-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "native-protocol"
+version = "0.3.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

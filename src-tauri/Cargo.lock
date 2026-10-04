@@ -3230,6 +3230,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "librqbit",
+ "native-protocol",
  "opener",
  "parking_lot",
  "reqwest 0.12.28",
@@ -3251,6 +3252,14 @@ dependencies = [
  "walkdir",
  "winreg 0.52.0",
  "zip",
+]
+
+[[package]]
+name = "native-protocol"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
