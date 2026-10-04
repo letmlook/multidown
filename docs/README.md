@@ -5,6 +5,7 @@
 命名约定：仓库和项目使用 `Multidown`；应用窗口、发布标题和安装包使用 `MultiDown`。
 
 - [项目首页](../README.md)
+- [进度快照](./PROJECT-STATUS.md)
 - [更新日志](../CHANGELOG.md)
 - [贡献指南](../CONTRIBUTING.md)
 - [安全策略](../SECURITY.md)
