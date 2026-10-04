@@ -1424,8 +1424,6 @@ fn extract_extension_zip(
             .map_err(browser_integration::ExtensionInstallError::from_zip_error)?;
         // enclosed_name() 会检查全部路径分量（而非只看第一个），返回 None 即表示
         // 条目名含 `..`、根目录或盘符前缀；先转成自有 Path 以释放对 entry 的借用。
-        // enclosed_name() 会检查全部路径分量（而非只看第一个），返回 None 即表示
-        // 条目名含 `..`、根目录或盘符前缀；先转成自有 Path 以释放对 entry 的借用。
         let Some(safe_relative) = entry.enclosed_name().map(std::path::Path::to_path_buf) else {
             return Err(browser_integration::ExtensionInstallError::Deploy {
                 context: format!("压缩包条目路径非法: {}", entry.name()),
@@ -1821,8 +1819,9 @@ mod extension_zip_extract_tests {
             error.contains("a/../../evil.txt"),
             "错误需指出非法条目名: {error}"
         );
+        // ext_dir 为 root/inner/unpacked，旧实现会把 a/../../evil.txt 写到 root/inner/evil.txt
         assert!(
-            !root.join("evil.txt").exists(),
+            !root.join("inner").join("evil.txt").exists() && !root.join("evil.txt").exists(),
             "逃逸条目不得写到目标目录之外"
         );
         std::fs::remove_dir_all(root).unwrap();

@@ -74,8 +74,6 @@ pub(crate) struct ExtensionManifest {
     #[serde(default)]
     pub(crate) name: String,
     #[serde(default)]
-    pub(crate) version: String,
-    #[serde(default)]
     pub(crate) icons: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) background: Background,
@@ -269,7 +267,7 @@ pub(crate) fn validate_extension_directory(
 
 /// 遍历到的条目类型（`walkdir` 不跟随符号链接，符号链接既非目录也非文件）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum entry_kind {
+pub(crate) enum EntryKind {
     Directory,
     File,
     Other,
@@ -282,12 +280,12 @@ pub(crate) enum EntryAction {
     Reject(&'static str),
 }
 
-pub(crate) fn classify_entry(kind: entry_kind) -> EntryAction {
+pub(crate) fn classify_entry(kind: EntryKind) -> EntryAction {
     match kind {
-        entry_kind::Directory => EntryAction::CreateDirectory,
-        entry_kind::File => EntryAction::Copy,
+        EntryKind::Directory => EntryAction::CreateDirectory,
+        EntryKind::File => EntryAction::Copy,
         // 静默丢弃会造出缺文件的扩展，必须显式失败
-        entry_kind::Other => EntryAction::Reject("既不是文件也不是目录，无法安全部署"),
+        EntryKind::Other => EntryAction::Reject("既不是文件也不是目录，无法安全部署"),
     }
 }
 
@@ -317,11 +315,11 @@ pub(crate) fn deploy_extension_directory(
         let context = entry.path().display().to_string();
         let file_type = entry.file_type();
         let kind = if file_type.is_dir() {
-            entry_kind::Directory
+            EntryKind::Directory
         } else if file_type.is_file() {
-            entry_kind::File
+            EntryKind::File
         } else {
-            entry_kind::Other
+            EntryKind::Other
         };
 
         match classify_entry(kind) {
@@ -557,9 +555,9 @@ fn platform_candidates() -> Vec<BrowserCandidate> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_entry, deploy_extension_directory, entry_kind, export_extension_zip,
+        classify_entry, deploy_extension_directory, export_extension_zip,
         open_extension_installers_with, validate_extension_directory, BrowserCandidate,
-        CommandLauncher, EntryAction,
+        CommandLauncher, EntryAction, EntryKind,
     };
     use std::io::Read;
     use std::path::{Path, PathBuf};
@@ -850,12 +848,12 @@ mod tests {
         // 非普通条目（既非目录也非文件，例如符号链接）必须被判为不支持，
         // 而不是被静默丢弃——该判断与平台无关，永远执行。
         assert_eq!(
-            classify_entry(entry_kind::Directory),
+            classify_entry(EntryKind::Directory),
             EntryAction::CreateDirectory
         );
-        assert_eq!(classify_entry(entry_kind::File), EntryAction::Copy);
+        assert_eq!(classify_entry(EntryKind::File), EntryAction::Copy);
         assert_eq!(
-            classify_entry(entry_kind::Other),
+            classify_entry(EntryKind::Other),
             EntryAction::Reject("既不是文件也不是目录，无法安全部署")
         );
 
