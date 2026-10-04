@@ -422,6 +422,80 @@ async fn peer_limit_reconfigure_reattaches_existing_torrent() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// 生产重建总是复用同一个 `state_dir`:librqbit 会先急切恢复所有已持久化的种子，
+/// 随后的逐任务 re-add 命中 `AlreadyManaged` 提前返回，丢弃传入的
+/// `AddTorrentOptions`。恢复出的种子按 `opts.peer_limit.or(session.peer_limit)`
+/// 取会话默认值（持久化结构不序列化 per-torrent 上限），所以新的 peer 上限
+/// 必须通过 `SessionOptions::peer_limit` 进入会话才对已注册种子生效。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_limit_reconfigure_applies_to_eagerly_restored_torrents() {
+    let root = std::env::temp_dir().join(format!(
+        "multidown-bt-reconfigure-restore-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let source = root.join("source");
+    let download = root.join("download");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(source.join("payload.bin"), b"restored payload").unwrap();
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = create_torrent(
+        &source.join("payload.bin"),
+        CreateTorrentOptions {
+            name: Some("payload.bin"),
+            trackers: Vec::new(),
+            piece_length: Some(16 * 1024),
+        },
+        &spawner,
+    )
+    .await
+    .unwrap();
+    let torrent_bytes = created.as_bytes().unwrap().to_vec();
+    let cfg = TorrentEngineConfig {
+        default_download_dir: download.clone(),
+        state_dir: root.join("state"),
+        enable_dht: false,
+        disable_lsd: true,
+        listen_port: None,
+        download_bps: None,
+        upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
+        client_name: "MultiDown-restore-test".into(),
+        initial_peers: Vec::new(),
+    };
+    let engine = TorrentEngine::new(cfg.clone()).await.unwrap();
+    let inspected = engine.inspect_bytes(torrent_bytes).await.unwrap();
+    engine
+        .add("kept", &inspected, &download, None, true)
+        .await
+        .unwrap();
+
+    // 仅变更 peer_limit：与 session_equivalent 无关的会话字段，必须走重建路径。
+    // state_dir 与原会话相同，正是生产的重建形态。
+    let outcome = engine
+        .reconfigure_session(TorrentEngineConfig {
+            peer_limit: Some(1),
+            ..cfg
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, ReconfigureOutcome::Rebuilt { reattached: 1 });
+    assert_eq!(
+        engine.session_peer_limit_for_test(),
+        Some(1),
+        "重建后的会话必须携带新的 peer 上限，恢复出的种子据此继承生效限制"
+    );
+    assert!(engine.handle("kept").is_some());
+    assert_eq!(
+        engine.snapshot("kept").unwrap().state,
+        TorrentRunState::Paused
+    );
+    engine.stop().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_reconfigure_keeps_old_session_and_handle_usable() {
     let root = std::env::temp_dir().join(format!(

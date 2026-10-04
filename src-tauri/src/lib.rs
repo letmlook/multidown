@@ -2194,6 +2194,26 @@ pub fn run() {
                 });
             }
 
+            // 启动恢复（规格 §5 第 9 步）：上次活动（Downloading/做种）的任务通过
+            // 正常队列与并发准入恢复；用户暂停的任务保持暂停。
+            {
+                let sched_recovery = sched_clone.clone();
+                let app_recovery = app_handle.clone();
+                let recovery_settings = settings.clone();
+                tauri::async_runtime::spawn(async move {
+                    let summary = sched_recovery
+                        .recover_tasks(
+                            Some(app_recovery),
+                            recovery_settings.max_connections_per_task as usize,
+                            network_options_from_settings(&recovery_settings),
+                        )
+                        .await;
+                    for failure in &summary.failures {
+                        eprintln!("[recovery] {}: {}", failure.task_id, failure.message);
+                    }
+                });
+            }
+
             // 检查是否首次运行，如果是则自动安装扩展
             let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
             let first_run_flag = app_data.join("first_run");

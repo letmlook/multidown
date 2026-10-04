@@ -210,6 +210,10 @@ impl TorrentEngine {
                 download_bps: cfg.download_bps.and_then(NonZeroU32::new),
                 upload_bps: cfg.upload_bps.and_then(NonZeroU32::new),
             },
+            // 持久化恢复出的种子按 `opts.peer_limit.or(session.peer_limit)` 取
+            // 每种子上限，而重新 add 已注册种子会命中 AlreadyManaged 提前返回、
+            // 丢弃传入的 AddTorrentOptions —— 会话默认值是恢复种子的唯一生效入口。
+            peer_limit: cfg.peer_limit,
             // SOCKS5 代理只作用于 BT peer 连接（uTP 会自动退化为纯 TCP）
             connect: cfg.proxy_url.as_ref().map(|url| ConnectionOptions {
                 proxy_url: Some(url.clone()),
@@ -618,6 +622,14 @@ impl TorrentEngine {
                     )
             })
         })
+    }
+
+    /// librqbit 持久化恢复出的种子按 `opts.peer_limit.or(session.peer_limit)`
+    /// 取每种子上限，而持久化结构不序列化该值，所以会话默认值就是恢复种子的
+    /// 实际生效上限；per-torrent 的 options 是 `pub(crate)`，测试只能从会话侧断言。
+    #[cfg(test)]
+    pub fn session_peer_limit_for_test(&self) -> Option<usize> {
+        self.session.lock().peer_limit
     }
 }
 

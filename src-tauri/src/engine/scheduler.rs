@@ -44,13 +44,6 @@ impl Default for EngineLimits {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-    )
-)]
 pub struct RecoverySummary {
     pub started: usize,
     pub restarted: usize,
@@ -60,13 +53,6 @@ pub struct RecoverySummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-    )
-)]
 pub struct RecoveryFailure {
     pub task_id: TaskId,
     pub message: String,
@@ -1814,13 +1800,6 @@ impl Scheduler {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-        )
-    )]
     async fn fail_http_recovery(&self, task_id: &str, message: String) -> Result<(), String> {
         let persisted_message = message.clone();
         let task = self
@@ -1834,13 +1813,6 @@ impl Scheduler {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-        )
-    )]
     async fn reset_http_recovery_for_restart(&self, task_id: &str) -> Result<Arc<Task>, String> {
         let task = self
             .persist_task_record_update(task_id, |record| {
@@ -1862,13 +1834,6 @@ impl Scheduler {
     /// Recover protocol tasks that were active when the previous process
     /// stopped. Task 3 owns the protocol-neutral orchestration and HTTP branch;
     /// the BitTorrent branch is deliberately extended by Task 4.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-        )
-    )]
     pub async fn recover_tasks(
         &self,
         app_handle: Option<tauri::AppHandle>,

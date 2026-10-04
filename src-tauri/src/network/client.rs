@@ -14,13 +14,6 @@ pub enum Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-    )
-)]
 pub enum ResumeError {
     #[error("remote representation changed: expected ETag {expected:?}, received {actual:?}")]
     EtagChanged {
@@ -139,13 +132,6 @@ pub struct ProbeResult {
 /// Ensure a partial download still refers to the same remote representation.
 /// A strong ETag is authoritative; when it is absent (including a weak ETag),
 /// Last-Modified is the fallback. Callers must restart when neither is usable.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "startup recovery is extended and wired by transfer lifecycle Task 4"
-    )
-)]
 pub fn validate_resume_identity(
     expected_etag: Option<&str>,
     expected_last_modified: Option<&str>,
