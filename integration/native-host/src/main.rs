@@ -25,10 +25,10 @@ use native_protocol::{
 /// 8 秒超时，用户只会看到泛泛的"Native Host 连接超时"。
 ///
 /// 上界 = 预算 + 2 × 握手 IO（写与读各自受 `HANDSHAKE_IO_TIMEOUT` 约束）
-/// 加轮询间隔，即 5s + 2s + 0.4s = 7.4s，余量只有 0.6s。算式见共享 crate 的
+/// 加轮询间隔，即 3s + 2s + 0.4s = 5.4s，余量有 2.6s。算式见共享 crate 的
 /// `handshake_worst_case()`，`open_app_budget_fits_extension_timeout` 会把两侧
 /// 的数字绑在一起。改动任一侧都要同步另一侧。
-const OPEN_APP_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const OPEN_APP_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 const OPEN_APP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
 // 调试日志函数
@@ -841,7 +841,7 @@ mod tests {
             + OPEN_APP_POLL_INTERVAL)
             .as_millis();
         assert_eq!(
-            worst_case_ms, 7400,
+            worst_case_ms, 5400,
             "上界算式变了（写与读各算一次握手 IO），两侧的余量声明要跟着更新"
         );
         assert!(
