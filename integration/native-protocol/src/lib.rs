@@ -8,8 +8,13 @@
 //!   `action` 字段选择 [`NativePayload`] 变体，其余字段属于该变体的负载。
 //! - 响应是同构 JSON：成功 `{"request_id":…,"ok":true,…}`，失败
 //!   `{"request_id":…,"ok":false,"error":{"code":…,"message":…}}`。
+//!   两侧的应答都必须经 [`NativeResponse`] 构造并用
+//!   [`NativeResponse::to_line`] 发出，`request_id` 才是真正被回显的。
+//!   对端可能不回显（旧版本地），此时 `request_id` 解析为空串——这是被容忍的
+//!   兼容情况，不是成功条件。
 //! - 敏感字段（cookie、user_agent、post_data 等）在 [`Debug`] 输出中被脱敏，
-//!   Host 的日志永远不会打印它们的值。
+//!   Host 的日志永远不会打印它们的值；完整 URL 一律经 [`url_log_hint`] /
+//!   [`sanitize_log_data`] 裁剪后才允许落日志。
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -289,6 +294,19 @@ impl NativeResponse {
         serde_json::from_slice(bytes)
             .map_err(|error| NativeError::new(NativeErrorCode::InvalidPayload, error.to_string()))
     }
+
+    /// 序列化成 TCP 线上的一行 JSON（含结尾换行）。
+    ///
+    /// Host 与桌面端的**所有**应答都必须走这里，`request_id` 才谈得上
+    /// "被回显"：手写字面量绕开了这个类型，回显约束就只是纸面承诺。
+    pub fn to_line(&self) -> Vec<u8> {
+        let mut line = serde_json::to_string(self).unwrap_or_else(|_| {
+            // NativeResponse 的字段都是 String/Value/bool，序列化不会失败
+            String::from("{\"ok\":false}")
+        });
+        line.push('\n');
+        line.into_bytes()
+    }
 }
 
 /// Tauri 应用标识符（tauri.conf.json `identifier`），端口文件位于
@@ -298,6 +316,12 @@ pub const PORT_FILE_NAME: &str = "native_host_port.txt";
 /// 桌面端握手标记：test_connection 的应答必须携带它才算连接成功。
 pub const DESKTOP_HANDSHAKE: &str = "multidown";
 
+/// [`ensure_desktop_connection`] 单次轮询内握手所用的 IO 超时。
+///
+/// 暴露成常量是因为它是"拉起预算"最坏耗时的一部分：调用方要保证
+/// 预算 + 本值 + 轮询间隔 仍落在上层（扩展）的等待上限之内。
+pub const HANDSHAKE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// 平台区分。端口文件位置必须与 Tauri 的 `app_data_dir` 完全一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -306,17 +330,21 @@ pub enum Platform {
     Linux,
 }
 
-/// 解析各平台端口文件路径。
+/// 解析各平台端口文件路径。`home` 的含义按平台不同：
 ///
-/// - Windows: `{home}/AppData/Roaming/{identifier}/native_host_port.txt`
-/// - macOS:   `{home}/Library/Application Support/{identifier}/native_host_port.txt`
-/// - Linux:   `{data_home | home/.local/share}/{identifier}/native_host_port.txt`
+/// - Windows: **漫游应用数据目录本身**（`%APPDATA%`，即 Tauri 使用的
+///   `FOLDERID_RoamingAppData`）→ `{home}/{identifier}/native_host_port.txt`。
+///   注意不能传 `%USERPROFILE%` 再拼 `AppData/Roaming`：漫游目录被重定向
+///   （企业/OneDrive 重定向）时它不在用户目录下，两侧会解析到不同文件。
+/// - macOS:   `$HOME` → `{home}/Library/Application Support/{identifier}/…`
+/// - Linux:   `$HOME` + 可选 `XDG_DATA_HOME`
+///   → `{data_home | home/.local/share}/{identifier}/native_host_port.txt`
 ///
 /// `data_home` 对应 `XDG_DATA_HOME`；Tauri 的 Linux 数据目录遵循同一规则，
 /// 桌面端与 Native Host 必须解析到同一个文件。
 pub fn port_file_path(platform: Platform, home: &std::path::Path, data_home: Option<&std::path::Path>) -> std::path::PathBuf {
     let base = match platform {
-        Platform::Windows => home.join("AppData/Roaming"),
+        Platform::Windows => home.to_path_buf(),
         Platform::MacOS => home.join("Library/Application Support"),
         Platform::Linux => data_home
             .map(std::path::Path::to_path_buf)
@@ -331,6 +359,112 @@ pub fn read_port_file(path: &std::path::Path) -> Option<u16> {
     let text = std::fs::read_to_string(path).ok()?;
     let port = text.trim().parse::<u16>().ok()?;
     (port != 0).then_some(port)
+}
+
+/// 把 URL 裁剪成可安全落日志的摘要：只保留 scheme 与 host，
+/// path / query（常常带签名 token）一律丢弃；userinfo 同样丢弃。
+/// 不像 URL 的文本退化为长度摘要。
+///
+/// 全局约束"日志永不包含 cookie、认证头或完整敏感 URL"在两侧的
+/// `debug_log` 出口处强制执行，见 [`sanitize_log_data`]。
+pub fn url_log_hint(url: &str) -> String {
+    let trimmed = url.trim();
+    let (scheme, rest) = match trimmed.find("://") {
+        Some(index) => (&trimmed[..index], &trimmed[index + 3..]),
+        None => match trimmed.find(":?") {
+            Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
+            None => return format!("[非 URL 文本 {} 字节]", trimmed.len()),
+        },
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    // https://user:pass@host/... 里的 userinfo 同样属于凭据
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    let host_part = if host.is_empty() {
+        String::new()
+    } else {
+        format!("//{host}")
+    };
+    format!(
+        "{scheme}:{host_part} [path/query 已省略, {} 字节]",
+        trimmed.len()
+    )
+}
+
+/// 日志出口的统一脱敏，两步：
+///
+/// 1. 把字符串里所有 URL 形状的片段替换成 [`url_log_hint`] 摘要；
+/// 2. 若仍带凭据形状（`cookie:`/`authorization=`/`token=`…），整段替换为
+///    长度摘要。
+///
+/// 两侧的 `debug_log` 都必须过这一层——它是"日志永不包含 cookie、认证头
+/// 或完整敏感 URL"这条约束的唯一执行点，调用点即使误传整条 URL、原始行或
+/// 请求头也不会泄漏。已脱敏形状（`[redacted`）不在第 2 步的射程内。
+pub fn sanitize_log_data(data: &str) -> String {
+    let mut result = if !data.contains("://") && !data.contains(":?") {
+        data.to_string()
+    } else {
+        data.split_whitespace()
+            .map(|token| {
+                if !token.contains("://") && !token.contains(":?") {
+                    return token.to_string();
+                }
+                // 保留 JSON / 引号等外围标点，只替换中间的 URL 本体
+                let lead_len = token
+                    .chars()
+                    .take_while(|c| matches!(c, '{' | '[' | '"' | '\'' | '('))
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                let core = &token[lead_len..];
+                let trail_len = core
+                    .chars()
+                    .rev()
+                    .take_while(|c| matches!(c, '}' | ']' | '"' | '\'' | ')' | ',' | ';'))
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                let body = &core[..core.len() - trail_len];
+                format!(
+                    "{}{}{}",
+                    &token[..lead_len],
+                    url_log_hint(body),
+                    &core[core.len() - trail_len..]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if contains_credential_value(&result) {
+        result = format!("[{} 字节的含凭据内容已省略]", result.len());
+    }
+    result
+}
+
+/// 凭据形状的键名：这些键后面的值不得落日志。
+const CREDENTIAL_KEYS: [&str; 7] = [
+    "cookie",
+    "authorization",
+    "password",
+    "token",
+    "api_key",
+    "apikey",
+    "secret",
+];
+
+/// 文本里是否存在"键: 值 / 键=值"形状的凭据。已带 `[redacted` 标记的
+/// （[`DownloadPayload`] 的 `Debug` 输出）视为已经脱敏，不再重复折叠。
+fn contains_credential_value(data: &str) -> bool {
+    if data.contains("[redacted") {
+        return false;
+    }
+    let lower = data.to_lowercase();
+    CREDENTIAL_KEYS.iter().any(|key| {
+        lower.match_indices(key).any(|(index, _)| {
+            let rest = lower[index + key.len()..].trim_start_matches([' ', '\t']);
+            rest.starts_with(':') || rest.starts_with('=')
+        })
+    })
 }
 
 /// 与桌面端建立 TCP 并完成握手：发送 `test_connection` 请求，
@@ -389,6 +523,10 @@ pub fn connect_and_handshake(
 }
 
 /// 校验桌面端握手应答：`ok` 为真且携带 multidown 握手标记。
+///
+/// 标记允许出现在两个位置：顶层（旧桌面端的字面量形状）与 `data` 内
+/// （[`NativeResponse`] 形状，桌面端现在统一走该类型）。两种都接受，
+/// 校验强度不变——缺标记的进程仍然无法冒充桌面端。
 pub fn validate_handshake_reply(bytes: &[u8]) -> Result<(), NativeError> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         NativeError::new(
@@ -397,7 +535,11 @@ pub fn validate_handshake_reply(bytes: &[u8]) -> Result<(), NativeError> {
         )
     })?;
     let ok = value.get("ok").and_then(serde_json::Value::as_bool);
-    let marker = value.get("handshake").and_then(serde_json::Value::as_str);
+    let data = value.get("data");
+    let marker = value
+        .get("handshake")
+        .or_else(|| data.and_then(|data| data.get("handshake")))
+        .and_then(serde_json::Value::as_str);
     if ok == Some(true) && marker == Some(DESKTOP_HANDSHAKE) {
         Ok(())
     } else {
@@ -423,7 +565,7 @@ pub fn ensure_desktop_connection(
     let mut launched = false;
     loop {
         if let Some(port) = read_port_file(port_file) {
-            if connect_and_handshake(port, request_id, std::time::Duration::from_secs(1)).is_ok() {
+            if connect_and_handshake(port, request_id, HANDSHAKE_IO_TIMEOUT).is_ok() {
                 return Ok(port);
             }
         }
@@ -576,6 +718,114 @@ mod tests {
         assert!(rendered.contains("[redacted"), "{rendered}");
         assert!(rendered.contains("https://example.com/a.bin"), "{rendered}");
     }
+
+    /// I1：日志出口绝不能吐出完整 URL。签名 token / path / userinfo 都不得出现。
+    #[test]
+    fn url_log_hint_keeps_scheme_and_host_only() {
+        for url in [
+            "https://example.com/a/b.bin?sig=SECRET&exp=1",
+            "http://user:pw@example.com/a?token=SECRET",
+            "magnet:?xt=urn:btih:SECRET&dn=name",
+            "https://example.com?sig=SECRET",
+        ] {
+            let hint = url_log_hint(url);
+            assert!(!hint.contains("SECRET"), "{url} -> {hint}");
+            assert!(!hint.contains("example.com/a"), "{url} -> {hint}");
+            assert!(!hint.contains("pw"), "{url} -> {hint}");
+            assert!(!hint.contains('?'), "{url} -> {hint}");
+        }
+        assert_eq!(
+            url_log_hint("https://example.com/a?sig=x"),
+            "https://example.com [path/query 已省略, 27 字节]"
+        );
+        assert_eq!(
+            url_log_hint("magnet:?xt=1"),
+            "magnet: [path/query 已省略, 12 字节]"
+        );
+        // 不像 URL 的输入退化为长度摘要，绝不回显原文
+        let opaque = "Cookie: session=SECRET";
+        let hint = url_log_hint(opaque);
+        assert!(!hint.contains("SECRET"), "{hint}");
+        assert!(hint.contains("非 URL 文本"), "{hint}");
+    }
+
+    /// I1：debug_log 的数据出口。误传整条 URL / 原始行时输出仍然干净。
+    #[test]
+    fn sanitize_log_data_redacts_urls_and_keeps_plain_text() {
+        let cases = [
+            "https://cdn.example.com/f.bin?token=SECRET",
+            "转发 https://cdn.example.com/f.bin?token=SECRET 完成",
+            r#"{"url":"https://cdn.example.com/f.bin?token=SECRET","open_window":true}"#,
+            "Cookie: session=SECRET https://cdn.example.com/f?token=SECRET",
+        ];
+        for case in cases {
+            let sanitized = sanitize_log_data(case);
+            assert!(!sanitized.contains("SECRET"), "{case} -> {sanitized}");
+            assert!(!sanitized.contains("/f.bin"), "{case} -> {sanitized}");
+        }
+        // 无 URL 的普通文本逐字保留，日志可用性不受影响
+        for plain in [
+            "filename: a.bin, open_window: true",
+            "端口: 51234",
+            "MobileCookie",
+        ] {
+            assert_eq!(sanitize_log_data(plain), plain);
+        }
+        // 凭据形状同样不得落日志；已脱敏的 Debug 形状不受影响
+        let sanitized = sanitize_log_data("Cookie: session=SECRET");
+        assert!(!sanitized.contains("SECRET"), "{sanitized}");
+        assert!(sanitized.contains("含凭据内容已省略"), "{sanitized}");
+        let redacted = "Download(DownloadPayload { cookie: Some([redacted 15 B]) })";
+        assert_eq!(sanitize_log_data(redacted), redacted);
+    }
+
+    /// I5：请求 ID 经由真实线上形状回显，且缺失回显被容忍为空串。
+    #[test]
+    fn request_id_is_echoed_on_the_wire_in_both_directions() {
+        let request = NativeRequest::parse(DOWNLOAD_FLAT.as_bytes()).unwrap();
+        let line = NativeResponse::ok(&request.request_id, serde_json::json!({})).to_line();
+        assert_eq!(line.last(), Some(&b'\n'));
+        let parsed = NativeResponse::parse(&line).unwrap();
+        assert_eq!(parsed.request_id, request.request_id);
+        assert!(parsed.ok);
+
+        let failure = NativeResponse::error(
+            &request.request_id,
+            NativeError::new(NativeErrorCode::DesktopUnavailable, "未运行"),
+        );
+        let parsed = NativeResponse::parse(&failure.to_line()).unwrap();
+        assert_eq!(parsed.request_id, "req-1");
+        assert!(!parsed.ok);
+        assert_eq!(
+            parsed.error.unwrap().code,
+            NativeErrorCode::DesktopUnavailable
+        );
+
+        // 旧对端不回显 request_id：解析为空串而不是报错
+        let legacy = NativeResponse::parse(br#"{"ok":true,"handshake":"multidown"}"#).unwrap();
+        assert_eq!(legacy.request_id, "");
+    }
+
+    /// I5：握手标记在 data 内也必须被认可（桌面端现在用 NativeResponse 应答）。
+    #[test]
+    fn handshake_marker_is_accepted_in_the_native_response_shape() {
+        let reply = NativeResponse::ok(
+            "req-hs",
+            serde_json::json!({ "handshake": DESKTOP_HANDSHAKE, "protocol": PROTOCOL_VERSION }),
+        );
+        validate_handshake_reply(&reply.to_line()).unwrap();
+        // 旧的顶层形状继续有效
+        validate_handshake_reply(br#"{"ok":true,"handshake":"multidown","protocol":1}"#).unwrap();
+        // 缺少标记的进程仍然无法冒充桌面端
+        for reply in [
+            NativeResponse::ok("r", serde_json::json!({})),
+            NativeResponse::ok("r", serde_json::json!({ "handshake": "other-app" })),
+        ] {
+            let error = validate_handshake_reply(&reply.to_line()).unwrap_err();
+            assert_eq!(error.code, NativeErrorCode::DesktopError);
+        }
+    }
+
     mod discovery {
         use super::*;
         use std::io::{BufReader, BufRead, Write};
@@ -603,26 +853,43 @@ mod tests {
         #[test]
         fn port_file_paths_match_tauri_app_data_dir_per_platform() {
             let home = std::path::Path::new("/Users/x");
-            let file = "native_host_port.txt";
             assert_eq!(
                 port_file_path(Platform::MacOS, home, None),
-                home.join(format!("Library/Application Support/{APP_IDENTIFIER}/{file}"))
+                home.join(format!(
+                    "Library/Application Support/{APP_IDENTIFIER}/{PORT_FILE_NAME}"
+                ))
             );
-            let win_home = std::path::Path::new("C:/Users/x");
+            // Windows 的 home 已经是漫游目录本身（%APPDATA%），不能再拼
+            // 一次 AppData/Roaming，否则重定向过的漫游目录会解析到错误位置
+            let win_roaming = std::path::Path::new("C:/Users/x/AppData/Roaming");
             assert_eq!(
-                port_file_path(Platform::Windows, win_home, None),
-                win_home.join(format!("AppData/Roaming/{APP_IDENTIFIER}/{file}"))
+                port_file_path(Platform::Windows, win_roaming, None),
+                win_roaming.join(format!("{APP_IDENTIFIER}/{PORT_FILE_NAME}"))
             );
             let linux_home = std::path::Path::new("/home/x");
             assert_eq!(
                 port_file_path(Platform::Linux, linux_home, None),
-                linux_home.join(format!(".local/share/{APP_IDENTIFIER}/{file}"))
+                linux_home.join(format!(".local/share/{APP_IDENTIFIER}/{PORT_FILE_NAME}"))
             );
             let xdg = std::path::Path::new("/custom/xdg/data");
             assert_eq!(
                 port_file_path(Platform::Linux, linux_home, Some(xdg)),
-                xdg.join(format!("{APP_IDENTIFIER}/{file}"))
+                xdg.join(format!("{APP_IDENTIFIER}/{PORT_FILE_NAME}"))
             );
+        }
+
+        /// I4b：漫游目录被重定向（企业 / OneDrive）时，端口文件必须跟着
+        /// `%APPDATA%` 走，而不是回到 `%USERPROFILE%\AppData\Roaming`。
+        #[test]
+        fn windows_port_file_follows_a_relocated_roaming_folder() {
+            let relocated = std::path::Path::new("D:/Roaming/Redirected");
+            let resolved = port_file_path(Platform::Windows, relocated, None);
+            assert_eq!(
+                resolved,
+                relocated.join(format!("{APP_IDENTIFIER}/{PORT_FILE_NAME}"))
+            );
+            let rendered = resolved.to_string_lossy().replace('\\', "/");
+            assert!(!rendered.contains("AppData/Roaming"), "{rendered}");
         }
 
         #[test]
