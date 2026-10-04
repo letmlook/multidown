@@ -202,3 +202,154 @@ test('Firefox 变体仍保留 gecko ID 且不携带 Chromium key', () => {
   assert.equal(manifest.key, undefined);
   assert.deepEqual(manifest.background, { scripts: ['background.js'] });
 });
+
+// ─── background.js 的应答关联契约 ──────────────────────────────────────────────
+
+const backgroundSource = readFileSync(
+  path.resolve(projectRoot, 'integration/extension/background.js'),
+  'utf8',
+);
+
+/** 回显异常时才会出现的两条日志文案。 */
+const ECHO_ANOMALY_LOGS = ['未回显 request_id', 'request_id 与请求不一致'];
+
+/** 加载 background.js，并装一个足够跑通 Native Messaging 的 chrome 桩。 */
+function loadBackground(respond) {
+  const state = { posted: [], logs: '', listeners: [] };
+  const port = {
+    onMessage: { addListener: (fn) => (state.onMessage = fn) },
+    onDisconnect: { addListener: (fn) => (state.onDisconnect = fn) },
+    postMessage: (message) => {
+      state.posted.push(JSON.parse(message));
+      respond(state.posted[state.posted.length - 1], state);
+    },
+    disconnect: () => {},
+  };
+  globalThis.chrome = {
+    runtime: {
+      connectNative: () => port,
+      onInstalled: { addListener: () => {} },
+      onMessage: { addListener: (fn) => state.listeners.push(fn) },
+      lastError: undefined,
+    },
+    contextMenus: { create: () => {}, onClicked: { addListener: () => {} } },
+    storage: {
+      local: {
+        get: (key, callback) => callback({ extension_logs: state.logs }),
+        set: (values) => {
+          state.logs = values.extension_logs ?? state.logs;
+        },
+      },
+    },
+  };
+  // background.js 是普通脚本：重新求值即可拿到一份全新的模块级状态
+  new Function(backgroundSource)();
+  return state;
+}
+
+test('Native Host 回显的 request_id 与请求一致时不产生异常日志', () => {
+  const state = loadBackground((request, handle) => {
+    handle.onMessage({
+      request_id: request.request_id,
+      ok: true,
+      success: true,
+      message: '已连接',
+    });
+  });
+
+  const listener = state.listeners[0];
+  const response = new Promise((resolve) => listener({ action: 'check_connection' }, {}, resolve));
+
+  return response.then((result) => {
+    assert.equal(result.success, true);
+    assert.equal(result.message, '已连接');
+    assert.equal(state.posted[0].version, 1);
+    assert.ok(state.posted[0].request_id, '请求必须携带 request_id');
+    for (const anomaly of ECHO_ANOMALY_LOGS) {
+      assert.ok(!state.logs.includes(anomaly), `不应记录"${anomaly}"：${state.logs}`);
+    }
+  });
+});
+
+test('Host 回显的 request_id 不一致时记录日志但仍然返回应答', () => {
+  const state = loadBackground((request, handle) => {
+    handle.onMessage({ request_id: 'someone-elses-id', ok: true, success: true, message: '已连接' });
+  });
+
+  const listener = state.listeners[0];
+  const response = new Promise((resolve) => listener({ action: 'check_connection' }, {}, resolve));
+
+  return response.then((result) => {
+    assert.equal(result.message, '已连接', '不匹配的应答仍要交给用户');
+    assert.ok(
+      state.logs.includes('request_id 与请求不一致'),
+      `回显不一致必须留下日志：${state.logs}`,
+    );
+  });
+});
+test('旧版 Host 不回显 request_id 时按缺失处理而不是报错', () => {
+  const state = loadBackground((request, handle) => {
+    handle.onMessage({ success: true, message: '已连接' });
+  });
+
+  const listener = state.listeners[0];
+  const response = new Promise((resolve) => listener({ action: 'check_connection' }, {}, resolve));
+
+  return response.then((result) => {
+    assert.equal(result.message, '已连接');
+    assert.ok(
+      state.logs.includes('未回显 request_id'),
+      `缺失回显必须留下日志：${state.logs}`,
+    );
+  });
+});
+
+test('消息文案同时认旧的 message 与 NativeResponse 的 data.message', () => {
+  const state = loadBackground((request, handle) => {
+    handle.onMessage({
+      request_id: request.request_id,
+      ok: true,
+      success: true,
+      data: { message: '已加入下载' },
+    });
+  });
+
+  const listener = state.listeners[0];
+  const response = new Promise((resolve) => listener({ action: 'check_connection' }, {}, resolve));
+
+  return response.then((result) => {
+    assert.equal(result.message, '已加入下载');
+  });
+});
+
+test('等待上限是具名常量，且超过 Native Host 的 open_app 拉起预算', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const state = loadBackground(() => {
+    // 永不回应：只能靠超时收场
+  });
+
+  const listener = state.listeners[0];
+  const settled = new Promise((resolve) => listener({ action: 'check_connection' }, {}, resolve));
+  t.mock.timers.tick(8000);
+
+  return settled.then((result) => {
+    assert.equal(result.success, false);
+    assert.equal(result.message, 'Native Host 连接超时');
+  });
+});
+
+test('background.js 把等待上限与 Host 侧的耦合写在注释里', () => {
+  assert.match(
+    backgroundSource,
+    /const NATIVE_HOST_TIMEOUT_MS = 8000;/,
+    '等待上限必须是具名常量，供 native-host 的测试读取',
+  );
+  assert.ok(
+    backgroundSource.includes('integration/native-host/src/main.rs'),
+    '注释必须指明 Host 侧的文件名，改动任一侧都能看到耦合',
+  );
+  assert.ok(
+    backgroundSource.includes('OPEN_APP_LAUNCH_BUDGET'),
+    '注释必须指明 Host 侧的常量名',
+  );
+});

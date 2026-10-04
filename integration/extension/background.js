@@ -20,6 +20,21 @@ function debugLog(message, data = {}) {
 
 // ─── Native Messaging ─────────────────────────────────────────────────────────
 
+// 等待 Native Host 应答的上限（毫秒）。
+// 与 `integration/native-host/src/main.rs` 的 `OPEN_APP_LAUNCH_BUDGET` 绑定：
+// Host 端 open_app 的拉起预算是 5 秒（最坏 5s + 1s 握手 IO + 400ms 轮询），
+// 必须严格小于这里的上限，否则深链拉起失败时用户只会看到"Native Host 连接超时"，
+// 而 Host 写好的"无法启动应用，请手动启动 Multidown"会晚到已被放弃的管道里。
+// 改动任一侧都必须同步另一侧；native-host 里有测试把这两个数字绑在一起。
+const NATIVE_HOST_TIMEOUT_MS = 8000;
+
+// 应答消息：Host 同时给出旧的 `message` 与 NativeResponse 的 `data.message`，
+// 两个位置都认，新旧 Host 都能显示可读文案。
+function replyMessage(response, fallback) {
+  if (!response) return fallback;
+  return response.message || response.data?.message || fallback;
+}
+
 // Send a message to the Native Host via Chrome Native Messaging
 // Protocol: stdin writes 4-byte LE length + JSON; stdout reads 4-byte LE + JSON response
 function sendToNativeHost(action, data, useNative = true) {
@@ -34,10 +49,22 @@ function sendToNativeHost(action, data, useNative = true) {
       const timeout = setTimeout(() => {
         port.disconnect();
         reject(new Error('Native Host 连接超时'));
-      }, 8000);
+      }, NATIVE_HOST_TIMEOUT_MS);
+
+      // 协议 v1：请求携带版本与请求 ID。Host 在应答里回显 request_id；
+      // 旧版 Host 不回显，此时按"缺失"记录日志并照常使用应答。
+      const request_id = typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
       port.onMessage.addListener(response => {
         clearTimeout(timeout);
+        const echoed = response && response.request_id;
+        if (!echoed) {
+          debugLog('Native Host 应答未回显 request_id', { action, response });
+        } else if (echoed !== request_id) {
+          debugLog('Native Host 回显的 request_id 与请求不一致', { action });
+        }
         debugLog('Native Host 响应', response);
         resolve(response);
         port.disconnect();
@@ -50,10 +77,6 @@ function sendToNativeHost(action, data, useNative = true) {
         }
       });
 
-      // 协议 v1：请求携带版本与请求 ID，Host 会原样回显请求 ID
-      const request_id = typeof crypto !== 'undefined' && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `req-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const message = JSON.stringify({ version: 1, request_id, action, ...data });
       debugLog('发送 Native Host 消息', { request_id, action, data });
       port.postMessage(message);
@@ -221,7 +244,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Quick connectivity check
         try {
           const resp = await sendToNativeHost('test_connection', {});
-          return { success: true, message: resp?.message || '已连接' };
+          return { success: true, message: replyMessage(resp, '已连接') };
         } catch (e) {
           return { success: false, message: e.message };
         }
@@ -242,7 +265,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           save_path: '',
           open_window: true
         });
-        return { success: result.success !== false, message: result?.message || '已添加' };
+        return { success: result.success !== false, message: replyMessage(result, '已添加') };
 
       } else if (message.action === 'download_media') {
         const rejected = await checkCaptureRules(message.url);
@@ -260,7 +283,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           save_path: '',
           open_window: true
         });
-        return { success: result.success !== false, message: result?.message || '已添加' };
+        return { success: result.success !== false, message: replyMessage(result, '已添加') };
 
       } else if (message.action === 'export_logs') {
         const result = await new Promise(resolve => {
