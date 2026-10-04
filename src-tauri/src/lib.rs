@@ -1363,180 +1363,101 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
-/// 获取浏览器扩展所在路径（用于「加载已解压的扩展程序」）。
-/// 若安装包内带扩展，会复制到应用数据目录后返回；否则返回错误。
-#[tauri::command]
-fn get_browser_extension_path(app: tauri::AppHandle) -> Result<String, String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let crx_dest = app_data.join("extension").join("multidown-extension.crx");
-    if crx_dest.exists() {
-        return Ok(crx_dest.to_string_lossy().to_string());
-    }
-    if let Ok(res_dir) = app.path().resource_dir() {
-        let crx_src = res_dir.join("extension").join("multidown-extension.crx");
-        if crx_src.exists() {
-            let ext_dest_dir = app_data.join("extension");
-            std::fs::create_dir_all(&ext_dest_dir).map_err(|e| e.to_string())?;
-            std::fs::copy(&crx_src, &crx_dest).map_err(|e| e.to_string())?;
-            return Ok(crx_dest.to_string_lossy().to_string());
-        }
-    }
-    Err("扩展未随应用打包，请从项目 integration/extension 目录获取。".to_string())
-}
-
 #[tauri::command]
 async fn install_browser_extension(app: tauri::AppHandle) -> Result<BrowserInstallOutcome, String> {
     register_native_host(app.clone())?;
     let ext_dir = get_extension_directory(app)?;
     browser_integration::open_extension_installers(std::path::Path::new(&ext_dir))
+        .map_err(|error| error.to_string())
 }
 
-/// 获取扩展目录（解压后的扩展文件）
+/// 获取扩展目录（已解压的扩展文件，含 icons/ 等子目录）。
+///
+/// 安装包内提供已解压目录；只有 ZIP 时先解压。部署后立刻校验 manifest 引用的资源，
+/// 避免把缺文件的残缺扩展交给浏览器。
+#[tauri::command]
 fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let ext_dir = app_data.join("extension");
 
-    // 检查扩展目录是否存在
-    if ext_dir.join("manifest.json").exists() {
+    // 已部署的完整扩展直接复用
+    if browser_integration::validate_extension_directory(&ext_dir).is_ok() {
         return Ok(ext_dir.to_string_lossy().to_string());
     }
 
-    // 检查资源目录中的扩展文件
     if let Ok(res_dir) = app.path().resource_dir() {
-        // 首先检查解压后的扩展目录
+        // 首选已解压的扩展目录：递归部署，保留 icons/ 等子目录
         let unpacked_ext_dir = res_dir.join("extension").join("unpacked");
-        if unpacked_ext_dir.join("manifest.json").exists() {
-            // 复制到应用数据目录
-            std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-
-            // 复制所有文件
-            let files = std::fs::read_dir(&unpacked_ext_dir).map_err(|e| e.to_string())?;
-            for file in files {
-                let file = file.map_err(|e| e.to_string())?;
-                let src_path = file.path();
-                let dest_path = ext_dir.join(file.file_name());
-                if src_path.is_file() {
-                    std::fs::copy(&src_path, &dest_path).map_err(|e| e.to_string())?;
-                }
-            }
-
+        if unpacked_ext_dir.is_dir() {
+            browser_integration::deploy_extension_directory(&unpacked_ext_dir, &ext_dir)
+                .map_err(|error| error.to_string())?;
             return Ok(ext_dir.to_string_lossy().to_string());
         }
 
-        // 尝试使用ZIP文件
+        // 其次使用打包好的 ZIP
         let zip_path = res_dir.join("extension").join("multidown-extension.zip");
-        if zip_path.exists() {
-            // 创建扩展目录
-            std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-
-            // 解压zip文件
-            let zip_content = std::fs::read(&zip_path).map_err(|e| e.to_string())?;
-
-            // 使用zip库解压
-            let mut cursor = std::io::Cursor::new(zip_content);
-            let mut archive = zip::ZipArchive::new(&mut cursor).map_err(|e| e.to_string())?;
-
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-                let outpath = ext_dir.join(file.name());
-
-                if file.name().ends_with('/') {
-                    std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
-                } else {
-                    if let Some(p) = outpath.parent() {
-                        if !p.exists() {
-                            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                        }
-                    }
-                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
-                    std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
-                }
-            }
-
-            return Ok(ext_dir.to_string_lossy().to_string());
-        }
-
-        // 最后尝试CRX文件
-        let crx_path = res_dir.join("extension").join("multidown-extension.crx");
-        if crx_path.exists() {
-            // 创建扩展目录
-            std::fs::create_dir_all(&ext_dir).map_err(|e| e.to_string())?;
-
-            // 解压crx文件（实际上是zip文件）
-            let crx_content = std::fs::read(&crx_path).map_err(|e| e.to_string())?;
-
-            // 使用zip库解压
-            let mut cursor = std::io::Cursor::new(crx_content);
-            let mut archive = zip::ZipArchive::new(&mut cursor).map_err(|e| e.to_string())?;
-
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-                let outpath = ext_dir.join(file.name());
-
-                if file.name().ends_with('/') {
-                    std::fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
-                } else {
-                    if let Some(p) = outpath.parent() {
-                        if !p.exists() {
-                            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                        }
-                    }
-                    let mut outfile = std::fs::File::create(&outpath).map_err(|e| e.to_string())?;
-                    std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
-                }
-            }
-
+        if zip_path.is_file() {
+            extract_extension_zip(&zip_path, &ext_dir).map_err(|error| error.to_string())?;
+            browser_integration::validate_extension_directory(&ext_dir)
+                .map_err(|error| error.to_string())?;
             return Ok(ext_dir.to_string_lossy().to_string());
         }
     }
 
-    Err("扩展文件不存在".to_string())
+    Err("扩展未随应用打包，请先运行 npm run build:extension 重新构建。".to_string())
 }
 
-#[tauri::command]
-async fn package_browser_extension(app: tauri::AppHandle) -> Result<String, String> {
-    use std::fs::File;
-    use std::io::Write;
-    use zip::write::FileOptions;
+/// 解压扩展 ZIP：拒绝逃逸目标目录的条目，解压后由调用方校验。
+fn extract_extension_zip(
+    zip_path: &std::path::Path,
+    ext_dir: &std::path::Path,
+) -> Result<(), browser_integration::ExtensionInstallError> {
+    std::fs::create_dir_all(ext_dir)?;
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(browser_integration::ExtensionInstallError::from_zip_error)?;
 
-    // 获取扩展路径
-    let ext_path = get_browser_extension_path(app.clone())?;
-    let ext_dir = std::path::Path::new(&ext_path);
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(browser_integration::ExtensionInstallError::from_zip_error)?;
+        let Some(relative) = std::path::Path::new(entry.name()).components().next() else {
+            continue;
+        };
+        if matches!(
+            relative,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        ) {
+            return Err(browser_integration::ExtensionInstallError::Deploy {
+                context: format!("压缩包条目路径非法: {}", entry.name()),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, "路径逃逸"),
+            });
+        }
+        let outpath = ext_dir.join(entry.name());
 
-    // 创建输出目录
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let output_dir = app_data.join("extension");
-    std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
-
-    // 生成zip文件路径
-    let zip_path = output_dir.join("multidown-extension.zip");
-
-    // 创建zip文件
-    let file = File::create(&zip_path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipWriter::new(file);
-
-    // 遍历扩展目录中的所有文件
-    let walk_dir = walkdir::WalkDir::new(ext_dir).into_iter();
-    for entry in walk_dir.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() {
-            // 计算相对路径
-            let relative_path = path.strip_prefix(ext_dir).map_err(|e| e.to_string())?;
-            let relative_path_str = relative_path.to_string_lossy().to_string();
-
-            // 写入文件到zip
-            zip.start_file(relative_path_str, FileOptions::default())
-                .map_err(|e| e.to_string())?;
-            let mut file = File::open(path).map_err(|e| e.to_string())?;
-            let mut buffer = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut buffer).map_err(|e| e.to_string())?;
-            zip.write_all(&buffer).map_err(|e| e.to_string())?;
+        if entry.is_dir() {
+            std::fs::create_dir_all(&outpath)?;
+        } else {
+            if let Some(parent) = outpath.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut outfile = std::fs::File::create(&outpath)?;
+            std::io::copy(&mut entry, &mut outfile)?;
         }
     }
 
-    // 完成zip写入
-    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
 
+/// 导出扩展 ZIP：条目路径与已解压目录一致，可直接分发或解压后加载。
+#[tauri::command]
+async fn export_extension_zip(app: tauri::AppHandle) -> Result<String, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let ext_dir = get_extension_directory(app)?;
+    let zip_path = app_data.join("extension").join("multidown-extension.zip");
+
+    browser_integration::export_extension_zip(std::path::Path::new(&ext_dir), &zip_path)
+        .map_err(|error| error.to_string())?;
     Ok(zip_path.to_string_lossy().to_string())
 }
 
@@ -2896,9 +2817,9 @@ pub fn run() {
             read_clipboard_text,
             clear_clipboard_text,
             write_clipboard_text,
-            get_browser_extension_path,
+            get_extension_directory,
             install_browser_extension,
-            package_browser_extension,
+            export_extension_zip,
             export_tasks,
             import_tasks,
             // Queue commands

@@ -1,5 +1,9 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  formatExtensionDirectoryHint,
+  formatExtensionZipHint,
+} from "../utils/browserInstall";
 
 interface InstallExtensionModalProps {
   open: boolean;
@@ -8,17 +12,20 @@ interface InstallExtensionModalProps {
 
 export function InstallExtensionModal({ open, onClose }: InstallExtensionModalProps) {
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
   const doWithPath = async (
     action: "open" | "copy"
   ): Promise<void> => {
     setError(null);
+    setStatus(null);
     setCopied(false);
     try {
-      const path = await invoke<string>("get_browser_extension_path");
+      const path = await invoke<string>("get_extension_directory");
       if (action === "open") {
         await invoke("open_folder", { path });
+        setStatus(formatExtensionDirectoryHint(path));
       } else {
         await invoke("write_clipboard_text", { text: path });
         setCopied(true);
@@ -31,6 +38,7 @@ export function InstallExtensionModal({ open, onClose }: InstallExtensionModalPr
 
   const installExtension = async (): Promise<void> => {
     setError(null);
+    setStatus(null);
     try {
       await invoke("install_browser_extension");
     } catch (e) {
@@ -38,10 +46,12 @@ export function InstallExtensionModal({ open, onClose }: InstallExtensionModalPr
     }
   };
 
-  const packageExtension = async (): Promise<void> => {
+  const exportExtensionZip = async (): Promise<void> => {
     setError(null);
+    setStatus(null);
     try {
-      const zipPath = await invoke<string>("package_browser_extension");
+      const zipPath = await invoke<string>("export_extension_zip");
+      setStatus(formatExtensionZipHint(zipPath));
       await invoke("open_folder", { path: zipPath });
     } catch (e) {
       setError(String(e));
@@ -65,8 +75,15 @@ export function InstallExtensionModal({ open, onClose }: InstallExtensionModalPr
             <li>选择下方「打开扩展文件夹」后显示的文件夹</li>
           </ol>
           <p style={{ margin: 0, fontSize: 12, color: "var(--text-secondary, #666)" }}>
+            扩展以已解压目录的形式提供（含 <code>icons/</code> 等子目录），浏览器不能直接加载
+            ZIP：需要分发时用「导出扩展 ZIP」，解压后再按上面的步骤加载。
+          </p>
+          <p style={{ margin: 0, fontSize: 12, color: "var(--text-secondary, #666)" }}>
             安装扩展后还需注册 Native Host，详见 <code>integration/README.md</code>。
           </p>
+          {status && (
+            <p style={{ margin: 0, fontSize: 13, whiteSpace: "pre-line" }}>{status}</p>
+          )}
           {error && (
             <p style={{ margin: 0, color: "var(--error, #c00)", fontSize: 13 }}>{error}</p>
           )}
@@ -82,9 +99,9 @@ export function InstallExtensionModal({ open, onClose }: InstallExtensionModalPr
           <button
             type="button"
             className="btn"
-            onClick={packageExtension}
+            onClick={exportExtensionZip}
           >
-            打包扩展
+            导出扩展 ZIP
           </button>
           <button
             type="button"
