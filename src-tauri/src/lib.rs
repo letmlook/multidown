@@ -11,6 +11,9 @@ mod settings;
 mod storage;
 mod torrent;
 
+#[cfg(feature = "integration-tests")]
+pub mod test_support;
+
 use arboard::Clipboard;
 use browser_integration::BrowserInstallOutcome;
 use chrono::Local;

@@ -62,6 +62,26 @@ core-foundation = "0.10"
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# `tests/` 下的集成目标以**外部 crate** 的方式链接本 crate，因此只能看见 `pub`
+# 项。开启该 feature 后 `src/test_support.rs` 才会把这些内部 API 以一个窄的
+# `pub mod` 暴露出来；关闭时模块整体不存在，发布构建与普通 `cargo test` 不受
+# 任何影响（Cargo 没有 "dev-only feature"，只能靠 feature 门控 + required-features）。
+integration-tests = []
+
+[dev-dependencies]
+# 集成测试要自己造真实的种子 metainfo fixture（无 tracker、不联网）。
+# 与上面的正式依赖同版本同 feature，Cargo 会复用同一份编译产物。
+librqbit = { version = "9.0.1", default-features = false, features = ["default-tls"] }
+
+# 集成目标必须显式声明 required-features：feature 关闭时 Cargo **跳过**它们，
+# 而不是编译失败——否则一次普通的 `cargo test` 就会被集成测试依赖的 API 弄挂。
+[[test]]
+name = "http_resume"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "torrent_restart"
+required-features = ["integration-tests"]
 
 # 降低 dev 编译时内存占用，避免 rustc/LLVM OOM（内存不足时可启用）
 [profile.dev]

@@ -8,6 +8,12 @@ description = "Chrome Native Messaging Host for Multidown"
 name = "multidown-native-host"
 path = "src/main.rs"
 
+# 端到端往返测试：把上面的二进制当子进程跑起来，从带帧的 stdin 写请求、
+# 从 stdout 读应答，并指向测试自己起的回环桌面端桩。显式声明（而不是靠
+# 自动发现）是为了让"这个 crate 有集成目标"在清单里看得见。
+[[test]]
+name = "round_trip"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
