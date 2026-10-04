@@ -1654,3 +1654,152 @@ input[type="checkbox"]:hover {
 .app-layout.dark {
   /* 已经是深色主题，这些变量保持一致 */
 }
+
+/* ===== 下载完成弹窗条目（沿用 .modal 体系） ===== */
+.completion-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.completion-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-glass);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.completion-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.completion-item-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.completion-item-path {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.completion-item-path-unknown {
+  font-style: italic;
+  color: #e6a23c;
+}
+
+.completion-item-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.completion-error {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: #c0392b;
+}
+
+/* ===== 启动恢复警告横幅 ===== */
+.recovery-warnings {
+  position: relative;
+  z-index: 2;
+  max-width: 1200px;
+  margin: 16px auto 0;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid rgba(230, 162, 60, 0.45);
+  border-radius: 14px;
+  background: rgba(230, 162, 60, 0.12);
+}
+
+.recovery-warnings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.recovery-warnings-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: #c0392b;
+}
+
+.recovery-warnings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.recovery-warning-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.recovery-warning-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.recovery-warning-domain {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(230, 162, 60, 0.2);
+  color: #e6a23c;
+}
+
+.recovery-warning-message {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.recovery-warning-path {
+  margin: 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  word-break: break-all;
+}

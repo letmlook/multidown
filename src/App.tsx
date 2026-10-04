@@ -9,8 +9,8 @@ import {
   sendNotification,
 } from "@tauri-apps/plugin-notification";
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
-import type { BrowserInstallOutcome, TaskInfo } from "./types/download";
-import { isTorrentInput } from "./types/download";
+import type { BrowserInstallOutcome, CompletionItem, TaskInfo } from "./types/download";
+import { addCompletionItem, isTorrentInput } from "./types/download";
 import { formatBrowserInstallOutcome } from "./utils/browserInstall";
 import { TaskList } from "./components/TaskList";
 import { AddTask } from "./components/AddTask";
@@ -27,6 +27,8 @@ import { MoveRenameModal } from "./components/MoveRenameModal";
 import { DeleteTaskModal } from "./components/DeleteTaskModal";
 import { AboutModal } from "./components/AboutModal";
 import { Toast } from "./components/Toast";
+import { CompletionModal } from "./components/CompletionModal";
+import { RecoveryWarnings } from "./components/RecoveryWarnings";
 import { useToast } from "./hooks/useToast";
 import type { AppSettings } from "./types/download";
 import "./index.css";
@@ -67,6 +69,12 @@ function App() {
   const [batchAddInitialUrls, setBatchAddInitialUrls] = useState("");
   /** 外部输入预填给「新建任务」的地址（磁力 / .torrent） */
   const [addTaskInitialUrl, setAddTaskInitialUrl] = useState("");
+  /** 下载完成队列：所有未确认条目聚合进同一个弹窗，关闭即清空 */
+  const [completionItems, setCompletionItems] = useState<CompletionItem[]>([]);
+  /** 设置项 show_complete_dialog：与系统通知设置相互独立 */
+  const [showCompleteDialog, setShowCompleteDialog] = useState(true);
+  /** 任务列表快照，供完成事件查询 save_path（事件 payload 不带路径） */
+  const tasksRef = useRef<TaskInfo[]>([]);
   const { toast, showToast, hideToast } = useToast();
 
   const refreshTasks = useCallback(async () => {
@@ -75,9 +83,15 @@ function App() {
       setTasks(list);
       setSelectedId((id) => (id && list.some((t) => t.id === id)) ? id : list[0]?.id ?? null);
     } catch (e) {
+      // 不再只写控制台：任务列表加载失败用户必须看得见
       console.error(e);
+      showToast("刷新任务列表失败");
     }
-  }, []);
+  }, [showToast]);
+
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   useEffect(() => {
     refreshTasks();
@@ -91,9 +105,27 @@ function App() {
 
   useEffect(() => {
     const unlisten = listen<[string, string, string]>("download-finished", async (e) => {
-      const [_, status, filename] = e.payload;
+      const [taskId, status, filename] = e.payload;
       try {
         const s = await invoke<AppSettings>("get_settings");
+        setShowCompleteDialog(s.show_complete_dialog);
+
+        // ── 完成弹窗队列：与系统通知相互独立 ──
+        // 事件只带 (taskId, status, filename)，没有路径；save_path 只能从任务列表取，
+        // 取不到时留 null，由弹窗显式标注"保存路径未知"，不臆造相对路径。
+        if (status === "completed" && s.show_complete_dialog) {
+          const savePath = tasksRef.current.find((t) => t.id === taskId)?.save_path ?? null;
+          setCompletionItems((items) =>
+            addCompletionItem(items, {
+              taskId,
+              filename: filename || "任务已完成",
+              savePath,
+            })
+          );
+          refreshTasks();
+        }
+
+        // ── 系统通知：notification_on_complete / notification_on_fail 单独控制 ──
         const show =
           (status === "completed" && s.notification_on_complete) ||
           (status === "failed" && s.notification_on_fail);
@@ -114,7 +146,7 @@ function App() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [refreshTasks]);
 
   useEffect(() => {
     try {
@@ -705,6 +737,8 @@ function App() {
         </div>
       )}
 
+      <RecoveryWarnings />
+
       <main className="main-content">
         <TaskList
           tasks={displayTasks}
@@ -753,6 +787,12 @@ function App() {
           setOptionsOpen(false);
           setScheduleOpen(false);
         }}
+      />
+
+      <CompletionModal
+        enabled={showCompleteDialog}
+        items={completionItems}
+        onClose={() => setCompletionItems([])}
       />
 
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} version="0.3.0" />

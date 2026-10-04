@@ -19,6 +19,34 @@ export interface RecoveryWarning {
 /** 任务协议类型；旧任务数据默认为 "http" */
 export type TaskKind = "http" | "torrent";
 
+/**
+ * 下载完成弹窗的一条待确认条目。
+ * `filename` 来自 download-finished 事件；`savePath` 只能取自任务列表
+ * （事件的 payload 不含路径），任务已不在列表中时为 null——此时不臆造
+ * 相对路径，弹窗会显式标注"保存路径未知"并禁用打开操作。
+ */
+export interface CompletionItem {
+  taskId: string;
+  filename: string;
+  /** 任务完整保存路径（含文件名，与 TaskInfo.save_path 一致）；未知时 null */
+  savePath: string | null;
+}
+
+/**
+ * 完成队列插入策略：不同 taskId 追加；同一 taskId 再次完成时**就地替换**
+ * 旧条目（保留位置、更新文件名与路径），因此连发事件不会产生重复行。
+ */
+export function addCompletionItem(
+  items: CompletionItem[],
+  next: CompletionItem
+): CompletionItem[] {
+  const index = items.findIndex((item) => item.taskId === next.taskId);
+  if (index === -1) return [...items, next];
+  const merged = items.slice();
+  merged[index] = next;
+  return merged;
+}
+
 /** 种子内的单个文件（对应 Rust TorrentFileInfo） */
 export interface TorrentFileInfo {
   index: number;
