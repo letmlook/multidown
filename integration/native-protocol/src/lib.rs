@@ -114,10 +114,9 @@ impl fmt::Debug for NativePayload {
         match self {
             NativePayload::TestConnection => f.write_str("TestConnection"),
             NativePayload::OpenApp => f.write_str("OpenApp"),
-            NativePayload::OpenWindow { url } => f
-                .debug_struct("OpenWindow")
-                .field("url", url)
-                .finish(),
+            NativePayload::OpenWindow { url } => {
+                f.debug_struct("OpenWindow").field("url", url).finish()
+            }
             NativePayload::Download(payload) => f.debug_tuple("Download").field(payload).finish(),
             NativePayload::GetConfig => f.write_str("GetConfig"),
         }
@@ -199,13 +198,12 @@ impl NativeRequest {
     /// [`NativeErrorCode::UnknownAction`]；其余解析失败一律是
     /// [`NativeErrorCode::InvalidPayload`]。
     pub fn parse(bytes: &[u8]) -> Result<Self, NativeError> {
-        let value: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::InvalidPayload,
-                    format!("invalid json: {error}"),
-                )
-            })?;
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::InvalidPayload,
+                format!("invalid json: {error}"),
+            )
+        })?;
         // 版本检查先于动作解析。显式给出的版本无论什么类型都必须等于
         // 当前版本；缺省（旧扩展）才按当前版本处理。
         let version = value.get("version");
@@ -339,10 +337,9 @@ mod tests {
 
     #[test]
     fn legacy_requests_without_version_are_accepted_as_current_version() {
-        let request = NativeRequest::parse(
-            br#"{"action":"download","url":"https://example.com/a.bin"}"#,
-        )
-        .unwrap();
+        let request =
+            NativeRequest::parse(br#"{"action":"download","url":"https://example.com/a.bin"}"#)
+                .unwrap();
         assert_eq!(request.version, PROTOCOL_VERSION);
         assert_eq!(
             request.payload,

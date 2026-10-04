@@ -1,18 +1,16 @@
 //! Chrome Native Messaging Host for Multidown.
 //! 从 Chrome 扩展接收链接，通过 TCP 转发给主程序。
 //! 与IDM通信方式对齐，支持更多下载参数和命令结构。
-//! 
+//!
 //! 协议：stdin 读 4 字节 (little-endian 长度) + N 字节 JSON；
 //!       stdout 写 4 字节长度 + JSON 响应。
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::fs::OpenOptions;
 use std::io::BufWriter;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 
-use native_protocol::{
-    DownloadPayload, NativeErrorCode, NativeRequest, NativePayload,
-};
+use native_protocol::{DownloadPayload, NativeErrorCode, NativePayload, NativeRequest};
 
 // 调试日志函数
 fn debug_log(message: &str, data: Option<&str>) {
@@ -21,22 +19,18 @@ fn debug_log(message: &str, data: Option<&str>) {
         Some(d) => format!("[{}] [Multidown Native Host] {}: {}", timestamp, message, d),
         None => format!("[{}] [Multidown Native Host] {}", timestamp, message),
     };
-    
+
     // 输出到标准错误
     eprintln!("{}", log_message);
-    
+
     // 写入日志文件
     if let Some(log_path) = log_file_path() {
         // 确保日志目录存在
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             let mut writer = BufWriter::new(file);
             let _ = writeln!(writer, "{}", log_message);
         } else {
@@ -54,7 +48,9 @@ fn log_file_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         std::env::var("APPDATA").ok().map(|d| {
-            std::path::PathBuf::from(d).join("com.multidown.app").join("native_host.log")
+            std::path::PathBuf::from(d)
+                .join("com.multidown.app")
+                .join("native_host.log")
         })
     }
     #[cfg(target_os = "macos")]
@@ -72,7 +68,11 @@ fn log_file_path() -> Option<std::path::PathBuf> {
         let dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config")))?;
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| std::path::PathBuf::from(h).join(".config"))
+            })?;
         Some(dir.join("com.multidown.app").join("native_host.log"))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -85,7 +85,9 @@ fn port_file_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         std::env::var("APPDATA").ok().map(|d| {
-            std::path::PathBuf::from(d).join("com.multidown.app").join("native_host_port.txt")
+            std::path::PathBuf::from(d)
+                .join("com.multidown.app")
+                .join("native_host_port.txt")
         })
     }
     #[cfg(target_os = "macos")]
@@ -103,7 +105,11 @@ fn port_file_path() -> Option<std::path::PathBuf> {
         let dir = std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".config")))?;
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| std::path::PathBuf::from(h).join(".config"))
+            })?;
         Some(dir.join("com.multidown.app").join("native_host_port.txt"))
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -161,7 +167,10 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
     // 全局约束：日志不得包含 cookie / 认证头 / 完整敏感 URL；referer 同理脱敏
     debug_log(
         "下载参数",
-        Some(&format!("filename: {}, open_window: {}", filename, open_window)),
+        Some(&format!(
+            "filename: {}, open_window: {}",
+            filename, open_window
+        )),
     );
 
     let port = match port_file_path() {
@@ -184,7 +193,7 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
             0
         }
     };
-    
+
     if port == 0 {
         debug_log("端口为0，主程序未运行", None);
         send_response(
@@ -197,7 +206,7 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
 
     let addr = format!("127.0.0.1:{}", port);
     debug_log("尝试连接主程序", Some(&addr));
-    
+
     let mut stream = match TcpStream::connect(&addr) {
         Ok(s) => {
             debug_log("连接主程序成功", None);
@@ -205,17 +214,13 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
         }
         Err(e) => {
             debug_log("连接主程序失败", Some(&e.to_string()));
-            send_response(
-                stdout,
-                false,
-                &format!("无法连接 Multidown: {}", e),
-            );
+            send_response(stdout, false, &format!("无法连接 Multidown: {}", e));
             return false;
         }
     };
 
     // 与IDM对齐的消息结构
-    let body = serde_json::json!({ 
+    let body = serde_json::json!({
         "action": "download",
         "url": url,
         "filename": filename,
@@ -226,18 +231,18 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
         "save_path": save_path,
         "open_window": open_window
     });
-    
+
     let body_str = body.to_string();
     // 用脱敏后的 Debug 而不是原始 JSON：cookie/user_agent/post_data 不落日志
     debug_log("转发下载请求", Some(&format!("{download:?}")));
-    
+
     let line = format!("{}\n", body_str);
     if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
         debug_log("发送消息失败", None);
         send_response(stdout, false, "发送失败");
         return false;
     }
-    
+
     debug_log("消息发送成功，等待主程序响应", None);
 
     // 读取主程序返回的一行 JSON：{"ok":true} 或 {"ok":false,"error":"..."}
@@ -260,7 +265,7 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
             Err(_) => break,
         }
     }
-    
+
     let response_msg = if n == 0 {
         debug_log("未收到主程序响应", None);
         send_response(stdout, false, "未收到主程序响应");
@@ -279,7 +284,7 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
             }
         }
     };
-    
+
     let response: serde_json::Value = match serde_json::from_str(&response_msg) {
         Ok(v) => v,
         Err(_) => {
@@ -288,15 +293,25 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
             return false;
         }
     };
-    
-    let ok = response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let ok = response
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = response
         .get("error")
         .and_then(|v| v.as_str())
-        .unwrap_or(if ok { "已加入下载" } else { "添加失败" });
-    
-    debug_log("处理响应完成", Some(&format!("ok: {}, message: {}", ok, message)));
-    
+        .unwrap_or(if ok {
+            "已加入下载"
+        } else {
+            "添加失败"
+        });
+
+    debug_log(
+        "处理响应完成",
+        Some(&format!("ok: {}, message: {}", ok, message)),
+    );
+
     send_response(stdout, ok, message);
     true
 }
@@ -380,7 +395,7 @@ fn handle_get_config_message(stdout: &mut impl Write) -> bool {
 
 fn handle_open_window_message(url: &str, stdout: &mut impl Write) -> bool {
     let url = url.to_string();
-    
+
     let port = match port_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(s) => s.trim().parse::<u16>().unwrap_or(0),
         None => 0,
@@ -398,16 +413,12 @@ fn handle_open_window_message(url: &str, stdout: &mut impl Write) -> bool {
     let mut stream = match TcpStream::connect(&addr) {
         Ok(s) => s,
         Err(e) => {
-            send_response(
-                stdout,
-                false,
-                &format!("无法连接 Multidown: {}", e),
-            );
+            send_response(stdout, false, &format!("无法连接 Multidown: {}", e));
             return false;
         }
     };
 
-    let body = serde_json::json!({ 
+    let body = serde_json::json!({
         "action": "open_window",
         "url": url
     });
@@ -456,18 +467,25 @@ fn handle_open_window_message(url: &str, stdout: &mut impl Write) -> bool {
             return false;
         }
     };
-    let ok = response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ok = response
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = response
         .get("error")
         .and_then(|v| v.as_str())
-        .unwrap_or(if ok { "已打开下载窗口" } else { "打开窗口失败" });
+        .unwrap_or(if ok {
+            "已打开下载窗口"
+        } else {
+            "打开窗口失败"
+        });
     send_response(stdout, ok, message);
     true
 }
 
 fn main() {
     debug_log("本地主机启动", None);
-    
+
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let mut stdout = std::io::stdout().lock();
@@ -532,6 +550,6 @@ fn main() {
             }
         }
     }
-    
+
     debug_log("处理完成", None);
 }
