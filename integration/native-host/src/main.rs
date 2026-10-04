@@ -158,7 +158,11 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
     let save_path = download.save_path.as_deref().unwrap_or("");
     let open_window = download.open_window;
 
-    debug_log("下载参数", Some(&format!("filename: {}, referer: {}, open_window: {}", filename, referer, open_window)));
+    // 全局约束：日志不得包含 cookie / 认证头 / 完整敏感 URL；referer 同理脱敏
+    debug_log(
+        "下载参数",
+        Some(&format!("filename: {}, open_window: {}", filename, open_window)),
+    );
 
     let port = match port_file_path() {
         Some(p) => {
@@ -224,7 +228,8 @@ fn handle_download_message(download: &DownloadPayload, stdout: &mut impl Write) 
     });
     
     let body_str = body.to_string();
-    debug_log("发送给主程序的消息", Some(&body_str));
+    // 用脱敏后的 Debug 而不是原始 JSON：cookie/user_agent/post_data 不落日志
+    debug_log("转发下载请求", Some(&format!("{download:?}")));
     
     let line = format!("{}\n", body_str);
     if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
@@ -495,7 +500,8 @@ fn main() {
     // 共享协议 crate 是唯一的解析权威；动作分发与负载提取全部走类型。
     match NativeRequest::parse(&payload) {
         Err(error) => {
-            debug_log("请求解析失败", Some(&error.to_string()));
+            // 错误文本可能内嵌输入片段，日志只记错误码
+            debug_log("请求解析失败", Some(&format!("{:?}", error.code)));
             let message = match error.code {
                 NativeErrorCode::UnknownAction => "unknown action",
                 NativeErrorCode::UnsupportedVersion => "unsupported protocol version",

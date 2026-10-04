@@ -2390,7 +2390,12 @@ pub fn run() {
                         continue;
                     }
 
-                    debug_log(&app_handle_clone, "接收到消息", Some(&line));
+                    // 日志不落原始行：可能包含 cookie / 认证头等敏感值
+                    debug_log(
+                        &app_handle_clone,
+                        "接收到消息",
+                        Some(&format!("{} bytes", line.len())),
+                    );
 
                     // 共享协议 crate 是唯一的解析权威；裸 URL 直连作为
                     // download 动作的兼容输入保留。
@@ -2474,7 +2479,11 @@ pub fn run() {
                                 ..
                             } = download;
 
-                            debug_log(&app_handle_clone, "下载参数", Some(&format!("filename: {:?}, referer: {:?}, open_window: {:?}", filename, referer, open_window)));
+                            debug_log(
+                                &app_handle_clone,
+                                "下载参数",
+                                Some(&format!("filename: {:?}, open_window: {:?}", filename, open_window)),
+                            );
 
                             let (resp_tx, resp_rx) = oneshot::channel();
                             let download_task = DownloadTask {

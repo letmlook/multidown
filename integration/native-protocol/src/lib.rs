@@ -206,25 +206,40 @@ impl NativeRequest {
                     format!("invalid json: {error}"),
                 )
             })?;
-        let version = value
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(PROTOCOL_VERSION as u64);
-        if version != PROTOCOL_VERSION as u64 {
+        // 版本检查先于动作解析。显式给出的版本无论什么类型都必须等于
+        // 当前版本；缺省（旧扩展）才按当前版本处理。
+        let version = value.get("version");
+        let version_matches = match version {
+            None => true,
+            Some(v) => v.as_u64() == Some(PROTOCOL_VERSION as u64),
+        };
+        if !version_matches {
             return Err(NativeError::new(
                 NativeErrorCode::UnsupportedVersion,
-                format!("protocol version {version} is not supported; supported: {PROTOCOL_VERSION}"),
+                format!(
+                    "protocol version {:?} is not supported; supported: {PROTOCOL_VERSION}",
+                    version
+                ),
             ));
         }
+        // 不依赖 serde 错误文本：显式检查 action 键是否能映射到已知动作
+        let known_action = value
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .map(|action| {
+                serde_json::from_value::<NativeAction>(serde_json::Value::String(
+                    action.to_string(),
+                ))
+                .is_ok()
+            })
+            .unwrap_or(true);
         serde_json::from_value(value).map_err(|error| {
-            let unknown_action = error
-                .to_string()
-                .contains("unknown variant")
-                .then_some(NativeErrorCode::UnknownAction);
-            NativeError::new(
-                unknown_action.unwrap_or(NativeErrorCode::InvalidPayload),
-                error.to_string(),
-            )
+            let code = if known_action {
+                NativeErrorCode::InvalidPayload
+            } else {
+                NativeErrorCode::UnknownAction
+            };
+            NativeError::new(code, error.to_string())
         })
     }
 }
@@ -357,6 +372,22 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, NativeErrorCode::UnsupportedVersion);
         assert!(error.message.contains("99"));
+    }
+
+    #[test]
+    fn non_numeric_or_other_version_values_are_rejected() {
+        for raw in [
+            br#"{"version":"2","action":"download","url":"https://example.com/a.bin"}"#.as_slice(),
+            br#"{"version":2,"action":"download","url":"https://example.com/a.bin"}"#.as_slice(),
+        ] {
+            let error = NativeRequest::parse(raw).unwrap_err();
+            assert_eq!(
+                error.code,
+                NativeErrorCode::UnsupportedVersion,
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 
     #[test]
