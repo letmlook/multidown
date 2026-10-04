@@ -1407,7 +1407,8 @@ fn get_extension_directory(app: tauri::AppHandle) -> Result<String, String> {
     Err("扩展未随应用打包，请先运行 npm run build:extension 重新构建。".to_string())
 }
 
-/// 解压扩展 ZIP：拒绝逃逸目标目录的条目，解压后由调用方校验。
+/// 解压扩展 ZIP：只接受完全落在目标目录内的条目名（含 `..`、根路径、盘符前缀一律拒绝），
+/// 解压后由调用方校验。
 fn extract_extension_zip(
     zip_path: &std::path::Path,
     ext_dir: &std::path::Path,
@@ -1421,19 +1422,17 @@ fn extract_extension_zip(
         let mut entry = archive
             .by_index(index)
             .map_err(browser_integration::ExtensionInstallError::from_zip_error)?;
-        let Some(relative) = std::path::Path::new(entry.name()).components().next() else {
-            continue;
-        };
-        if matches!(
-            relative,
-            std::path::Component::ParentDir | std::path::Component::RootDir
-        ) {
+        // enclosed_name() 会检查全部路径分量（而非只看第一个），返回 None 即表示
+        // 条目名含 `..`、根目录或盘符前缀；先转成自有 Path 以释放对 entry 的借用。
+        // enclosed_name() 会检查全部路径分量（而非只看第一个），返回 None 即表示
+        // 条目名含 `..`、根目录或盘符前缀；先转成自有 Path 以释放对 entry 的借用。
+        let Some(safe_relative) = entry.enclosed_name().map(std::path::Path::to_path_buf) else {
             return Err(browser_integration::ExtensionInstallError::Deploy {
                 context: format!("压缩包条目路径非法: {}", entry.name()),
                 source: std::io::Error::new(std::io::ErrorKind::InvalidData, "路径逃逸"),
             });
-        }
-        let outpath = ext_dir.join(entry.name());
+        };
+        let outpath = ext_dir.join(safe_relative);
 
         if entry.is_dir() {
             std::fs::create_dir_all(&outpath)?;
@@ -1778,6 +1777,106 @@ mod native_messaging_manifest_tests {
             manifest["allowed_extensions"],
             serde_json::json!(["multidown@letmlook"])
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_zip_extract_tests {
+    use super::extract_extension_zip;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("multidown-{name}-{}", std::process::id()))
+    }
+
+    /// 写出一个指定条目名的 ZIP（条目名按原样写入，不做任何规范化）。
+    fn write_zip(zip_path: &Path, entries: &[(&str, &str)]) {
+        let file = std::fs::File::create(zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, zip::write::FileOptions::default())
+                .unwrap();
+            writer.write_all(contents.as_bytes()).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn extract_rejects_parent_dir_after_a_normal_leading_component() {
+        let root = unique_temp_dir("zip-slip-guard");
+        let _ = std::fs::remove_dir_all(&root);
+        // 目标目录多一层，逃逸后的落点仍在测试自己的临时目录内
+        let ext_dir = root.join("inner").join("unpacked");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let zip_path = root.join("multidown-extension.zip");
+        write_zip(&zip_path, &[("a/../../evil.txt", "pwned")]);
+
+        let error = extract_extension_zip(&zip_path, &ext_dir)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("a/../../evil.txt"),
+            "错误需指出非法条目名: {error}"
+        );
+        assert!(
+            !root.join("evil.txt").exists(),
+            "逃逸条目不得写到目标目录之外"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extract_rejects_absolute_and_traversal_entries() {
+        for entry_name in ["../evil.txt", "..\\evil.txt", "/absolute.txt"] {
+            let root = unique_temp_dir("zip-slip-guard-absolute");
+            let _ = std::fs::remove_dir_all(&root);
+            let ext_dir = root.join("unpacked");
+            std::fs::create_dir_all(&ext_dir).unwrap();
+            let zip_path = root.join("multidown-extension.zip");
+            write_zip(&zip_path, &[(entry_name, "pwned")]);
+
+            let error = extract_extension_zip(&zip_path, &ext_dir)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("路径非法"),
+                "条目 {entry_name} 必须被拒绝: {error}"
+            );
+            assert!(
+                !root.join("evil.txt").exists() && !ext_dir.join("evil.txt").exists(),
+                "条目 {entry_name} 不得落盘"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn extract_writes_nested_entries_inside_the_destination() {
+        let root = unique_temp_dir("zip-extract-ok");
+        let _ = std::fs::remove_dir_all(&root);
+        let ext_dir = root.join("unpacked");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let zip_path = root.join("multidown-extension.zip");
+        write_zip(
+            &zip_path,
+            &[
+                ("manifest.json", "{\"manifest_version\":3}"),
+                ("icons/icon16.png", "PNG-16"),
+            ],
+        );
+
+        extract_extension_zip(&zip_path, &ext_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(ext_dir.join("icons/icon16.png")).unwrap(),
+            "PNG-16"
+        );
+        assert!(ext_dir.join("manifest.json").is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

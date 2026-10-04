@@ -267,7 +267,32 @@ pub(crate) fn validate_extension_directory(
     Ok(manifest)
 }
 
-/// 递归部署扩展目录：保留 icons/ 等子目录，部署后重新校验，避免静默丢文件。
+/// 遍历到的条目类型（`walkdir` 不跟随符号链接，符号链接既非目录也非文件）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum entry_kind {
+    Directory,
+    File,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryAction {
+    CreateDirectory,
+    Copy,
+    Reject(&'static str),
+}
+
+pub(crate) fn classify_entry(kind: entry_kind) -> EntryAction {
+    match kind {
+        entry_kind::Directory => EntryAction::CreateDirectory,
+        entry_kind::File => EntryAction::Copy,
+        // 静默丢弃会造出缺文件的扩展，必须显式失败
+        entry_kind::Other => EntryAction::Reject("既不是文件也不是目录，无法安全部署"),
+    }
+}
+
+/// 递归部署扩展目录：保留 icons/ 等子目录，遇到无法复制的条目直接报错，
+/// 部署后重新校验，避免静默丢文件。
 pub(crate) fn deploy_extension_directory(
     source: &Path,
     destination: &Path,
@@ -290,17 +315,33 @@ pub(crate) fn deploy_extension_directory(
         })?;
         let target = destination.join(relative);
         let context = entry.path().display().to_string();
+        let file_type = entry.file_type();
+        let kind = if file_type.is_dir() {
+            entry_kind::Directory
+        } else if file_type.is_file() {
+            entry_kind::File
+        } else {
+            entry_kind::Other
+        };
 
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|error| deploy_error(context.clone(), error))?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| deploy_error(context.clone(), error))?;
+        match classify_entry(kind) {
+            EntryAction::CreateDirectory => {
+                std::fs::create_dir_all(&target).map_err(|error| deploy_error(context, error))?
             }
-            std::fs::copy(entry.path(), &target)
-                .map_err(|error| deploy_error(context.clone(), error))?;
+            EntryAction::Copy => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|error| deploy_error(context.clone(), error))?;
+                }
+                std::fs::copy(entry.path(), &target)
+                    .map_err(|error| deploy_error(context, error))?;
+            }
+            EntryAction::Reject(reason) => {
+                return Err(deploy_error(
+                    context,
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, reason),
+                ))
+            }
         }
     }
 
@@ -516,8 +557,9 @@ fn platform_candidates() -> Vec<BrowserCandidate> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deploy_extension_directory, export_extension_zip, open_extension_installers_with,
-        validate_extension_directory, BrowserCandidate, CommandLauncher,
+        classify_entry, deploy_extension_directory, entry_kind, export_extension_zip,
+        open_extension_installers_with, validate_extension_directory, BrowserCandidate,
+        CommandLauncher, EntryAction,
     };
     use std::io::Read;
     use std::path::{Path, PathBuf};
@@ -799,6 +841,54 @@ mod tests {
             destination.join("kept.txt").is_file(),
             "校验失败时不得清空既有部署目录"
         );
+        std::fs::remove_dir_all(source).unwrap();
+        std::fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn deploy_extension_directory_rejects_symbolic_links() {
+        // 非普通条目（既非目录也非文件，例如符号链接）必须被判为不支持，
+        // 而不是被静默丢弃——该判断与平台无关，永远执行。
+        assert_eq!(
+            classify_entry(entry_kind::Directory),
+            EntryAction::CreateDirectory
+        );
+        assert_eq!(classify_entry(entry_kind::File), EntryAction::Copy);
+        assert_eq!(
+            classify_entry(entry_kind::Other),
+            EntryAction::Reject("既不是文件也不是目录，无法安全部署")
+        );
+
+        let source = unique_temp_dir("deploy-symlink-source");
+        let destination = unique_temp_dir("deploy-symlink-destination");
+        write_extension(&source);
+        let _ = std::fs::remove_dir_all(&destination);
+
+        // 端到端：manifest 未引用的符号链接也必须报错，不能静默消失
+        let link = source.join("assets").join("unreferenced-link.json");
+        let target = source.join("assets").join("rule.json");
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&target, &link);
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&target, &link);
+
+        if let Err(error) = link_result {
+            // 本机缺少创建符号链接的权限（Windows 需管理员或开发者模式）：
+            // 端到端部分跳过，上面三条断言仍然覆盖分类逻辑。
+            eprintln!("skipped 端到端符号链接部署: {error}");
+        } else {
+            let error = deploy_extension_directory(&source, &destination)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unreferenced-link.json"),
+                "符号链接必须被报告为错误: {error}"
+            );
+            assert!(
+                !destination.join("assets/unreferenced-link.json").exists(),
+                "符号链接不得被当作普通文件复制出去"
+            );
+        }
         std::fs::remove_dir_all(source).unwrap();
         std::fs::remove_dir_all(destination).unwrap();
     }
