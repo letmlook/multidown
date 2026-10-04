@@ -786,11 +786,18 @@ fn native_port_file_path(app_data: &std::path::Path) -> std::path::PathBuf {
 
 /// 桌面端 → Native Host 的成功应答。`request_id` 必须回显，否则 Host 无法把
 /// 应答关联回请求（见共享 crate 的 `NativeResponse`）。
+///
+/// 发的是**兼容行**（[`native_protocol::NativeResponse::to_legacy_line`]）而不是
+/// 纯新信封：Native Host 是**单独安装**的旧二进制，它只读顶层的扁平键
+/// （握手标记、`config`、字符串 `error`）。合并逻辑只有共享 crate 那一份，
+/// 新旧 Host 读到的都是同一个值。
 fn native_reply_ok(request_id: &str, data: serde_json::Value) -> Vec<u8> {
-    native_protocol::NativeResponse::ok(request_id, data).to_line()
+    native_protocol::NativeResponse::ok(request_id, data).to_legacy_line()
 }
 
-/// 桌面端 → Native Host 的失败应答。
+/// 桌面端 → Native Host 的失败应答。同样走兼容行：旧 Host 只读顶层字符串
+/// `error`，真实文案（例如"该域名已被捕获黑名单过滤"）因此不会退化成
+/// 泛泛的"添加失败"；结构化的 `{code, message}` 留在 `data.error`。
 fn native_reply_error(
     request_id: &str,
     code: native_protocol::NativeErrorCode,
@@ -800,11 +807,12 @@ fn native_reply_error(
         request_id,
         native_protocol::NativeError::new(code, message),
     )
-    .to_line()
+    .to_legacy_line()
 }
 
 /// 握手应答。`multidown` 标记必须随应答下发，Host 的
 /// `connect_and_handshake` 会校验它，防止别的进程碰巧占用了端口文件里的端口。
+/// 标记同时出现在顶层与 `data` 内：新 Host 顶层优先，旧 Host 只看顶层。
 fn native_handshake_reply(request_id: &str) -> Vec<u8> {
     native_reply_ok(
         request_id,
@@ -1927,6 +1935,111 @@ mod native_protocol_replies_tests {
         native_protocol::validate_handshake_reply(&reply).unwrap();
     }
 
+    /// **上一版** Native Host 的读取器：它只按当时的扁平字面量位置取值——
+    /// 握手标记、`config` 在顶层，`error` 按 `as_str` 读。Native Host 是单独
+    /// 安装的旧二进制，"新应用 + 旧 Host"是常态，因此应用发出去的每一行都
+    /// 必须能被它读到标记/配置/文案。
+    struct PreDiffHostReply {
+        ok: bool,
+        handshake: Option<String>,
+        protocol: Option<u64>,
+        config: Option<serde_json::Value>,
+        error: Option<String>,
+    }
+
+    impl PreDiffHostReply {
+        fn parse(line: &[u8]) -> Self {
+            let value: serde_json::Value =
+                serde_json::from_slice(line).expect("旧 Host 只会读到 JSON");
+            let top = |key: &str| value.get(key).cloned();
+            Self {
+                ok: value
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                handshake: top("handshake").and_then(|v| v.as_str().map(str::to_string)),
+                protocol: top("protocol").and_then(|v| v.as_u64()),
+                config: top("config"),
+                error: top("error").and_then(|v| v.as_str().map(str::to_string)),
+            }
+        }
+    }
+
+    /// 握手：旧 Host 读顶层标记（否则 `test_connection` 永远失败，弹窗一直说
+    /// "Multidown 未运行"，`open_app` 也永远过不了握手）。
+    #[test]
+    fn handshake_reply_is_readable_by_a_pre_diff_host() {
+        let reply = native_handshake_reply("req-handshake");
+        let old = PreDiffHostReply::parse(&reply);
+        assert!(old.ok);
+        assert_eq!(
+            old.handshake.as_deref(),
+            Some(native_protocol::DESKTOP_HANDSHAKE),
+            "旧 Host 只看顶层握手标记"
+        );
+        assert_eq!(
+            old.protocol,
+            Some(u64::from(native_protocol::PROTOCOL_VERSION))
+        );
+        // 新 Host 走共享 crate 的校验（顶层优先，回退 data）
+        native_protocol::validate_handshake_reply(&reply).unwrap();
+        let parsed = native_protocol::NativeResponse::parse(&reply).unwrap();
+        assert_eq!(parsed.request_id, "req-handshake");
+        assert_eq!(
+            parsed.data.unwrap()["handshake"],
+            native_protocol::DESKTOP_HANDSHAKE
+        );
+    }
+
+    /// get_config：旧 Host 读顶层 `config`。读不到时它退回
+    /// `{capture_enabled: true, domain_blacklist: []}`——用户关掉的捕获和
+    /// 加的黑名单会被静默还原，这是隐私控制丢失，不是显示问题。
+    #[test]
+    fn config_reply_keeps_the_capture_switches_visible_to_a_pre_diff_host() {
+        let config = serde_json::json!({
+            "config": {
+                "capture_enabled": false,
+                "domain_blacklist": ["blocked.example.com"],
+            }
+        });
+        let reply = native_reply_ok("req-cfg", config);
+        let old = PreDiffHostReply::parse(&reply);
+        let legacy = old.config.expect("旧 Host 必须读到顶层 config");
+        assert_eq!(legacy["capture_enabled"], false, "关闭状态必须原样下发");
+        assert_eq!(legacy["domain_blacklist"][0], "blocked.example.com");
+        // 新 Host 优先读 data.config，两边拿到的是同一个值
+        let parsed = native_protocol::NativeResponse::parse(&reply).unwrap();
+        assert_eq!(parsed.request_id, "req-cfg");
+        let nested = parsed.data.expect("新格式读 data.config")["config"].clone();
+        assert_eq!(nested, legacy);
+    }
+
+    /// 失败应答：旧 Host 只读顶层**字符串** `error`；结构化的 code 留在
+    /// `data.error` 给新消费者。
+    #[test]
+    fn error_reply_keeps_the_real_text_for_a_pre_diff_host() {
+        let reply = native_reply_error(
+            "req-e",
+            NativeErrorCode::InvalidPayload,
+            "该域名已被捕获黑名单过滤",
+        );
+        let old = PreDiffHostReply::parse(&reply);
+        assert!(!old.ok);
+        assert_eq!(
+            old.error.as_deref(),
+            Some("该域名已被捕获黑名单过滤"),
+            "旧 Host 读不到文本就会退化成\"添加失败\""
+        );
+        // 新解析器从同一行还原出结构化错误
+        let parsed = native_protocol::NativeResponse::parse(&reply).unwrap();
+        assert_eq!(parsed.request_id, "req-e");
+        let error = parsed.error.expect("失败应答必须带错误");
+        assert_eq!(error.message, "该域名已被捕获黑名单过滤");
+        let data = parsed.data.expect("结构化错误的权威副本在 data.error");
+        assert_eq!(data["error"]["code"], "invalid_payload");
+        assert_eq!(data["error"]["message"], "该域名已被捕获黑名单过滤");
+    }
+
     /// I1：调用点不得把完整 URL 或原始行交给日志函数。
     #[test]
     fn log_call_sites_never_pass_a_raw_url_or_line() {
@@ -2670,7 +2783,10 @@ pub fn run() {
 
                     match request.payload {
                         native_protocol::NativePayload::GetConfig => {
-                            // 下发捕获配置给扩展（总开关 + 域名黑名单）
+                            // 下发捕获配置给扩展（总开关 + 域名黑名单）。配置放在
+                            // `data.config`，兼容行会把它提升到旧 Host 读的顶层
+                            // `config`：用户关掉的捕获与黑名单因此不会在旧 Host
+                            // 上退化成"默认开启"。
                             let settings = app_settings_path(&app_handle_clone)
                                 .ok()
                                 .and_then(|p| load_settings(&p).ok())
