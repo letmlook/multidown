@@ -478,6 +478,17 @@ fn validate_content_range(
 mod tests {
     use super::*;
 
+    /// 原始请求文本里的大小写不敏感头匹配。
+    /// HTTP 头名不区分大小写（RFC 9110），mock 断言必须按此匹配。
+    fn request_has_header(request: &str, name: &str, value: &str) -> bool {
+        request.lines().any(|line| {
+            let Some((header_name, header_value)) = line.split_once(':') else {
+                return false;
+            };
+            header_name.trim().eq_ignore_ascii_case(name) && header_value.trim() == value
+        })
+    }
+
     #[test]
     fn content_disposition_parsing() {
         assert_eq!(
@@ -596,7 +607,9 @@ mod tests {
             .await
             .expect("probe must make a Range GET when HEAD lacks MIME")
             .unwrap();
-        assert!(fallback.starts_with("GET ") && fallback.contains("Range: bytes=0-0"));
+        assert!(
+            fallback.starts_with("GET ") && request_has_header(&fallback, "range", "bytes=0-0")
+        );
         server.await.unwrap();
     }
 
@@ -614,7 +627,7 @@ mod tests {
                 let response = if request.starts_with("HEAD ") {
                     "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                 } else {
-                    assert!(request.contains("Range: bytes=0-0"));
+                    assert!(request_has_header(&request, "range", "bytes=0-0"));
                     "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: Video/MP4\r\nConnection: close\r\n\r\n0123456789"
                 };
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -655,7 +668,7 @@ mod tests {
                     let response = if request.starts_with("HEAD ") {
                         "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n".to_string()
                     } else {
-                        assert!(request.contains("Range: bytes=0-0"));
+                        assert!(request_has_header(&request, "range", "bytes=0-0"));
                         format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\n{}Content-Type: Video/MP4\r\nConnection: close\r\n\r\nx",
                             content_range
@@ -691,7 +704,7 @@ mod tests {
                 let response = if request.starts_with("HEAD ") {
                     "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                 } else {
-                    assert!(request.contains("Range: bytes=0-0"));
+                    assert!(request_has_header(&request, "range", "bytes=0-0"));
                     "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: Bytes 0-0/12\r\nContent-Type: Video/MP4\r\nConnection: close\r\n\r\nx"
                 };
                 stream.write_all(response.as_bytes()).await.unwrap();
