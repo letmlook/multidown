@@ -63,17 +63,23 @@ export function DeleteTaskModal({ tasks, onClose, onConfirmed }: DeleteTaskModal
   const handleConfirm = async () => {
     setBusy(true);
     setError(null);
-    try {
-      for (const task of tasks) {
+    // 逐个移除并继续处理剩余目标：单个失败不阻断其余任务，最后汇总报告；
+    // 全部成功才回调父层关闭并刷新。
+    const failures: string[] = [];
+    for (const task of tasks) {
+      try {
         await invoke("remove_task", { taskId: task.id, deleteFiles });
+      } catch (e) {
+        console.error(e);
+        failures.push(`${task.filename}: ${String(e)}`);
       }
-      onConfirmed();
-    } catch (e) {
-      console.error(e);
-      setError(String(e));
-    } finally {
-      setBusy(false);
     }
+    setBusy(false);
+    if (failures.length > 0) {
+      setError(`部分任务移除失败：\n${failures.join("\n")}`);
+      return;
+    }
+    onConfirmed();
   };
 
   const title = tasks.length === 1 ? "删除任务" : `删除 ${tasks.length} 个任务`;

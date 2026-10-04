@@ -81,14 +81,48 @@ pub struct DeletionPreview {
 
 /// worker 退出时摘除自己在 http_workers 中的句柄；
 /// 任务被 abort 时 future 被 drop，同样会触发。
+///
+/// 句柄带代际标记：暂停→继续会在旧 worker 尚未退出时插入替代 worker，
+/// 被中止的旧 worker 绝不允许摘掉替代者的句柄，所以只有代际匹配才移除。
 struct WorkerHandleCleanup {
     scheduler: Arc<Scheduler>,
     task_id: TaskId,
+    generation: u64,
 }
 
 impl Drop for WorkerHandleCleanup {
     fn drop(&mut self) {
-        self.scheduler.http_workers.lock().remove(&self.task_id);
+        let mut workers = self.scheduler.http_workers.lock();
+        if workers
+            .get(&self.task_id)
+            .map(|(generation, _)| *generation)
+            == Some(self.generation)
+        {
+            workers.remove(&self.task_id);
+        }
+    }
+}
+
+impl Scheduler {
+    fn next_http_worker_generation(&self) -> u64 {
+        self.http_worker_generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 登记 worker 句柄；同任务的旧条目（若有）先取回并中止。
+    fn install_http_worker(
+        &self,
+        task_id: &str,
+        generation: u64,
+        worker: tokio::task::JoinHandle<()>,
+    ) {
+        let previous = self
+            .http_workers
+            .lock()
+            .insert(task_id.to_string(), (generation, worker));
+        if let Some((_, previous)) = previous {
+            previous.abort();
+        }
     }
 }
 
@@ -235,6 +269,10 @@ fn retain_known_tasks(
     });
 }
 
+/// task_id → (代际, worker 句柄)。代际用于让被中止的旧 worker 的清理守卫
+/// 不至于误删替代 worker 的句柄。
+type HttpWorkerRegistry = HashMap<TaskId, (u64, tokio::task::JoinHandle<()>)>;
+
 pub struct Scheduler {
     tasks: Arc<AsyncMutex<HashMap<TaskId, Arc<Task>>>>,
     save_path: Option<PathBuf>,
@@ -267,8 +305,12 @@ pub struct Scheduler {
     torrent_supervisors: Arc<AsyncMutex<HashMap<TaskId, tokio::task::JoinHandle<()>>>>,
     /// Scheduler-owned HTTP worker join handles. Safe deletion awaits the
     /// worker (which awaits the file writer) before removing data files, so a
-    /// live worker can never hold an open handle against deletion.
-    http_workers: Arc<ParkingMutex<HashMap<TaskId, tokio::task::JoinHandle<()>>>>,
+    /// live worker can never hold an open handle against deletion. Each entry
+    /// carries a generation token so an aborted predecessor's cleanup can
+    /// never evict its replacement's handle.
+    http_workers: Arc<ParkingMutex<HttpWorkerRegistry>>,
+    /// Monotonic generation source for `http_workers` entries.
+    http_worker_generations: Arc<std::sync::atomic::AtomicU64>,
     /// 最近一次应用设置快照（做种策略等运行时读取）
     settings: Arc<ParkingMutex<crate::settings::AppSettings>>,
     #[cfg(test)]
@@ -648,6 +690,7 @@ impl Scheduler {
             torrent_engine: Arc::new(OnceCell::new()),
             torrent_supervisors: Arc::new(AsyncMutex::new(HashMap::new())),
             http_workers: Arc::new(ParkingMutex::new(HashMap::new())),
+            http_worker_generations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             settings: Arc::new(ParkingMutex::new(crate::settings::AppSettings::default())),
             #[cfg(test)]
             admission_test_barrier: Arc::new(ParkingMutex::new(None)),
@@ -1616,12 +1659,14 @@ impl Scheduler {
         let (start_tx, start_rx) = oneshot::channel();
         let worker_task_id = task_id_s.clone();
         let worker_scheduler = scheduler_self.clone();
+        let worker_generation = self.next_http_worker_generation();
         let worker = tokio::spawn(async move {
             // 无论以何种方式退出（含 start_rx 提前关闭），都要摘除自己的
             // join 句柄；退出即意味着 writer 已落盘并关闭文件。
             let _worker_cleanup = WorkerHandleCleanup {
                 scheduler: worker_scheduler,
                 task_id: worker_task_id,
+                generation: worker_generation,
             };
             let _active_slot = active_slot;
             if start_rx.await.is_err() {
@@ -1830,9 +1875,7 @@ impl Scheduler {
         });
 
         // 登记 join 句柄供删除事务等待；替换并中止同任务的残留 worker。
-        if let Some(previous) = self.http_workers.lock().insert(task_id_s.clone(), worker) {
-            previous.abort();
-        }
+        self.install_http_worker(&task_id_s, worker_generation, worker);
 
         if let Err(error) = self
             .persist_status_transition(&task_id, expected_statuses, TaskStatus::Downloading)
@@ -1841,7 +1884,7 @@ impl Scheduler {
             drop(start_tx);
             // 句柄已登记进 http_workers：取回并等待；若 worker 已自行退出
             // 并摘除句柄，这里取到 None 也无需等待。
-            let handle = self.http_workers.lock().remove(&task_id_s);
+            let handle = self.http_workers.lock().remove(&task_id_s).map(|(_, h)| h);
             if let Some(handle) = handle {
                 let _ = handle.await;
             }
@@ -2730,8 +2773,8 @@ impl Scheduler {
     }
 
     /// 删除预览：收集任务的数据路径并检查它们是否都在保存目录边界内。
-    /// 种子任务的 save_path 即其数据文件（单文件）或数据目录（多文件）；
-    /// HTTP 任务是目标文件本身。
+    /// 种子任务的数据位置从缓存的 metainfo 离线解析（占位任务的 save_path
+    /// 可能还停留在占位文件名上）；HTTP 任务是目标文件本身。
     pub async fn preview_task_deletion(
         &self,
         task_id: &str,
@@ -2743,7 +2786,7 @@ impl Scheduler {
             .get(task_id)
             .cloned()
             .ok_or_else(|| TaskOperationError::TaskNotFound(task_id.to_string()))?;
-        let paths = vec![std::path::PathBuf::from(&task.save_path)];
+        let paths = self.deletion_candidate_paths(&task).await;
         let can_delete_files = self.paths_within_save_root(&paths).await.is_ok();
         Ok(DeletionPreview {
             task_id: task_id.to_string(),
@@ -2756,7 +2799,8 @@ impl Scheduler {
     }
 
     /// 删除任务的事务：
-    /// 1) 先停止 worker / 种子会话（文件句柄关闭后才能安全删除数据）；
+    /// 1) 先停止 worker / 种子会话（文件句柄关闭后才能安全删除数据），
+    ///    停止失败立即中止事务并保留任务；
     /// 2) `delete_files=true` 时在保存目录边界内删除数据文件，失败则保留
     ///    任务并附错误信息（关键失败不得丢任务的可见性）；
     /// 3) 最后走 `commit_task_removals` 的跨存储回滚事务移除记录。
@@ -2776,22 +2820,27 @@ impl Scheduler {
         if task.kind.is_torrent() {
             self.stop_torrent_supervisor(task_id).await;
             // 只摘除会话句柄、保留数据：文件删除由下方受控路径负责，
-            // 这样才能先校验保存目录边界再动手。
+            // 这样才能先校验保存目录边界再动手。摘除失败意味着会话仍然
+            // 活着，此时既不能删文件也不能移除记录。
             if let Some(engine) = self.torrent_engine.get() {
-                let _ = engine.remove(task_id, false).await;
+                engine.remove(task_id, false).await.map_err(|error| {
+                    TaskOperationError::Operation(format!("移除种子会话失败: {error}"))
+                })?;
             }
         } else {
-            // 通过任务状态通知 worker 退出，并等它结束（worker 退出前
+            // 持久化取消状态通知 worker 退出，并等它结束（worker 退出前
             // 会等 writer 落盘并关闭文件句柄）。
-            *task.status.lock().await = TaskStatus::Cancelled;
-            let handle = self.http_workers.lock().remove(task_id);
+            self.persist_status_transition(task_id, &[], TaskStatus::Cancelled)
+                .await
+                .map_err(TaskOperationError::Operation)?;
+            let handle = self.http_workers.lock().remove(task_id).map(|(_, h)| h);
             if let Some(handle) = handle {
                 let _ = handle.await;
             }
         }
 
         if delete_files {
-            let paths = vec![std::path::PathBuf::from(&task.save_path)];
+            let paths = self.deletion_candidate_paths(&task).await;
             if let Err(error) = self.delete_within_save_root(&paths).await {
                 let message = error.to_string();
                 *task.error_message.lock().await = Some(message.clone());
@@ -2809,6 +2858,26 @@ impl Scheduler {
         self.commit_task_removals(&removed_task_ids)
             .await
             .map_err(|error| TaskOperationError::Operation(error.to_string()))
+    }
+
+    /// 任务落盘数据的候选路径（预览与删除共用同一来源）。
+    ///
+    /// 种子任务：数据一定在 `save_path` 的父目录下、以解析后的种子名命名
+    /// （单文件是数据文件本身，多文件是数据子目录）。占位任务或用户改过
+    /// 文件名的任务，`save_path` 可能不再指向真实数据，所以两个位置都列
+    /// 入候选，由边界校验与"不存在则跳过"兜底。
+    async fn deletion_candidate_paths(&self, task: &Task) -> Vec<std::path::PathBuf> {
+        let save_path = std::path::PathBuf::from(&task.save_path);
+        if !task.kind.is_torrent() {
+            return vec![save_path];
+        }
+        let mut candidates = vec![save_path.clone()];
+        if let Some(resolved) = torrent_data_path(&task.save_path, task.torrent_meta()) {
+            if resolved != save_path {
+                candidates.push(resolved);
+            }
+        }
+        candidates
     }
 
     fn deletion_save_root(&self) -> Option<std::path::PathBuf> {
@@ -3568,6 +3637,7 @@ impl Clone for Scheduler {
             torrent_engine: self.torrent_engine.clone(),
             torrent_supervisors: self.torrent_supervisors.clone(),
             http_workers: self.http_workers.clone(),
+            http_worker_generations: self.http_worker_generations.clone(),
             settings: self.settings.clone(),
             #[cfg(test)]
             admission_test_barrier: self.admission_test_barrier.clone(),
@@ -3583,6 +3653,27 @@ impl Clone for Scheduler {
             worker_test_panic_after_reservation: self.worker_test_panic_after_reservation.clone(),
         }
     }
+}
+
+/// 从任务持久化的种子元数据离线解析真实数据路径（不创建/访问会话）。
+///
+/// 无论单文件还是多文件种子，数据都落在 `save_path` 父目录下、以解析后的
+/// 种子名命名（单文件是数据文件本身，多文件是数据子目录）。占位任务的
+/// `save_path` 还停留在占位文件名上，删除时必须用它而不是 save_path，
+/// 否则用户勾选"删除文件"后真实数据会被留下。
+fn torrent_data_path(save_path: &str, meta: Option<TorrentMeta>) -> Option<std::path::PathBuf> {
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+    let metainfo_b64 = meta?.metainfo_b64?;
+    let bytes = BASE64_STANDARD.decode(metainfo_b64).ok()?;
+    let parsed = librqbit::torrent_from_bytes(&bytes).ok()?;
+    let validated = parsed.info.data.validate().ok()?;
+    let name = validated.name()?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    let base = std::path::Path::new(save_path).parent()?;
+    Some(base.join(crate::torrent::detect::sanitize_filename(&name)))
 }
 
 async fn task_to_info(t: &Arc<Task>) -> TaskInfo {
@@ -5723,6 +5814,125 @@ mod tests {
                 "符号链接背后的外部文件不得被删除"
             );
             assert!(scheduler.get_task("symlink").await.is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn preview_and_removal_reject_deleting_the_save_root_itself() {
+            let fixture = InitializationFixture::new();
+            // save_path 指向保存目录本身：删除它等于清空下载根，必须拒绝
+            let mut record = http_record(&fixture, "rootish", b"rootish");
+            std::fs::write(fixture.0.join("downloads/keep.bin"), b"keep").unwrap();
+            record.save_path = fixture.0.join("downloads").to_string_lossy().into_owned();
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+
+            let preview = scheduler.preview_task_deletion("rootish").await.unwrap();
+            assert!(!preview.can_delete_files, "保存目录本身必须拒绝删除");
+
+            let error = scheduler.remove_task("rootish", true).await.unwrap_err();
+            assert!(matches!(error, TaskOperationError::PathEscape(_)));
+            assert_eq!(
+                std::fs::read(fixture.0.join("downloads/keep.bin")).unwrap(),
+                b"keep",
+                "保存目录内容必须原样保留"
+            );
+            assert!(scheduler.get_task("rootish").await.is_some());
+            drop(error);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remove_task_deletes_placeholder_torrent_data_at_resolved_location() {
+            let fixture = InitializationFixture::new();
+            let mut record =
+                torrent_record(&fixture, "placeholder-torrent", TaskStatus::Paused).await;
+            // 占位任务：元数据解析后真实数据以种子名落盘，而 save_path 还
+            // 停留在占位文件名上（占位路径本身不存在）
+            let base = fixture.0.join("downloads/placeholder-torrent-dir");
+            let placeholder_path = base.join("magnet-placeholder");
+            record.save_path = placeholder_path.to_string_lossy().into_owned();
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+            assert!(!placeholder_path.exists(), "占位路径不应有数据");
+            assert!(base.join("payload.bin").exists());
+
+            let preview = scheduler
+                .preview_task_deletion("placeholder-torrent")
+                .await
+                .unwrap();
+            assert!(
+                preview
+                    .paths
+                    .iter()
+                    .any(|path| path.ends_with("payload.bin")),
+                "预览必须列出解析后的真实数据路径: {preview:?}"
+            );
+
+            scheduler
+                .remove_task("placeholder-torrent", true)
+                .await
+                .unwrap();
+            assert!(
+                !base.join("payload.bin").exists(),
+                "勾选删除文件时必须删除解析位置的真实数据"
+            );
+            assert!(scheduler.get_task("placeholder-torrent").await.is_none());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remove_task_retains_task_when_session_removal_fails() {
+            let fixture = InitializationFixture::new();
+            let record = torrent_record(&fixture, "session-stuck", TaskStatus::Paused).await;
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+            let data_path = fixture.0.join("downloads/session-stuck-dir/payload.bin");
+            // 触碰一次引擎使其初始化，然后注入移除失败
+            let engine = scheduler.torrent_engine().await.unwrap();
+            engine.fail_next_remove_for_test();
+
+            let error = scheduler
+                .remove_task("session-stuck", true)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(error, TaskOperationError::Operation(ref m) if m.contains("移除种子会话失败")),
+                "会话移除失败必须中止事务: {error:?}"
+            );
+            assert!(
+                scheduler.get_task("session-stuck").await.is_some(),
+                "关键失败必须保留任务"
+            );
+            assert!(data_path.exists(), "会话未摘除时不得删除数据文件");
+            engine.stop().await;
+        }
+
+        /// 中止的旧 worker 在替代 worker 已登记后才运行清理守卫：
+        /// 代际不匹配时绝不允许摘掉替代者的句柄（暂停→继续是常规路径）。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn http_worker_registry_survives_aborted_predecessor_cleanup() {
+            let scheduler = Arc::new(Scheduler::new(None));
+            let spawn_eternal = || tokio::spawn(std::future::pending::<()>());
+            let generation_a = scheduler.next_http_worker_generation();
+            scheduler.install_http_worker("t", generation_a, spawn_eternal());
+            let generation_b = scheduler.next_http_worker_generation();
+            scheduler.install_http_worker("t", generation_b, spawn_eternal());
+
+            // 模拟旧 worker 迟到的退出清理：只允许摘掉自己那一代
+            drop(WorkerHandleCleanup {
+                scheduler: scheduler.clone(),
+                task_id: "t".into(),
+                generation: generation_a,
+            });
+            assert_eq!(
+                scheduler.http_workers.lock().get("t").map(|(g, _)| *g),
+                Some(generation_b),
+                "被中止的旧 worker 不得驱逐替代 worker 的句柄"
+            );
+
+            // 替代 worker 自己退出：此时才真正摘除
+            drop(WorkerHandleCleanup {
+                scheduler: scheduler.clone(),
+                task_id: "t".into(),
+                generation: generation_b,
+            });
+            assert!(scheduler.http_workers.lock().get("t").is_none());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

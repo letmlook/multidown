@@ -163,6 +163,8 @@ pub struct TorrentEngine {
     lifecycle: tokio::sync::Mutex<()>,
     #[cfg(test)]
     fail_next_reconfigure: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_remove: std::sync::atomic::AtomicBool,
 }
 
 impl TorrentEngine {
@@ -178,6 +180,8 @@ impl TorrentEngine {
             lifecycle: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             fail_next_reconfigure: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_remove: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -476,6 +480,13 @@ impl TorrentEngine {
     /// 从会话中移除。`delete_files=false` 保留已下载数据，便于再次续传。
     pub async fn remove(&self, task_id: &str, delete_files: bool) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
+        #[cfg(test)]
+        if self
+            .fail_next_remove
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("injected torrent removal failure"));
+        }
         let handle = self.handles.lock().remove(task_id);
         if let Some(handle) = handle {
             let session = self.session.lock().clone();
@@ -607,6 +618,12 @@ impl TorrentEngine {
     #[cfg(test)]
     pub fn fail_next_reconfigure_for_test(&self) {
         self.fail_next_reconfigure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_remove_for_test(&self) {
+        self.fail_next_remove
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
