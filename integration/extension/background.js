@@ -22,10 +22,13 @@ function debugLog(message, data = {}) {
 
 // 等待 Native Host 应答的上限（毫秒）。
 // 与 `integration/native-host/src/main.rs` 的 `OPEN_APP_LAUNCH_BUDGET` 绑定：
-// Host 端 open_app 的拉起预算是 5 秒（最坏 5s + 1s 握手 IO + 400ms 轮询），
+// Host 端 open_app 的拉起预算是 5 秒，最坏耗时是
+// 预算 5s + 握手 IO 1s（写）+ 1s（读）+ 400ms 轮询 ≈ 7.4s，
 // 必须严格小于这里的上限，否则深链拉起失败时用户只会看到"Native Host 连接超时"，
 // 而 Host 写好的"无法启动应用，请手动启动 Multidown"会晚到已被放弃的管道里。
-// 改动任一侧都必须同步另一侧；native-host 里有测试把这两个数字绑在一起。
+// 余量只有 0.6s：这个数字被低估过（曾按"握手 IO 只有 1s"算），而低估的余量
+// 会悄悄消失。改动任一侧都必须同步另一侧；native-host 里有测试把这两个数字
+// 和上面的算式绑在一起。
 const NATIVE_HOST_TIMEOUT_MS = 8000;
 
 // 应答消息：Host 同时给出旧的 `message` 与 NativeResponse 的 `data.message`，
@@ -33,6 +36,14 @@ const NATIVE_HOST_TIMEOUT_MS = 8000;
 function replyMessage(response, fallback) {
   if (!response) return fallback;
   return response.message || response.data?.message || fallback;
+}
+
+// 应答是否表示失败。`success` 是旧 Host 的扁平键，`ok` 是 NativeResponse 的
+// 信封键，两个都看：Host 的失败应答现在会在 8 秒等待之内准时到达（拉起预算
+// 从 15 秒收紧到 5 秒），只把 `success` 当成功会把失败报成成功。
+// 两个键都缺时按成功处理——那与"旧 Host 不回显"时的既有行为一致。
+function replyFailed(response) {
+  return !!response && (response.success === false || response.ok === false);
 }
 
 // Send a message to the Native Host via Chrome Native Messaging
@@ -244,6 +255,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         // Quick connectivity check
         try {
           const resp = await sendToNativeHost('test_connection', {});
+          // 握手失败时 Host 回的是 {success:false,…}，文案是
+          // "Multidown 未运行或未就绪"。丢掉 success 把它当成功返回，
+          // 弹窗就会一边报错文案一边显示"已连接"。
+          if (replyFailed(resp)) {
+            return { success: false, message: replyMessage(resp, 'Multidown 未运行或未就绪') };
+          }
           return { success: true, message: replyMessage(resp, '已连接') };
         } catch (e) {
           return { success: false, message: e.message };
@@ -301,12 +318,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { success: true };
 
       } else if (message.action === 'open_app') {
-        // Try to open app via native messaging ping
+        // 通过 native messaging 拉起主程序
         try {
-          await sendToNativeHost('open_app', {});
-          return { success: true };
+          const resp = await sendToNativeHost('open_app', {});
+          // 必须看 Host 的成功标志：拉起预算是 5 秒，它的失败应答会在 8 秒
+          // 等待之内准时到达（更早的版本预算是 15 秒，应答总是晚到、由超时
+          // 兜底）。无视 success 会把"应用根本没起来"报成"已启动 Multidown"。
+          if (replyFailed(resp)) {
+            return {
+              success: false,
+              message: replyMessage(resp, '无法启动应用，请手动启动 Multidown'),
+            };
+          }
+          return { success: true, message: replyMessage(resp, '已启动 Multidown') };
         } catch (e) {
-          return { success: false, message: '无法启动应用' };
+          return { success: false, message: e.message };
         }
 
       } else {

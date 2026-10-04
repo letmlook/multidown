@@ -70,7 +70,9 @@ document.getElementById('btnOpenApp').addEventListener('click', function() {
     if (response && response.success) {
       showToast('已启动 Multidown', 'success');
     } else {
-      showToast('启动失败，请确保已安装', 'error');
+      // Host 的失败原因（如"无法启动应用，请手动启动 Multidown"）比泛泛的
+      // 提示有用，这里优先显示它
+      showToast(response?.message || '启动失败，请确保已安装', 'error');
     }
   });
 });

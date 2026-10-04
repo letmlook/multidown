@@ -353,3 +353,81 @@ test('background.js 把等待上限与 Host 侧的耦合写在注释里', () => 
     '注释必须指明 Host 侧的常量名',
   );
 });
+
+// ─── open_app / check_connection 不得把失败报成成功 ─────────────────────────
+
+/** 让 Host 回一句固定应答，再触发一次 background 的消息处理。 */
+function replyThen(action, reply) {
+  const state = loadBackground((request, handle) => {
+    handle.onMessage({ request_id: request.request_id, ...reply });
+  });
+  const listener = state.listeners[0];
+  return new Promise((resolve) => listener({ action }, {}, resolve));
+}
+
+test('open_app 收到 Host 的失败应答时报失败并带出 Host 的文案', () => {
+  // 拉起预算收紧到 5 秒后，Host 的失败应答会准时落进 8 秒等待窗口：
+  // 此时若丢弃 success，用户会看到"已启动 Multidown"，而应用根本没起来。
+  return replyThen('open_app', {
+    ok: false,
+    success: false,
+    message: '无法启动应用，请手动启动 Multidown',
+  }).then((result) => {
+    assert.equal(result.success, false);
+    assert.equal(result.message, '无法启动应用，请手动启动 Multidown');
+  });
+});
+
+test('open_app 成功时仍然报成功', () => {
+  return replyThen('open_app', { ok: true, success: true, message: '已启动 Multidown' }).then(
+    (result) => {
+      assert.equal(result.success, true);
+      assert.equal(result.message, '已启动 Multidown');
+    },
+  );
+});
+
+test('open_app 只回 ok:false（没有旧 success 键）时同样判失败', () => {
+  return replyThen('open_app', {
+    ok: false,
+    data: { message: '无法启动应用，请手动启动 Multidown' },
+  }).then((result) => {
+    assert.equal(result.success, false);
+    assert.equal(result.message, '无法启动应用，请手动启动 Multidown');
+  });
+});
+
+test('check_connection 握手失败时报失败，而不是带着失败文案显示已连接', () => {
+  return replyThen('check_connection', {
+    ok: false,
+    success: false,
+    message: 'Multidown 未运行或未就绪，请先启动 Multidown',
+  }).then((result) => {
+    assert.equal(result.success, false);
+    assert.equal(result.message, 'Multidown 未运行或未就绪，请先启动 Multidown');
+  });
+});
+
+test('check_connection 握手成功时仍然报成功', () => {
+  return replyThen('check_connection', { ok: true, success: true, message: '已连接' }).then(
+    (result) => {
+      assert.equal(result.success, true);
+      assert.equal(result.message, '已连接');
+    },
+  );
+});
+
+test('popup.js 在 open_app 失败时优先显示 Host 的文案', () => {
+  const popupSource = readFileSync(
+    path.resolve(projectRoot, 'integration/extension/popup.js'),
+    'utf8',
+  );
+  const openAppHandler = popupSource.slice(
+    popupSource.indexOf("action: 'open_app'"),
+    popupSource.indexOf('loadPageMedia'),
+  );
+  assert.ok(
+    openAppHandler.includes('response?.message'),
+    'open_app 失败必须把 Host 的文案显示出来，而不是固定提示',
+  );
+});
