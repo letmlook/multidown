@@ -2977,6 +2977,18 @@ impl Scheduler {
         if to_remove.is_empty() {
             return Ok(0);
         }
+        // 与 remove_task 相同的"先停会话/worker 再移除记录"契约：做种恢复
+        // 会把活跃会话挂到 Completed 任务上，直接删记录会留下孤儿会话。
+        // 只移除记录、不删数据文件（菜单语义如此）。
+        for task_id in &to_remove {
+            self.stop_torrent_supervisor(task_id).await;
+            if let Some(engine) = self.torrent_engine.get() {
+                engine
+                    .remove(task_id, false)
+                    .await
+                    .map_err(|error| format!("移除种子会话失败: {error}"))?;
+            }
+        }
         self.commit_task_removals(&to_remove).await?;
         Ok(to_remove.len())
     }
@@ -5956,6 +5968,56 @@ mod tests {
             let missing = scheduler.preview_task_deletion("no-such-task").await;
             assert!(missing.is_err());
             scheduler.remove_task("inside", true).await.unwrap();
+        }
+
+        /// 最终计划评审修复：清除已完成任务必须先停活着的做种会话，
+        /// 否则做种恢复挂上的 supervisor/会话会随记录一起变成孤儿。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn clear_completed_stops_live_seeding_sessions_before_removing_records() {
+            let fixture = InitializationFixture::new();
+            let record = torrent_record(&fixture, "seeding-done", TaskStatus::Completed).await;
+            save_tasks_to_file(&fixture.paths().tasks, &[record])
+                .await
+                .unwrap();
+            let (scheduler, warnings) = Scheduler::initialize(
+                fixture.paths(),
+                crate::settings::AppSettings {
+                    torrent_seed_mode: "forever".into(),
+                    ..settings_with_root(&fixture.0.join("downloads"))
+                },
+            )
+            .unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 1, "forever 策略下已完成任务应恢复做种");
+            let engine = scheduler.torrent_engine().await.unwrap();
+            assert!(engine.handle("seeding-done").is_some());
+            assert!(scheduler
+                .torrent_supervisors
+                .lock()
+                .await
+                .contains_key("seeding-done"));
+
+            let removed = scheduler.clear_completed_tasks().await.unwrap();
+
+            assert_eq!(removed, 1);
+            assert!(engine.handle("seeding-done").is_none(), "会话必须先被摘除");
+            assert!(!scheduler
+                .torrent_supervisors
+                .lock()
+                .await
+                .contains_key("seeding-done"));
+            assert!(scheduler.get_task("seeding-done").await.is_none());
+            assert!(
+                fixture
+                    .0
+                    .join("downloads/seeding-done-dir/payload.bin")
+                    .exists(),
+                "清除记录不删除数据文件"
+            );
+            engine.stop().await;
         }
     }
 
