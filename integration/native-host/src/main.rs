@@ -23,8 +23,11 @@ use native_protocol::{
 /// `integration/extension/background.js` 里的 `NATIVE_HOST_TIMEOUT_MS`（8000），
 /// 否则 Host 写进管道的"无法启动应用，请手动启动 Multidown"会晚于扩展的
 /// 8 秒超时，用户只会看到泛泛的"Native Host 连接超时"。
-/// 双向依赖，改动任一侧都要同步另一侧；`open_app_budget_fits_extension_timeout`
-/// 测试会把两侧的数字绑在一起。
+///
+/// 上界 = 预算 + 2 × 握手 IO（写与读各自受 `HANDSHAKE_IO_TIMEOUT` 约束）
+/// 加轮询间隔，即 5s + 2s + 0.4s = 7.4s，余量只有 0.6s。算式见共享 crate 的
+/// `handshake_worst_case()`，`open_app_budget_fits_extension_timeout` 会把两侧
+/// 的数字绑在一起。改动任一侧都要同步另一侧。
 const OPEN_APP_LAUNCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 const OPEN_APP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
@@ -188,29 +191,22 @@ fn write_u32_le(w: &mut impl Write, n: u32) -> std::io::Result<()> {
 
 /// Host → 扩展的应答。
 ///
-/// 应答主体由共享 crate 的 [`NativeResponse`] 构造，`request_id` 因此被真正
-/// 回显。为了不让**已发布**的扩展读到 `undefined`，旧的 `success` / `message`
-/// 字段仍然并列输出（`get_config` 另有 `config`）：`background.js` 现在同时
-/// 认这两种形状，缺 `request_id` 的旧版 Host 也照样能工作。
+/// 应答主体由共享 crate 的 [`NativeResponse`] 构造并经
+/// [`NativeResponse::legacy_value`] 合并，`request_id` 因此被真正回显，而
+/// **已发布**的扩展读的扁平键（`success` / `message`，`get_config` 另有
+/// `config`）也仍在原位——合并逻辑只有这一份，应用侧发来的应答走同一条路。
 fn send_response(stdout: &mut impl Write, request_id: &str, ok: bool, message: &str) {
-    let mut body = serde_json::to_value(response_of(request_id, ok, message))
-        .unwrap_or_else(|_| serde_json::json!({ "ok": false }));
-    if let Some(object) = body.as_object_mut() {
-        object.insert("success".to_string(), serde_json::json!(ok));
-        object.insert("message".to_string(), serde_json::json!(message));
-    }
-    write_frame(stdout, &body)
+    write_frame(stdout, &response_of(request_id, ok, message).legacy_value());
 }
 
-/// `get_config` 应答：捕获配置沿用旧的顶层 `config` 字段，同时带上回显。
+/// `get_config` 应答：捕获配置放在 `data.config`，由共享合并器提升到旧扩展
+/// 读的顶层 `config`。
 fn send_config_response(stdout: &mut impl Write, request_id: &str, config: serde_json::Value) {
-    let mut body = serde_json::to_value(response_of(request_id, true, "已获取配置"))
-        .unwrap_or_else(|_| serde_json::json!({ "ok": false }));
-    if let Some(object) = body.as_object_mut() {
-        object.insert("success".to_string(), serde_json::json!(true));
-        object.insert("config".to_string(), config);
-    }
-    write_frame(stdout, &body)
+    let response = NativeResponse::ok(
+        request_id,
+        serde_json::json!({ "message": "已获取配置", "config": config }),
+    );
+    write_frame(stdout, &response.legacy_value());
 }
 
 fn response_of(request_id: &str, ok: bool, message: &str) -> NativeResponse {
@@ -835,14 +831,19 @@ mod tests {
 
     /// I2：Host 的 open_app 预算必须留出余量地小于扩展的等待上限，否则
     /// "无法启动应用，请手动启动 Multidown" 会写进 Chrome 已经放弃的管道。
-    /// 预算检查发生在握手之后，所以上界是 预算 + 握手 IO + 轮询间隔。
+    /// 预算检查发生在**最后一次**握手之后，而 `HANDSHAKE_IO_TIMEOUT` 同时约束
+    /// 写与读，所以上界是 预算 + 2 × 握手 IO + 轮询间隔。
     #[test]
     fn open_app_budget_fits_extension_timeout() {
         let extension_ms = extension_timeout_ms();
         let worst_case_ms = (OPEN_APP_LAUNCH_BUDGET
-            + native_protocol::HANDSHAKE_IO_TIMEOUT
+            + native_protocol::handshake_worst_case()
             + OPEN_APP_POLL_INTERVAL)
             .as_millis();
+        assert_eq!(
+            worst_case_ms, 7400,
+            "上界算式变了（写与读各算一次握手 IO），两侧的余量声明要跟着更新"
+        );
         assert!(
             OPEN_APP_LAUNCH_BUDGET.as_millis() < extension_ms,
             "open_app 预算 {}ms 必须小于扩展等待上限 {extension_ms}ms",
@@ -926,8 +927,17 @@ mod tests {
         assert_eq!(body["request_id"], "req-7");
         assert_eq!(body["ok"], false);
         assert_eq!(body["success"], false);
-        assert_eq!(body["error"]["message"], "无法连接 Multidown: refused");
+        // 失败文本：旧格式读者（上一版 Host / 上一版桌面端）只读顶层字符串，
+        // 新的共享解析器从同一行还原出结构化错误
+        assert_eq!(body["error"], "无法连接 Multidown: refused");
         assert_eq!(body["message"], "无法连接 Multidown: refused");
+        let parsed =
+            native_protocol::NativeResponse::parse(serde_json::to_vec(&body).unwrap().as_slice())
+                .expect("Host 发出的失败应答必须能被共享 crate 解析");
+        assert_eq!(parsed.request_id, "req-7");
+        let error = parsed.error.expect("失败应答必须带错误");
+        assert_eq!(error.message, "无法连接 Multidown: refused");
+        assert_eq!(error.code, native_protocol::NativeErrorCode::DesktopError);
     }
 
     /// I5：解析出的应答是合法的 NativeResponse（共享 crate 的读路径）。
@@ -1003,6 +1013,45 @@ mod tests {
         assert_eq!(reply.config.unwrap()["capture_enabled"], true);
 
         assert!(read_desktop_reply("not json").is_err());
+    }
+
+    /// I5：应用端也用共享合并器发应答（为了兼容已发布的旧 Host），因此
+    /// **新 Host** 必须能读回带兼容键的每一行：握手标记、捕获配置、错误文本。
+    #[test]
+    fn replies_merged_by_the_app_side_are_read_back_without_losing_anything() {
+        let handshake = NativeResponse::ok(
+            "req-hs",
+            serde_json::json!({ "handshake": native_protocol::DESKTOP_HANDSHAKE, "protocol": PROTOCOL_VERSION }),
+        );
+        let line = handshake.to_legacy_line();
+        native_protocol::validate_handshake_reply(&line).expect("握手行必须通过校验");
+        let reply = read_desktop_reply(&String::from_utf8(line).unwrap()).unwrap();
+        assert!(reply.ok);
+        assert_eq!(reply.request_id, "req-hs");
+
+        // 捕获关闭 + 黑名单必须原样传回来，否则用户会重新被捕获
+        let config = NativeResponse::ok(
+            "req-c",
+            serde_json::json!({
+                "config": { "capture_enabled": false, "domain_blacklist": ["a.com"] },
+            }),
+        );
+        let reply =
+            read_desktop_reply(&String::from_utf8(config.to_legacy_line()).unwrap()).unwrap();
+        let config = reply.config.expect("配置必须被读到");
+        assert_eq!(config["capture_enabled"], false);
+        assert_eq!(config["domain_blacklist"][0], "a.com");
+
+        // 错误文本：顶层字符串与 data 里的结构化副本都得到同一条文案
+        let failure = NativeResponse::error(
+            "req-e",
+            NativeError::new(NativeErrorCode::InvalidPayload, "该域名已被捕获黑名单过滤"),
+        );
+        let reply =
+            read_desktop_reply(&String::from_utf8(failure.to_legacy_line()).unwrap()).unwrap();
+        assert!(!reply.ok);
+        assert_eq!(reply.message, "该域名已被捕获黑名单过滤");
+        assert_eq!(reply.request_id, "req-e");
     }
 
     /// I4：Host 解析出的端口文件与共享解析器逐平台一致。

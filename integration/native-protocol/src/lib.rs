@@ -9,9 +9,25 @@
 //! - 响应是同构 JSON：成功 `{"request_id":…,"ok":true,…}`，失败
 //!   `{"request_id":…,"ok":false,"error":{"code":…,"message":…}}`。
 //!   两侧的应答都必须经 [`NativeResponse`] 构造并用
-//!   [`NativeResponse::to_line`] 发出，`request_id` 才是真正被回显的。
-//!   对端可能不回显（旧版本地），此时 `request_id` 解析为空串——这是被容忍的
-//!   兼容情况，不是成功条件。
+//!   [`NativeResponse::to_line`] 或 [`NativeResponse::to_legacy_line`] 发出，
+//!   `request_id` 才是真正被回显的。对端可能不回显（旧版本地），此时
+//!   `request_id` 解析为空串——这是被容忍的兼容情况，不是成功条件。
+//!
+//! **新旧配对的部署现实**：Native Host 二进制是**单独安装**的（只有应用的
+//! "install_browser_extension" 动作会把它复制到浏览器的 host 目录），所以
+//! "升级了应用但没重装扩展" = **新应用进程 + 旧 Host 二进制**，这是常态而不是
+//! 边缘情况。旧 Host 的读取位置是写死的扁平字面量：握手标记在顶层、`config` 在
+//! 顶层、`error` 是**裸字符串**。因此线上发出的每一行都走
+//! [`NativeResponse::to_legacy_line`]：新信封原样保留（旧 Host 忽略未知键），
+//! 同时把旧位置的扁平键补齐。两侧读到的是：
+//!
+//! | 键 | 旧 Host（已发布） | 新 Host / [`NativeResponse::parse`] |
+//! |---|---|---|
+//! | `ok` / `request_id` | 顶层 | 顶层 |
+//! | `success` / `message` | 顶层 | 忽略（`data.message` 优先） |
+//! | `handshake` / `protocol` | 只看顶层 | 顶层优先，回退 `data.*` |
+//! | `config` | 只看顶层 | `data.config` 优先，回退顶层 |
+//! | `error` | 顶层**字符串** | 字符串或 `{code,message}` 都解析；<br>代码的权威副本在 `data.error` |
 //! - 敏感字段（cookie、user_agent、post_data 等）在 [`Debug`] 输出中被脱敏，
 //!   Host 的日志永远不会打印它们的值；完整 URL 一律经 [`url_log_hint`] /
 //!   [`sanitize_log_data`] 裁剪后才允许落日志。
@@ -248,6 +264,9 @@ impl NativeRequest {
 }
 
 /// 桌面端的处理结果：成功携带动作相关数据，失败携带结构化错误。
+///
+/// 线上还并列输出一份**旧位置**的扁平键（见 [`NativeResponse::to_legacy_line`]），
+/// 让已发布的 Native Host 也能读到握手标记 / `config` / 错误文本。
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeResponse {
     #[serde(default)]
@@ -255,8 +274,32 @@ pub struct NativeResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_error_compat")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<NativeError>,
+}
+
+/// `error` 字段的兼容反序列化：结构化 `{code, message}` 与旧版本地的裸字符串
+/// 都接受。裸字符串没有 `code`（旧格式压根没这个字段），统一归到
+/// [`NativeErrorCode::DesktopError`]——它只表示"这是桌面端报的错"，不代表
+/// 成因；真正的代码仍以 `data.error` 的形式留在兼容行里给新消费者读。
+fn deserialize_error_compat<'de, D>(deserializer: D) -> Result<Option<NativeError>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ErrorWire {
+        Structured(NativeError),
+        Message(String),
+    }
+    Ok(match Option::<ErrorWire>::deserialize(deserializer)? {
+        None => None,
+        Some(ErrorWire::Structured(error)) => Some(error),
+        Some(ErrorWire::Message(message)) => {
+            Some(NativeError::new(NativeErrorCode::DesktopError, message))
+        }
+    })
 }
 
 impl fmt::Debug for NativeResponse {
@@ -289,6 +332,19 @@ impl NativeResponse {
         }
     }
 
+    /// 人类可读的文本：成功取 `data.message`，失败取 `error.message`。
+    /// 应答没有文本时返回 `None`（不要用空串顶替，那会让调用方把"没消息"
+    /// 当成"消息是空的"）。
+    pub fn message(&self) -> Option<&str> {
+        if let Some(error) = &self.error {
+            return Some(error.message.as_str());
+        }
+        self.data
+            .as_ref()
+            .and_then(|data| data.get("message"))
+            .and_then(serde_json::Value::as_str)
+    }
+
     /// 解析响应 JSON（Host / 桌面端回读时使用）。
     pub fn parse(bytes: &[u8]) -> Result<Self, NativeError> {
         serde_json::from_slice(bytes)
@@ -307,6 +363,71 @@ impl NativeResponse {
         line.push('\n');
         line.into_bytes()
     }
+
+    /// 新信封 + 旧位置扁平键的合并结果（不含结尾换行）。
+    ///
+    /// 两侧的线上应答都必须经过这里：旧 Host 的读取位置是写死的扁平字面量，
+    /// 它读不到 `data` 里的东西。合并只**增加**键、不改新信封的语义：
+    ///
+    /// - `success` = `ok`，`message` = [`NativeResponse::message`]；
+    /// - `handshake` / `protocol` / `config` 从 `data` 提升到顶层（旧 Host 只看
+    ///   顶层；新 Host 优先顶层、回退 `data`，因此两者都拿得到同一个值）；
+    /// - 失败时顶层 `error` 降级成**裸字符串**（旧 Host 只读 `as_str`），
+    ///   结构化 `{code, message}` 保留在 `data.error` 给新消费者。
+    pub fn legacy_value(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self)
+            .unwrap_or_else(|_| serde_json::json!({ "ok": false, "request_id": "" }));
+        if !value.is_object() {
+            return value;
+        }
+        {
+            let object = value.as_object_mut().expect("刚确认是对象");
+            object.insert("success".to_string(), serde_json::json!(self.ok));
+            if let Some(message) = self.message() {
+                object.insert("message".to_string(), serde_json::json!(message));
+            }
+            if let Some(error) = &self.error {
+                // 旧 Host 的 `response.get("error").and_then(as_str)` 只认字符串
+                object.insert("error".to_string(), serde_json::json!(error.message));
+                let structured = serde_json::to_value(error)
+                    .unwrap_or_else(|_| serde_json::json!({ "message": error.message }));
+                let data = object
+                    .entry("data".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(data) = data.as_object_mut() {
+                    data.insert("error".to_string(), structured);
+                }
+            }
+        }
+        // data 里的握手标记 / 配置提升到顶层（旧 Host 只看顶层）
+        let hoisted: Vec<(&str, serde_json::Value)> = ["handshake", "protocol", "config"]
+            .iter()
+            .filter_map(|key| {
+                value
+                    .get("data")
+                    .and_then(|data| data.get(*key))
+                    .cloned()
+                    .map(|found| (*key, found))
+            })
+            .collect();
+        for (key, found) in hoisted {
+            value
+                .as_object_mut()
+                .expect("刚确认是对象")
+                .insert(key.to_string(), found);
+        }
+        value
+    }
+
+    /// 线上兼容行：新信封 + 旧位置扁平键（含结尾换行）。
+    ///
+    /// 这是**唯一**该发到 TCP / Native Messaging 管道的形状：应用与 Host 都用
+    /// 它，两边不必各长一套私有合并器。
+    pub fn to_legacy_line(&self) -> Vec<u8> {
+        let mut line = self.legacy_value().to_string();
+        line.push('\n');
+        line.into_bytes()
+    }
 }
 
 /// Tauri 应用标识符（tauri.conf.json `identifier`），端口文件位于
@@ -318,9 +439,21 @@ pub const DESKTOP_HANDSHAKE: &str = "multidown";
 
 /// [`ensure_desktop_connection`] 单次轮询内握手所用的 IO 超时。
 ///
+/// **写与读各自**受本值约束（见 [`connect_and_handshake`]），所以一次握手的
+/// 最坏耗时是它的两倍——把它当"一次握手的耗时"就会把上界算小一整个超时。
 /// 暴露成常量是因为它是"拉起预算"最坏耗时的一部分：调用方要保证
-/// 预算 + 本值 + 轮询间隔 仍落在上层（扩展）的等待上限之内。
+/// 预算 + [`handshake_worst_case`] + 轮询间隔 仍落在上层（扩展）的等待上限之内。
 pub const HANDSHAKE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 单次握手最坏耗时的上界 = 写超时 + 读超时。
+///
+/// 算式集中在这里，调用方（Native Host 的预算检查）与两侧的注释都用它，
+/// 免得同一个上界在三处各写一遍、其中一处少算一个超时。
+/// `TcpStream::connect` 不受 [`HANDSHAKE_IO_TIMEOUT`] 约束，但它只连环回地址
+/// （`127.0.0.1`），要么立即成功、要么立即被拒，不构成"超时型"耗时。
+pub fn handshake_worst_case() -> std::time::Duration {
+    HANDSHAKE_IO_TIMEOUT + HANDSHAKE_IO_TIMEOUT
+}
 
 /// 平台区分。端口文件位置必须与 Tauri 的 `app_data_dir` 完全一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -824,6 +957,170 @@ mod tests {
             let error = validate_handshake_reply(&reply.to_line()).unwrap_err();
             assert_eq!(error.code, NativeErrorCode::DesktopError);
         }
+    }
+
+    // ─── 旧 Host 兼容（扁平读取位置） ────────────────────────────────────────
+
+    /// **上一版** Native Host 的读取器，按当时的字面量位置取值：`handshake`、
+    /// `protocol`、`config` 只看顶层，`error` 按 `as_str` 读（读不到就退化成
+    /// 泛泛的"添加失败"）。它是对"已发布 Host"最忠实的复刻，因此下面的断言
+    /// 比字符串匹配更接近真实故障模式。
+    struct PreDiffHostReply {
+        ok: bool,
+        handshake: Option<String>,
+        protocol: Option<u64>,
+        config: Option<serde_json::Value>,
+        error: Option<String>,
+    }
+
+    impl PreDiffHostReply {
+        fn parse(line: &[u8]) -> Self {
+            let value: serde_json::Value =
+                serde_json::from_slice(line).expect("旧 Host 只会读到 JSON");
+            let top = |key: &str| value.get(key).cloned();
+            Self {
+                ok: value
+                    .get("ok")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                handshake: top("handshake").and_then(|v| v.as_str().map(str::to_string)),
+                protocol: top("protocol").and_then(|v| v.as_u64()),
+                config: top("config"),
+                error: top("error").and_then(|v| v.as_str().map(str::to_string)),
+            }
+        }
+    }
+
+    /// 兼容行必须让**只读顶层**的旧 Host 拿到握手标记、`config` 与错误文本，
+    /// 同时新解析器仍能拿到结构化的值。
+    #[test]
+    fn legacy_lines_are_readable_by_both_the_pre_diff_host_and_the_new_parser() {
+        // 握手：旧 Host 的握手校验只认顶层标记
+        let handshake = NativeResponse::ok(
+            "req-hs",
+            serde_json::json!({ "handshake": DESKTOP_HANDSHAKE, "protocol": PROTOCOL_VERSION }),
+        );
+        let line = handshake.to_legacy_line();
+        assert_eq!(line.last(), Some(&b'\n'));
+        let old = PreDiffHostReply::parse(&line);
+        assert!(old.ok);
+        assert_eq!(old.handshake.as_deref(), Some(DESKTOP_HANDSHAKE));
+        assert_eq!(old.protocol, Some(u64::from(PROTOCOL_VERSION)));
+        validate_handshake_reply(&line).expect("新 Host 同样认这行");
+        let new = NativeResponse::parse(&line).unwrap();
+        assert_eq!(new.request_id, "req-hs");
+        assert_eq!(new.data.unwrap()["handshake"], DESKTOP_HANDSHAKE);
+
+        // get_config：关闭捕获 + 黑名单是隐私控制，旧 Host 读不到就会退化成
+        // "默认开启"，等于用户关了又被重新捕获
+        let config = NativeResponse::ok(
+            "req-cfg",
+            serde_json::json!({
+                "config": { "capture_enabled": false, "domain_blacklist": ["blocked.example.com"] },
+            }),
+        );
+        let line = config.to_legacy_line();
+        let old = PreDiffHostReply::parse(&line);
+        assert_eq!(
+            old.config.as_ref().unwrap()["capture_enabled"],
+            false,
+            "旧 Host 必须读到真实的 capture_enabled"
+        );
+        assert_eq!(
+            old.config.as_ref().unwrap()["domain_blacklist"][0],
+            "blocked.example.com",
+            "旧 Host 必须读到真实的黑名单"
+        );
+        let new = NativeResponse::parse(&line).unwrap();
+        assert_eq!(new.data.unwrap()["config"]["capture_enabled"], false);
+
+        // 失败应答：旧 Host 只读顶层字符串 error
+        let failure = NativeResponse::error(
+            "req-e",
+            NativeError::new(NativeErrorCode::InvalidPayload, "该域名已被捕获黑名单过滤"),
+        );
+        let line = failure.to_legacy_line();
+        let old = PreDiffHostReply::parse(&line);
+        assert!(!old.ok);
+        assert_eq!(
+            old.error.as_deref(),
+            Some("该域名已被捕获黑名单过滤"),
+            "旧 Host 必须拿到真实错误文本而不是泛泛的'添加失败'"
+        );
+        let new = NativeResponse::parse(&line).expect("新解析器接受裸字符串 error");
+        assert!(!new.ok);
+        let error = new.error.expect("失败应答必须带错误");
+        assert_eq!(error.message, "该域名已被捕获黑名单过滤");
+        // 结构化代码的权威副本留在 data.error；顶层字符串没有 code，解析时
+        // 按 DesktopError 兜底（见 deserialize_error_compat）
+        assert_eq!(error.code, NativeErrorCode::DesktopError);
+        let data = new.data.expect("兼容行必须保留结构化错误");
+        assert_eq!(data["error"]["code"], "invalid_payload");
+        assert_eq!(data["error"]["message"], "该域名已被捕获黑名单过滤");
+        assert_eq!(new.request_id, "req-e");
+    }
+
+    /// 反向证明：只发新信封（不带兼容键）时旧 Host 拿不到标记、配置与文本。
+    /// 这条断言是兼容层的存在理由——没有它，"顺手精简一下字段"不会被发现。
+    #[test]
+    fn a_new_only_line_is_unreadable_by_the_pre_diff_host() {
+        let handshake = NativeResponse::ok(
+            "req-hs",
+            serde_json::json!({ "handshake": DESKTOP_HANDSHAKE, "protocol": PROTOCOL_VERSION }),
+        );
+        let old = PreDiffHostReply::parse(&handshake.to_line());
+        assert_eq!(old.handshake, None, "旧 Host 只看顶层标记");
+        assert!(validate_handshake_reply(&handshake.to_legacy_line()).is_ok());
+
+        let config = NativeResponse::ok("req-c", serde_json::json!({ "config": {} }));
+        assert_eq!(PreDiffHostReply::parse(&config.to_line()).config, None);
+
+        let failure = NativeResponse::error(
+            "req-e",
+            NativeError::new(NativeErrorCode::DesktopError, "磁盘已满"),
+        );
+        assert_eq!(PreDiffHostReply::parse(&failure.to_line()).error, None);
+        assert_eq!(
+            PreDiffHostReply::parse(&failure.to_legacy_line())
+                .error
+                .as_deref(),
+            Some("磁盘已满")
+        );
+    }
+
+    /// 裸字符串 `error`（上一版桌面端的字面量形状）也能被解析。
+    #[test]
+    fn legacy_string_error_replies_still_parse() {
+        let parsed = NativeResponse::parse(br#"{"ok":false,"error":"timeout"}"#).unwrap();
+        assert!(!parsed.ok);
+        let error = parsed.error.expect("裸字符串也要还原成结构化错误");
+        assert_eq!(error.message, "timeout");
+        assert_eq!(error.code, NativeErrorCode::DesktopError);
+        // 旧版本地没有 data / request_id，被容忍为空
+        assert_eq!(parsed.request_id, "");
+        assert!(parsed.data.is_none());
+    }
+
+    /// 兼容行不带"空消息"：没有文本时就不写 `message` 键，避免调用方把
+    /// "没有消息"读成"消息是空的"。
+    #[test]
+    fn legacy_lines_omit_an_absent_message() {
+        let value = NativeResponse::ok("req-empty", serde_json::json!({})).legacy_value();
+        assert_eq!(value["success"], true);
+        assert!(value.get("message").is_none(), "{value}");
+        let failure = NativeResponse::error(
+            "req-e",
+            NativeError::new(NativeErrorCode::DesktopError, "x"),
+        );
+        assert_eq!(failure.legacy_value()["message"], "x");
+    }
+
+    /// I3：握手最坏耗时是写超时 + 读超时，不是单个超时。拉起预算的上界必须
+    /// 按这个算式算，否则余量会被凭空多算一秒。
+    #[test]
+    fn handshake_worst_case_counts_both_io_timeouts() {
+        assert_eq!(handshake_worst_case(), HANDSHAKE_IO_TIMEOUT * 2);
+        assert_eq!(handshake_worst_case(), std::time::Duration::from_secs(2));
     }
 
     mod discovery {
