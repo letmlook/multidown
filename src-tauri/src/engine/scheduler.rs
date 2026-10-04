@@ -872,7 +872,26 @@ impl Scheduler {
     }
 
     /// 将当前任务列表保存到 save_path（若已配置）。
+    ///
+    /// 与其他落盘入口共用 `lifecycle_persist_lock`：`save_store` 是"写临时文件 →
+    /// 轮换备份 → 原子替换"三步（`storage.rs`），两个并发写在 Windows 上是否会
+    /// 互踩，**目前只是推测**。
+    ///
+    /// 已知与未知的分界：
+    /// - **已知**：这里曾是唯一一个不持锁的落盘入口（`persist_task_record_update`、
+    ///   `persist_status_transition`、`commit_created_tasks`、
+    ///   `commit_task_removals`、`retry_batch` 都持锁），并发写没有被串行化。
+    /// - **已知（实测）**：Windows 上偶发 `[persistence-error] … os error 5` /
+    ///   `os error 32`，约每 6 次"种子在恢复瞬间完成"出现 1 次。
+    /// - **未知**：该报错是否由这个缺口造成。并发最强的场景（`join!` 同时发起
+    ///   两次整表落盘，8 轮 × 16 次写）**一次都没有复现**，所以"进程内并发写"
+    ///   并不能解释它；外部句柄（如扫描程序以不允许 `FILE_SHARE_DELETE` 的方式
+    ///   持有刚落盘的文件，使 `MoveFileExW` 失败）是同样合理的解释。
+    ///
+    /// 因此这把锁的价值是**消除一个确实存在的串行化缺口**，而不是"已修好上面
+    /// 那个报错"——后者仍然未解决，需要单独诊断。
     pub async fn save_tasks(&self) -> Result<(), String> {
+        let _transaction = self.lifecycle_persist_lock.lock().await;
         let snapshots = self.task_records().await;
         self.persist_task_records(&snapshots).await
     }
@@ -3019,6 +3038,10 @@ impl Scheduler {
         pt.url = probe_result.final_url;
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, Arc::new(Task::from_persisted(pt)));
+        // 必须先释放 `tasks` 守卫再落盘：`save_tasks` → `task_records` 会重新获取
+        // 同一把锁，而 tokio 的 Mutex 不可重入——带着守卫调用会永久挂起
+        // （并且连带挂住 `lifecycle_persist_lock`，把一次调用卡成全局落盘停顿）。
+        drop(tasks);
         self.save_tasks().await?;
         Ok(())
     }
@@ -3052,6 +3075,9 @@ impl Scheduler {
             .to_string();
         let mut tasks = self.tasks.lock().await;
         tasks.insert(id, Arc::new(Task::from_persisted(pt)));
+        // 同 `refresh_task_url`：`save_tasks` 会重新获取 `tasks`，tokio 的 Mutex
+        // 不可重入，必须先释放守卫。
+        drop(tasks);
         self.save_tasks().await?;
         Ok(())
     }
@@ -7430,5 +7456,138 @@ mod tests {
             .create_torrent_task(second.into(), ".".into(), None, None, None, None, false)
             .await;
         assert_eq!(again.unwrap_err(), "重复下载：已存在相同地址的任务");
+    }
+
+    /// 改任务属性（改 URL / 改保存路径）必须能真正落盘。
+    ///
+    /// 回归覆盖：这两个函数先**释放** `tasks` 守卫去探测 / 搬文件，写回任务表
+    /// 之后**重新获取**守卫并就地调用 `save_tasks()`。而 `save_tasks` 经
+    /// `task_records()` 会再取同一把 `tasks` 锁——tokio 的 Mutex 不可重入，
+    /// 带着守卫调用会永久挂起。`save_tasks` 现在还会先取
+    /// `lifecycle_persist_lock`，于是一次这样的误用会把**整个落盘子系统**一起
+    /// 卡住：队列增删改、批次操作、状态流转与周期保存全在等这把锁。
+    ///
+    /// 测试写成**有界**形式：操作包在 `tokio::time::timeout` 里并要求在期限内
+    /// 返回。这样回归表现为"测试失败（超时）"，而不是把整个测试进程挂住。
+    mod task_mutation {
+        use super::*;
+
+        /// 单个操作的挂起上限。回归时测试在这里失败，而不是永远等待。
+        const DEADLOCK_GUARD: std::time::Duration = std::time::Duration::from_secs(3);
+
+        /// 一条已暂停的 HTTP 任务记录（落盘状态，不联网）。
+        fn http_task(id: &str, url: &str, save_path: &str, filename: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "url": url,
+                "save_path": save_path,
+                "filename": filename,
+                "total_bytes": 10,
+                "downloaded_bytes": 0,
+                "status": "paused",
+                "pending_segments": [[0, 9]],
+                "supports_range": true,
+                "created_at": 1_700_000_000u64,
+            })
+        }
+
+        /// 初始化一个只含该任务的调度器，并返回它。
+        async fn scheduler_with(
+            fixture: &InitializationFixture,
+            id: &str,
+            record: serde_json::Value,
+        ) -> Scheduler {
+            fixture.write("tasks.json", serde_json::json!([record]));
+            let (scheduler, warnings) =
+                Scheduler::initialize(fixture.paths(), Default::default()).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert!(
+                scheduler.get_task(id).await.is_some(),
+                "fixture 必须能被读回"
+            );
+            scheduler
+        }
+
+        /// 落盘记录里的某个字段。
+        fn stored(fixture: &InitializationFixture, id: &str, field: &str) -> serde_json::Value {
+            let text = std::fs::read_to_string(fixture.paths().tasks).unwrap();
+            let store: serde_json::Value = serde_json::from_str(&text).unwrap();
+            store["data"]
+                .as_array()
+                .expect("data 必须是数组")
+                .iter()
+                .find(|record| record["id"] == id)
+                .unwrap_or_else(|| panic!("存储里找不到 {id}"))[field]
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn refresh_task_url_persists_without_deadlocking_on_the_task_map() {
+            let fixture = InitializationFixture::new();
+            let (url, server) = spawn_probe_server().await;
+            let scheduler = scheduler_with(
+                &fixture,
+                "refresh",
+                http_task("refresh", &url, "unused.bin", "unused.bin"),
+            )
+            .await;
+
+            tokio::time::timeout(
+                DEADLOCK_GUARD,
+                scheduler.refresh_task_url("refresh", &NetworkOptions::default()),
+            )
+            .await
+            .expect("refresh_task_url 必须在期限内返回：带着 tasks 守卫调用 save_tasks 会永久挂起")
+            .expect("refresh_task_url 必须成功");
+
+            assert_eq!(scheduler.get_task("refresh").await.unwrap().url, url);
+            assert_eq!(
+                stored(&fixture, "refresh", "url"),
+                serde_json::json!(url),
+                "刷新后的地址必须落盘，否则重启后又用回旧地址"
+            );
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn update_task_save_path_moves_the_file_and_persists_without_deadlocking() {
+            let fixture = InitializationFixture::new();
+            let old_path = fixture.0.join("moves/old.bin");
+            let new_path = fixture.0.join("renamed/new.bin");
+            std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+            std::fs::write(&old_path, b"payload").unwrap();
+            let scheduler = scheduler_with(
+                &fixture,
+                "move",
+                http_task(
+                    "move",
+                    "https://example.com/move.bin",
+                    &old_path.to_string_lossy(),
+                    "old.bin",
+                ),
+            )
+            .await;
+
+            tokio::time::timeout(
+                DEADLOCK_GUARD,
+                scheduler.update_task_save_path("move", new_path.to_string_lossy().into_owned()),
+            )
+            .await
+            .expect(
+                "update_task_save_path 必须在期限内返回：带着 tasks 守卫调用 save_tasks 会永久挂起",
+            )
+            .expect("update_task_save_path 必须成功");
+
+            assert!(!old_path.exists(), "原文件必须已经搬走");
+            assert_eq!(std::fs::read(&new_path).unwrap(), b"payload");
+            let task = scheduler.get_task("move").await.unwrap();
+            assert_eq!(task.save_path, new_path.to_string_lossy());
+            assert_eq!(task.filename, "new.bin");
+            assert_eq!(
+                stored(&fixture, "move", "save_path"),
+                serde_json::json!(new_path.to_string_lossy()),
+                "新路径必须落盘，否则重启后还指着已经不存在的旧位置"
+            );
+        }
     }
 }
