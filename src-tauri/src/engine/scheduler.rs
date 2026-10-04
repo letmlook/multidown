@@ -4072,6 +4072,11 @@ mod tests {
         }
 
         impl RecoveryServer {
+            // 本函数内唯一用到 `Atomic::fetch_update`：它在 Rust 1.95 才被标记
+            // `#[deprecated]`（重命名为 `try_update`），而 `try_update` 本身要到 1.95
+            // 才稳定，低于本项目 MSRV 1.88 无法使用。这里局部放行以满足
+            // `clippy -D warnings`；等 MSRV 提升到 1.95 后，连同本属性一起删除。
+            #[allow(deprecated)]
             async fn spawn(etag: &str, last_modified: &str, supports_range: bool) -> Self {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
@@ -4164,7 +4169,7 @@ mod tests {
                             let transient_failure = range_ordinal.is_some_and(|ordinal| {
                                 ordinal > 0
                                     && transient_failures
-                                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                                             n.checked_sub(1)
                                         })
                                         .is_ok()
