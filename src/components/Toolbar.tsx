@@ -11,6 +11,8 @@ interface ToolbarProps {
   onOpenSchedule?: () => void;
   onStartQueue?: () => void;
   onStopQueue?: () => void;
+  /** 删除走安全确认弹窗；这里只负责收集目标。 */
+  onRequestDelete?: (tasks: TaskInfo[]) => void;
 }
 
 export function Toolbar({
@@ -22,6 +24,7 @@ export function Toolbar({
   onOpenSchedule,
   onStartQueue,
   onStopQueue,
+  onRequestDelete,
 }: ToolbarProps) {
   const selected = tasks.find((t) => t.id === selectedId);
   const canResume = selected && (selected.status === "paused" || selected.status === "pending");
@@ -63,26 +66,15 @@ export function Toolbar({
     onRefresh();
   }, [tasks, onRefresh]);
 
-  const handleDelete = useCallback(async () => {
-    if (!selectedId) return;
-    try {
-      await invoke("remove_task", { taskId: selectedId });
-      onRefresh();
-    } catch (e) {
-      console.error(e);
-    }
-  }, [selectedId, onRefresh]);
+  const handleDelete = useCallback(() => {
+    if (!selected) return;
+    onRequestDelete?.([selected]);
+  }, [selected, onRequestDelete]);
 
-  const handleDeleteAll = useCallback(async () => {
-    for (const t of tasks) {
-      try {
-        await invoke("remove_task", { taskId: t.id });
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    onRefresh();
-  }, [tasks, onRefresh]);
+  const handleDeleteAll = useCallback(() => {
+    if (tasks.length === 0) return;
+    onRequestDelete?.(tasks);
+  }, [tasks, onRequestDelete]);
 
   return (
     <div className="toolbar">

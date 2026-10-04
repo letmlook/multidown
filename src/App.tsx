@@ -24,6 +24,7 @@ import { DownloadFileInfo } from "./components/DownloadFileInfo";
 import { TorrentFilesModal } from "./components/TorrentFilesModal";
 import { PropertiesModal } from "./components/PropertiesModal";
 import { MoveRenameModal } from "./components/MoveRenameModal";
+import { DeleteTaskModal } from "./components/DeleteTaskModal";
 import { AboutModal } from "./components/AboutModal";
 import { Toast } from "./components/Toast";
 import { useToast } from "./hooks/useToast";
@@ -60,6 +61,8 @@ function App() {
   const [moveRenameOpen, setMoveRenameOpen] = useState(false);
   const [propertiesTask, setPropertiesTask] = useState<TaskInfo | null>(null);
   const [moveRenameTask, setMoveRenameTask] = useState<TaskInfo | null>(null);
+  /** 安全删除确认弹窗的目标任务列表；null 表示关闭 */
+  const [deleteTargets, setDeleteTargets] = useState<TaskInfo[] | null>(null);
   const [torrentFilesOpen, setTorrentFilesOpen] = useState(false);
   const [batchAddInitialUrls, setBatchAddInitialUrls] = useState("");
   /** 外部输入预填给「新建任务」的地址（磁力 / .torrent） */
@@ -336,15 +339,10 @@ function App() {
     if (selectedTask?.save_path) openFolder(selectedTask.save_path);
   }, [selectedTask, openFolder]);
 
-  const handleRemoveTask = useCallback(async () => {
-    if (!selectedId) return;
-    try {
-      await invoke("remove_task", { taskId: selectedId });
-      refreshTasks();
-    } catch (e) {
-      console.error(e);
-    }
-  }, [selectedId, refreshTasks]);
+  const handleRemoveTask = useCallback(() => {
+    if (!selectedTask) return;
+    setDeleteTargets([selectedTask]);
+  }, [selectedTask]);
 
   const handleStartDownload = useCallback(async () => {
     if (!selectedId) return;
@@ -541,8 +539,7 @@ function App() {
         {
           type: "item",
           label: "移除",
-          onClick: () =>
-            invoke("remove_task", { taskId: contextMenu.task.id }).then(refreshTasks).catch(console.error),
+          onClick: () => setDeleteTargets([contextMenu.task]),
         },
         { type: "separator" },
         {
@@ -689,6 +686,7 @@ function App() {
         onOpenSchedule={() => setScheduleOpen(true)}
         onStartQueue={handleStartQueue}
         onStopQueue={handleStopAll}
+        onRequestDelete={setDeleteTargets}
       />
 
       {findVisible && (
@@ -791,6 +789,15 @@ function App() {
         }}
         onSave={async (taskId, newSavePath) => {
           await invoke("update_task_save_path", { taskId, newSavePath });
+          refreshTasks();
+        }}
+      />
+
+      <DeleteTaskModal
+        tasks={deleteTargets ?? []}
+        onClose={() => setDeleteTargets(null)}
+        onConfirmed={() => {
+          setDeleteTargets(null);
           refreshTasks();
         }}
       />

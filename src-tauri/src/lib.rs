@@ -1169,8 +1169,26 @@ async fn cancel_download(task_id: String, state: State<'_, Arc<Scheduler>>) -> R
 }
 
 #[tauri::command]
-async fn remove_task(task_id: String, state: State<'_, Arc<Scheduler>>) -> Result<(), String> {
-    state.remove_task(&task_id).await
+async fn remove_task(
+    task_id: String,
+    delete_files: bool,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<(), String> {
+    state
+        .remove_task(&task_id, delete_files)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn preview_task_deletion(
+    task_id: String,
+    state: State<'_, Arc<Scheduler>>,
+) -> Result<engine::DeletionPreview, String> {
+    state
+        .preview_task_deletion(&task_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2832,6 +2850,7 @@ pub fn run() {
             resume_download,
             cancel_download,
             remove_task,
+            preview_task_deletion,
             list_downloads,
             clear_completed_tasks,
             get_download_progress,

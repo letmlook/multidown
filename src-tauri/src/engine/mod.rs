@@ -14,5 +14,6 @@ pub mod batch;
 pub mod queue;
 
 pub use persistence::load_tasks_from_file;
+pub use scheduler::DeletionPreview;
 pub use types::MatchResult;
 pub use types::*;

@@ -563,6 +563,76 @@ async fn failed_reconfigure_keeps_old_session_and_handle_usable() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// 删除契约：`remove(task, true)` 只删除该种子的数据文件，不碰同目录的其他文件；
+/// `remove(task, false)` 保留全部数据（供再次续传）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deletion_removes_only_torrent_files_when_requested() {
+    let root = std::env::temp_dir().join(format!("multidown-bt-deletion-{}", uuid::Uuid::new_v4()));
+    let source = root.join("source");
+    let download = root.join("download");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&download).unwrap();
+    std::fs::write(source.join("payload.bin"), b"deletion payload").unwrap();
+    std::fs::write(download.join("unrelated.bin"), b"unrelated").unwrap();
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = create_torrent(
+        &source.join("payload.bin"),
+        CreateTorrentOptions {
+            name: Some("payload.bin"),
+            trackers: Vec::new(),
+            piece_length: Some(16 * 1024),
+        },
+        &spawner,
+    )
+    .await
+    .unwrap();
+    let engine = TorrentEngine::new(TorrentEngineConfig {
+        default_download_dir: download.clone(),
+        state_dir: root.join("state"),
+        enable_dht: false,
+        disable_lsd: true,
+        listen_port: None,
+        download_bps: None,
+        upload_bps: None,
+        peer_limit: None,
+        proxy_url: None,
+        client_name: "MultiDown-deletion-test".into(),
+        initial_peers: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let inspected = engine
+        .inspect_bytes(created.as_bytes().unwrap().to_vec())
+        .await
+        .unwrap();
+    engine
+        .add("t", &inspected, &download, None, true)
+        .await
+        .unwrap();
+
+    // 未选中删除时：只摘除会话句柄，数据全部保留
+    engine.remove("t", false).await.unwrap();
+    assert!(engine.handle("t").is_none());
+    assert!(download.join("payload.bin").exists());
+
+    // 重新加入后按 delete_files=true 删除：只删除种子自身的数据文件
+    engine
+        .add("t", &inspected, &download, None, true)
+        .await
+        .unwrap();
+    engine.remove("t", true).await.unwrap();
+    assert!(
+        !download.join("payload.bin").exists(),
+        "种子数据文件应被删除"
+    );
+    assert!(
+        download.join("unrelated.bin").exists(),
+        "同目录的非种子文件不得被删除"
+    );
+    engine.stop().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fastresume_reattachment_unpauses_only_when_explicitly_admitted() {
     let root =

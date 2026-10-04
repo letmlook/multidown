@@ -58,6 +58,40 @@ pub struct RecoveryFailure {
     pub message: String,
 }
 
+/// 任务操作（删除）错误。PathEscape 表示目标越出保存目录边界，
+/// 数据文件保持原样、任务保留在列表中并附错误信息。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TaskOperationError {
+    #[error("任务不存在: {0}")]
+    TaskNotFound(String),
+    #[error("删除目标超出允许的保存目录: {0}")]
+    PathEscape(String),
+    #[error("{0}")]
+    Operation(String),
+}
+
+/// 删除预览。`can_delete_files=false` 时 UI 禁用"同时删除文件"，
+/// 仅允许移除任务记录。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DeletionPreview {
+    pub task_id: String,
+    pub paths: Vec<String>,
+    pub can_delete_files: bool,
+}
+
+/// worker 退出时摘除自己在 http_workers 中的句柄；
+/// 任务被 abort 时 future 被 drop，同样会触发。
+struct WorkerHandleCleanup {
+    scheduler: Arc<Scheduler>,
+    task_id: TaskId,
+}
+
+impl Drop for WorkerHandleCleanup {
+    fn drop(&mut self) {
+        self.scheduler.http_workers.lock().remove(&self.task_id);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SchedulerPaths {
     pub tasks: PathBuf,
@@ -231,6 +265,10 @@ pub struct Scheduler {
     /// Scheduler-owned torrent supervisors survive the start call and can be
     /// stopped/joined by lifecycle operations instead of becoming detached.
     torrent_supervisors: Arc<AsyncMutex<HashMap<TaskId, tokio::task::JoinHandle<()>>>>,
+    /// Scheduler-owned HTTP worker join handles. Safe deletion awaits the
+    /// worker (which awaits the file writer) before removing data files, so a
+    /// live worker can never hold an open handle against deletion.
+    http_workers: Arc<ParkingMutex<HashMap<TaskId, tokio::task::JoinHandle<()>>>>,
     /// 最近一次应用设置快照（做种策略等运行时读取）
     settings: Arc<ParkingMutex<crate::settings::AppSettings>>,
     #[cfg(test)]
@@ -609,6 +647,7 @@ impl Scheduler {
             torrent_cfg: Arc::new(ParkingMutex::new(None)),
             torrent_engine: Arc::new(OnceCell::new()),
             torrent_supervisors: Arc::new(AsyncMutex::new(HashMap::new())),
+            http_workers: Arc::new(ParkingMutex::new(HashMap::new())),
             settings: Arc::new(ParkingMutex::new(crate::settings::AppSettings::default())),
             #[cfg(test)]
             admission_test_barrier: Arc::new(ParkingMutex::new(None)),
@@ -709,13 +748,6 @@ impl Scheduler {
         Ok(engine.clone())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "safe deletion Task 5 consumes the supervisor join boundary"
-        )
-    )]
     pub(crate) async fn stop_torrent_supervisor(&self, task_id: &str) {
         let handle = self.torrent_supervisors.lock().await.remove(task_id);
         if let Some(handle) = handle {
@@ -1582,7 +1614,15 @@ impl Scheduler {
         let max_retries = scheduler_self.limits.lock().max_retries;
 
         let (start_tx, start_rx) = oneshot::channel();
+        let worker_task_id = task_id_s.clone();
+        let worker_scheduler = scheduler_self.clone();
         let worker = tokio::spawn(async move {
+            // 无论以何种方式退出（含 start_rx 提前关闭），都要摘除自己的
+            // join 句柄；退出即意味着 writer 已落盘并关闭文件。
+            let _worker_cleanup = WorkerHandleCleanup {
+                scheduler: worker_scheduler,
+                task_id: worker_task_id,
+            };
             let _active_slot = active_slot;
             if start_rx.await.is_err() {
                 return;
@@ -1788,12 +1828,23 @@ impl Scheduler {
                 eprintln!("[persistence-error] HTTP completion: {error}");
             }
         });
+
+        // 登记 join 句柄供删除事务等待；替换并中止同任务的残留 worker。
+        if let Some(previous) = self.http_workers.lock().insert(task_id_s.clone(), worker) {
+            previous.abort();
+        }
+
         if let Err(error) = self
             .persist_status_transition(&task_id, expected_statuses, TaskStatus::Downloading)
             .await
         {
             drop(start_tx);
-            let _ = worker.await;
+            // 句柄已登记进 http_workers：取回并等待；若 worker 已自行退出
+            // 并摘除句柄，这里取到 None 也无需等待。
+            let handle = self.http_workers.lock().remove(&task_id_s);
+            if let Some(handle) = handle {
+                let _ = handle.await;
+            }
             return Err(error);
         }
         let _ = start_tx.send(());
@@ -2678,10 +2729,160 @@ impl Scheduler {
         Ok(())
     }
 
-    /// 删除任务：先取消再从列表移除并持久化，任务记录从文件中删除
-    pub async fn remove_task(&self, task_id: &str) -> Result<(), String> {
+    /// 删除预览：收集任务的数据路径并检查它们是否都在保存目录边界内。
+    /// 种子任务的 save_path 即其数据文件（单文件）或数据目录（多文件）；
+    /// HTTP 任务是目标文件本身。
+    pub async fn preview_task_deletion(
+        &self,
+        task_id: &str,
+    ) -> Result<DeletionPreview, TaskOperationError> {
+        let task = self
+            .tasks
+            .lock()
+            .await
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| TaskOperationError::TaskNotFound(task_id.to_string()))?;
+        let paths = vec![std::path::PathBuf::from(&task.save_path)];
+        let can_delete_files = self.paths_within_save_root(&paths).await.is_ok();
+        Ok(DeletionPreview {
+            task_id: task_id.to_string(),
+            paths: paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            can_delete_files,
+        })
+    }
+
+    /// 删除任务的事务：
+    /// 1) 先停止 worker / 种子会话（文件句柄关闭后才能安全删除数据）；
+    /// 2) `delete_files=true` 时在保存目录边界内删除数据文件，失败则保留
+    ///    任务并附错误信息（关键失败不得丢任务的可见性）；
+    /// 3) 最后走 `commit_task_removals` 的跨存储回滚事务移除记录。
+    pub async fn remove_task(
+        &self,
+        task_id: &str,
+        delete_files: bool,
+    ) -> Result<(), TaskOperationError> {
+        let task = self
+            .tasks
+            .lock()
+            .await
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| TaskOperationError::TaskNotFound(task_id.to_string()))?;
+
+        if task.kind.is_torrent() {
+            self.stop_torrent_supervisor(task_id).await;
+            // 只摘除会话句柄、保留数据：文件删除由下方受控路径负责，
+            // 这样才能先校验保存目录边界再动手。
+            if let Some(engine) = self.torrent_engine.get() {
+                let _ = engine.remove(task_id, false).await;
+            }
+        } else {
+            // 通过任务状态通知 worker 退出，并等它结束（worker 退出前
+            // 会等 writer 落盘并关闭文件句柄）。
+            *task.status.lock().await = TaskStatus::Cancelled;
+            let handle = self.http_workers.lock().remove(task_id);
+            if let Some(handle) = handle {
+                let _ = handle.await;
+            }
+        }
+
+        if delete_files {
+            let paths = vec![std::path::PathBuf::from(&task.save_path)];
+            if let Err(error) = self.delete_within_save_root(&paths).await {
+                let message = error.to_string();
+                *task.error_message.lock().await = Some(message.clone());
+                *task.status.lock().await = TaskStatus::Failed;
+                if let Err(save_error) = self.save_tasks().await {
+                    return Err(TaskOperationError::Operation(format!(
+                        "{message}; 任务已保留但持久化失败: {save_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+
         let removed_task_ids = [task_id.to_string()];
-        self.commit_task_removals(&removed_task_ids).await
+        self.commit_task_removals(&removed_task_ids)
+            .await
+            .map_err(|error| TaskOperationError::Operation(error.to_string()))
+    }
+
+    fn deletion_save_root(&self) -> Option<std::path::PathBuf> {
+        let root = self.settings.lock().default_save_path.clone();
+        (!root.trim().is_empty()).then(|| std::path::PathBuf::from(root))
+    }
+
+    /// 校验所有目标都在保存目录边界内。对现存目标 canonicalize（解析符号
+    /// 链接与 `..`）后必须仍位于保存目录之内，且不得就是保存目录本身；
+    /// 已不存在的目标视为可删（幂等空操作）。
+    async fn paths_within_save_root(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Result<(), TaskOperationError> {
+        let root = self
+            .deletion_save_root()
+            .ok_or_else(|| TaskOperationError::PathEscape("未配置保存目录".into()))?;
+        let canonical_root = tokio::fs::canonicalize(&root).await.map_err(|error| {
+            TaskOperationError::PathEscape(format!(
+                "保存目录不可用 ({}): {error}",
+                root.to_string_lossy()
+            ))
+        })?;
+        for path in paths {
+            let Ok(resolved) = tokio::fs::canonicalize(path).await else {
+                // 目标不存在：删除是幂等空操作，不构成越界
+                continue;
+            };
+            if resolved == canonical_root {
+                return Err(TaskOperationError::PathEscape(format!(
+                    "拒绝删除保存目录本身: {}",
+                    path.to_string_lossy()
+                )));
+            }
+            if !resolved.starts_with(&canonical_root) {
+                return Err(TaskOperationError::PathEscape(
+                    path.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 在保存目录边界内删除数据文件。目录目标整体递归删除（种子子目录），
+    /// 符号链接叶子只摘链接本身、不追踪目标。
+    async fn delete_within_save_root(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Result<(), TaskOperationError> {
+        self.paths_within_save_root(paths).await?;
+        for path in paths {
+            let metadata = match tokio::fs::symlink_metadata(path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(TaskOperationError::Operation(format!(
+                        "读取 {} 失败: {error}",
+                        path.to_string_lossy()
+                    )));
+                }
+            };
+            let result = if metadata.is_dir() {
+                tokio::fs::remove_dir_all(path).await
+            } else {
+                tokio::fs::remove_file(path).await
+            };
+            if let Err(error) = result {
+                return Err(TaskOperationError::Operation(format!(
+                    "删除 {} 失败: {error}",
+                    path.to_string_lossy()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub async fn list_downloads(&self) -> Vec<TaskInfo> {
@@ -3366,6 +3567,7 @@ impl Clone for Scheduler {
             torrent_cfg: self.torrent_cfg.clone(),
             torrent_engine: self.torrent_engine.clone(),
             torrent_supervisors: self.torrent_supervisors.clone(),
+            http_workers: self.http_workers.clone(),
             settings: self.settings.clone(),
             #[cfg(test)]
             admission_test_barrier: self.admission_test_barrier.clone(),
@@ -5207,6 +5409,346 @@ mod tests {
         }
     }
 
+    mod deletion {
+        use super::*;
+        use crate::engine::types::TaskKind;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use librqbit::{create_torrent, CreateTorrentOptions};
+
+        fn settings_with_root(root: &std::path::Path) -> crate::settings::AppSettings {
+            crate::settings::AppSettings {
+                default_save_path: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            }
+        }
+
+        /// 保存根 = fixture/downloads；fixture 内其他位置都在根之外，
+        /// 便于构造越界目标而不污染系统临时目录。
+        async fn scheduler_with(
+            fixture: &InitializationFixture,
+            records: Vec<PersistedTask>,
+        ) -> Scheduler {
+            let root = fixture.0.join("downloads");
+            save_tasks_to_file(&fixture.paths().tasks, &records)
+                .await
+                .unwrap();
+            let (scheduler, warnings) =
+                Scheduler::initialize(fixture.paths(), settings_with_root(&root)).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            scheduler
+        }
+
+        fn http_record(fixture: &InitializationFixture, id: &str, content: &[u8]) -> PersistedTask {
+            let save_path = fixture.0.join("downloads").join(format!("{id}.bin"));
+            std::fs::create_dir_all(save_path.parent().unwrap()).unwrap();
+            std::fs::write(&save_path, content).unwrap();
+            PersistedTask {
+                id: id.into(),
+                url: format!("https://example.com/{id}.bin"),
+                save_path: save_path.to_string_lossy().into_owned(),
+                filename: format!("{id}.bin"),
+                total_bytes: Some((content.len() * 2) as u64),
+                downloaded_bytes: content.len() as u64,
+                status: TaskStatus::Paused,
+                error_message: None,
+                pending_segments: vec![(content.len() as u64, (content.len() * 2) as u64 - 1)],
+                supports_range: true,
+                created_at: 1_700_000_000,
+                auth: None,
+                extra_headers: Vec::new(),
+                etag: None,
+                last_modified: None,
+                kind: TaskKind::Http,
+                torrent: None,
+                total_dynamic: 0,
+                completed_at: None,
+                seeding_started_at: None,
+            }
+        }
+
+        async fn torrent_record(
+            fixture: &InitializationFixture,
+            id: &str,
+            status: TaskStatus,
+        ) -> PersistedTask {
+            let source = fixture.0.join(format!("source-{id}"));
+            std::fs::create_dir_all(&source).unwrap();
+            let payload = b"deterministic deletion torrent fixture";
+            let source_file = source.join("payload.bin");
+            std::fs::write(&source_file, payload).unwrap();
+            let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+            let created = create_torrent(
+                &source_file,
+                CreateTorrentOptions {
+                    name: Some("payload.bin"),
+                    trackers: Vec::new(),
+                    piece_length: Some(16 * 1024),
+                },
+                &spawner,
+            )
+            .await
+            .unwrap();
+            let metainfo = created.as_bytes().unwrap();
+            let save_dir = fixture.0.join("downloads").join(format!("{id}-dir"));
+            std::fs::create_dir_all(&save_dir).unwrap();
+            // 预置落盘数据：删除/保留的选择必须对真实文件生效
+            std::fs::write(save_dir.join("payload.bin"), payload).unwrap();
+            PersistedTask {
+                id: id.into(),
+                url: "magnet:?xt=urn:btih:0000000000000000000000000000000000000000".into(),
+                save_path: save_dir.join("payload.bin").to_string_lossy().into_owned(),
+                filename: "payload.bin".into(),
+                total_bytes: None,
+                downloaded_bytes: if status == TaskStatus::Completed {
+                    payload.len() as u64
+                } else {
+                    0
+                },
+                status,
+                error_message: None,
+                pending_segments: Vec::new(),
+                supports_range: false,
+                created_at: 1_700_000_000,
+                auth: None,
+                extra_headers: Vec::new(),
+                etag: None,
+                last_modified: None,
+                kind: TaskKind::Torrent,
+                torrent: Some(TorrentMeta {
+                    input: "fixture.torrent".into(),
+                    info_hash: None,
+                    metainfo_b64: Some(STANDARD.encode(metainfo)),
+                    selected_files: None,
+                    metadata_ready: true,
+                    uploaded_bytes: 0,
+                }),
+                total_dynamic: payload.len() as u64,
+                completed_at: None,
+                seeding_started_at: None,
+            }
+        }
+
+        fn stored_task_ids(fixture: &InitializationFixture) -> Vec<String> {
+            let path = fixture.paths().tasks;
+            let text = std::fs::read_to_string(&path).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap()
+                .get("data")
+                .and_then(|data| data.as_array())
+                .unwrap()
+                .iter()
+                .map(|record| record["id"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remove_task_stops_running_torrent_session_before_removing_records() {
+            let fixture = InitializationFixture::new();
+            let record = torrent_record(&fixture, "running-torrent", TaskStatus::Downloading).await;
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+            let summary = scheduler
+                .recover_tasks(None, 1, NetworkOptions::default())
+                .await;
+            assert_eq!(summary.started, 1);
+            let engine = scheduler.torrent_engine().await.unwrap();
+            assert!(engine.handle("running-torrent").is_some());
+
+            scheduler
+                .remove_task("running-torrent", false)
+                .await
+                .unwrap();
+
+            assert!(
+                engine.handle("running-torrent").is_none(),
+                "会话句柄必须先于记录被移除"
+            );
+            assert!(!scheduler
+                .torrent_supervisors
+                .lock()
+                .await
+                .contains_key("running-torrent"));
+            assert!(scheduler.get_task("running-torrent").await.is_none());
+            assert!(!stored_task_ids(&fixture).contains(&"running-torrent".to_string()));
+            assert!(
+                fixture
+                    .0
+                    .join("downloads/running-torrent-dir/payload.bin")
+                    .exists(),
+                "delete_files=false 必须保留已下载数据"
+            );
+            engine.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remove_task_removes_paused_and_completed_torrent_files_when_requested() {
+            for (id, status) in [
+                ("paused-torrent", TaskStatus::Paused),
+                ("completed-torrent", TaskStatus::Completed),
+            ] {
+                let fixture = InitializationFixture::new();
+                let record = torrent_record(&fixture, id, status).await;
+                let scheduler = scheduler_with(&fixture, vec![record]).await;
+                let data_path = fixture.0.join(format!("downloads/{id}-dir/payload.bin"));
+                assert!(data_path.exists());
+
+                scheduler.remove_task(id, true).await.unwrap();
+
+                assert!(
+                    !data_path.exists(),
+                    "{id}: delete_files=true 必须删除数据文件"
+                );
+                assert!(scheduler.get_task(id).await.is_none());
+                let engine = scheduler.torrent_engine().await.unwrap();
+                assert!(engine.handle(id).is_none());
+                engine.stop().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remove_task_http_respects_keep_and_delete_file_choices() {
+            let fixture = InitializationFixture::new();
+            let keep = http_record(&fixture, "keep-files", b"partial-keep");
+            let delete = http_record(&fixture, "delete-files", b"partial-delete");
+            let scheduler = scheduler_with(&fixture, vec![keep, delete]).await;
+            let keep_path = fixture.0.join("downloads/keep-files.bin");
+            let delete_path = fixture.0.join("downloads/delete-files.bin");
+
+            scheduler.remove_task("keep-files", false).await.unwrap();
+            scheduler.remove_task("delete-files", true).await.unwrap();
+
+            assert!(keep_path.exists(), "delete_files=false 保留文件");
+            assert!(!delete_path.exists(), "delete_files=true 删除文件");
+            assert!(scheduler.get_task("keep-files").await.is_none());
+            assert!(scheduler.get_task("delete-files").await.is_none());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remove_task_retains_task_when_file_deletion_fails() {
+            let fixture = InitializationFixture::new();
+            let mut record = http_record(&fixture, "blocked", b"undeletable");
+            // 把 save_path 换成受写保护的目录：递归删除必然失败
+            let blocked_dir = fixture.0.join("downloads/blocked.bin");
+            std::fs::remove_file(&blocked_dir).unwrap();
+            std::fs::create_dir_all(&blocked_dir).unwrap();
+            std::fs::write(blocked_dir.join("inner.bin"), b"data").unwrap();
+            record.save_path = blocked_dir.to_string_lossy().into_owned();
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&blocked_dir).unwrap().permissions();
+                permissions.set_mode(0o555);
+                std::fs::set_permissions(&blocked_dir, permissions).unwrap();
+            }
+            let result = scheduler.remove_task("blocked", true).await;
+            let error = result.unwrap_err();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&blocked_dir).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&blocked_dir, permissions).unwrap();
+            }
+
+            assert!(
+                scheduler.get_task("blocked").await.is_some(),
+                "关键失败必须保留任务"
+            );
+            assert_eq!(
+                std::fs::read_to_string(blocked_dir.join("inner.bin")).unwrap(),
+                "data",
+                "删除失败时数据必须原样保留"
+            );
+            let task = scheduler.tasks.lock().await["blocked"].clone();
+            assert!(task.error_message.lock().await.is_some());
+            drop(error);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn preview_and_removal_reject_parent_directory_escape() {
+            let fixture = InitializationFixture::new();
+            // 保存根是 fixture/downloads；fixture 根下的 outside.bin 在根之外
+            let outside = fixture.0.join("outside.bin");
+            std::fs::write(&outside, b"outside").unwrap();
+            let mut record = http_record(&fixture, "escape", b"escape");
+            record.save_path = fixture
+                .0
+                .join("downloads/../outside.bin")
+                .to_string_lossy()
+                .into_owned();
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+
+            let preview = scheduler.preview_task_deletion("escape").await.unwrap();
+            assert!(
+                !preview.can_delete_files,
+                "指向保存目录之外的目标必须拒绝删除"
+            );
+
+            let error = scheduler.remove_task("escape", true).await.unwrap_err();
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                b"outside",
+                "越界目标不得被删除"
+            );
+            assert!(scheduler.get_task("escape").await.is_some());
+            let task = scheduler.tasks.lock().await["escape"].clone();
+            assert!(task.error_message.lock().await.is_some());
+            drop(error);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn preview_and_removal_reject_symlink_escape() {
+            let fixture = InitializationFixture::new();
+            let outside_dir = fixture.0.join("outside-dir");
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            std::fs::write(outside_dir.join("victim.bin"), b"victim").unwrap();
+            let mut record = http_record(&fixture, "symlink", b"symlink");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_dir, fixture.0.join("downloads/link")).unwrap();
+            record.save_path = fixture
+                .0
+                .join("downloads/link/victim.bin")
+                .to_string_lossy()
+                .into_owned();
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+
+            let preview = scheduler.preview_task_deletion("symlink").await.unwrap();
+            assert!(!preview.can_delete_files, "符号链接逃逸必须拒绝删除");
+
+            scheduler.remove_task("symlink", true).await.unwrap_err();
+            assert_eq!(
+                std::fs::read(outside_dir.join("victim.bin")).unwrap(),
+                b"victim",
+                "符号链接背后的外部文件不得被删除"
+            );
+            assert!(scheduler.get_task("symlink").await.is_some());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn preview_reports_paths_inside_save_root_and_missing_task_errors() {
+            let fixture = InitializationFixture::new();
+            let record = http_record(&fixture, "inside", b"inside-data");
+            let scheduler = scheduler_with(&fixture, vec![record]).await;
+
+            let preview = scheduler.preview_task_deletion("inside").await.unwrap();
+            assert!(preview.can_delete_files);
+            assert_eq!(preview.task_id, "inside");
+            assert_eq!(
+                preview.paths,
+                vec![fixture
+                    .0
+                    .join("downloads/inside.bin")
+                    .to_string_lossy()
+                    .into_owned()]
+            );
+
+            let missing = scheduler.preview_task_deletion("no-such-task").await;
+            assert!(missing.is_err());
+            scheduler.remove_task("inside", true).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn initialization_first_run_uses_effective_defaults_without_warnings() {
         let fixture = InitializationFixture::new();
@@ -6040,9 +6582,12 @@ mod tests {
                 task_with_batch(&fixture, TaskStatus::Pending).await;
             scheduler.install_persistence_test_failures(&[failed_store]);
 
-            let error = scheduler.remove_task(&task_id).await.unwrap_err();
+            let error = scheduler.remove_task(&task_id, false).await.unwrap_err();
 
-            assert!(error.contains(failed_store), "{failed_store}: {error}");
+            assert!(
+                error.to_string().contains(failed_store),
+                "{failed_store}: {error}"
+            );
             assert!(scheduler.get_task(&task_id).await.is_some());
             assert!(scheduler.get_task_queue(&task_id).await.is_some());
             assert!(scheduler
@@ -6112,7 +6657,7 @@ mod tests {
             let (scheduler, task_id, batch_id) = task_with_batch(&fixture, status).await;
 
             match operation {
-                "remove" => scheduler.remove_task(&task_id).await.unwrap(),
+                "remove" => scheduler.remove_task(&task_id, false).await.unwrap(),
                 "clear" => assert_eq!(scheduler.clear_completed_tasks().await.unwrap(), 1),
                 _ => unreachable!(),
             }
