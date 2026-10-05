@@ -15,6 +15,17 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    watch: {
+      // Rust 的 target/ 里是链接器正在写的产物（Windows 下 multidown_lib.dll 会被
+      // 独占锁定）。不排除的话，Vite 的文件监听会在编译期间抛 EBUSY 并整个崩掉，
+      // 前端热更新也就无从谈起。这些目录没有任何前端源码。
+      ignored: [
+        "**/src-tauri/target/**",
+        "**/integration/*/target/**",
+        "**/dist/**",
+        "**/dist-extension/**",
+      ],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {
