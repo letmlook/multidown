@@ -5756,41 +5756,96 @@ mod tests {
             assert!(scheduler.get_task("delete-files").await.is_none());
         }
 
+        /// 让"删除数据文件必然失败"这一条件成立，句柄即守卫。
+        ///
+        /// Windows：以 `share_mode(0)` 打开，**不**给出 `FILE_SHARE_DELETE`，
+        /// 之后 `DeleteFileW` / `RemoveDirectoryW` 都会返回
+        /// `ERROR_SHARING_VIOLATION`（os error 32）。这正是生产环境里外部程序
+        /// （扫描器、索引器、同步盘）占住刚写好的文件时的机制，也与
+        /// `storage::save_store` 偶发 os error 5 / 32 的疑似成因相同。
+        /// unix：POSIX 允许 unlink 已打开的文件，句柄拦不住，所以改用只读目录
+        /// （属主也无法删除其中的文件）——unix 上等价的"删不掉"条件。
+        ///
+        /// 注入的机制按平台不同，但**测试本身在两个平台都无条件运行**。
+        fn block_deletion_of(undeletable_file: &std::path::Path) -> Option<DeletionBlocker> {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(undeletable_file)
+                    .ok()?;
+                Some(DeletionBlocker { _file: file })
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let file = std::fs::File::open(undeletable_file).ok()?;
+                let parent_dir = undeletable_file.parent()?;
+                let mut permissions = std::fs::metadata(parent_dir).ok()?.permissions();
+                permissions.set_mode(0o555);
+                std::fs::set_permissions(parent_dir, permissions).ok()?;
+                Some(DeletionBlocker {
+                    _file: file,
+                    restored_on_drop: parent_dir.to_path_buf(),
+                })
+            }
+        }
+
+        struct DeletionBlocker {
+            /// 持有即维持"删不掉"；Windows 上它本身就是全部机制。
+            _file: std::fs::File,
+            /// unix 上要把只读目录的权限改回去，否则临时目录清不掉。
+            #[cfg(unix)]
+            restored_on_drop: std::path::PathBuf,
+        }
+
+        impl Drop for DeletionBlocker {
+            fn drop(&mut self) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&self.restored_on_drop) {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&self.restored_on_drop, permissions);
+                    }
+                }
+            }
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn remove_task_retains_task_when_file_deletion_fails() {
             let fixture = InitializationFixture::new();
             let mut record = http_record(&fixture, "blocked", b"undeletable");
-            // 把 save_path 换成受写保护的目录：递归删除必然失败
-            let blocked_dir = fixture.0.join("downloads/blocked.bin");
+            // 把 save_path 换成含子文件的目录：递归删除必然失败
+            let blocked_dir = fixture.0.join("downloads").join("blocked.bin");
             std::fs::remove_file(&blocked_dir).unwrap();
             std::fs::create_dir_all(&blocked_dir).unwrap();
-            std::fs::write(blocked_dir.join("inner.bin"), b"data").unwrap();
+            let inner = blocked_dir.join("inner.bin");
+            std::fs::write(&inner, b"data").unwrap();
             record.save_path = blocked_dir.to_string_lossy().into_owned();
             let scheduler = scheduler_with(&fixture, vec![record]).await;
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&blocked_dir).unwrap().permissions();
-                permissions.set_mode(0o555);
-                std::fs::set_permissions(&blocked_dir, permissions).unwrap();
-            }
+            let Some(blocker) = block_deletion_of(&inner) else {
+                eprintln!(
+                    "跳过：无法在当前系统注入删除失败条件（{}），保留语义未被覆盖",
+                    inner.to_string_lossy()
+                );
+                return;
+            };
             let result = scheduler.remove_task("blocked", true).await;
+            // 先解除占用，再断言与清理：断言只读文件，无需占用持续存在。
+            drop(blocker);
             let error = result.unwrap_err();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut permissions = std::fs::metadata(&blocked_dir).unwrap().permissions();
-                permissions.set_mode(0o755);
-                std::fs::set_permissions(&blocked_dir, permissions).unwrap();
-            }
 
             assert!(
                 scheduler.get_task("blocked").await.is_some(),
                 "关键失败必须保留任务"
             );
             assert_eq!(
-                std::fs::read_to_string(blocked_dir.join("inner.bin")).unwrap(),
+                std::fs::read_to_string(&inner).unwrap(),
                 "data",
                 "删除失败时数据必须原样保留"
             );
@@ -5838,25 +5893,36 @@ mod tests {
             std::fs::create_dir_all(&outside_dir).unwrap();
             std::fs::write(outside_dir.join("victim.bin"), b"victim").unwrap();
             let mut record = http_record(&fixture, "symlink", b"symlink");
+            // 目录符号链接：Windows 需要 SeCreateSymbolicLinkPrivilege 或开发者模式，
+            // unix 无条件可建。建不出来时优雅跳过并说明原因——绝不用 #[ignore]，
+            // 否则 Windows 上"符号链接逃逸必须拒绝"这条保证就永久失去覆盖。
+            let link = fixture.0.join("downloads").join("link");
+            #[cfg(windows)]
+            let linked = std::os::windows::fs::symlink_dir(&outside_dir, &link).is_ok();
             #[cfg(unix)]
-            std::os::unix::fs::symlink(&outside_dir, fixture.0.join("downloads/link")).unwrap();
-            record.save_path = fixture
-                .0
-                .join("downloads/link/victim.bin")
-                .to_string_lossy()
-                .into_owned();
+            let linked = std::os::unix::fs::symlink(&outside_dir, &link).is_ok();
+            if !linked {
+                eprintln!(
+                    "跳过：当前系统不允许创建目录符号链接（{}），符号链接逃逸拒绝未被覆盖",
+                    link.to_string_lossy()
+                );
+                return;
+            }
+            record.save_path = link.join("victim.bin").to_string_lossy().into_owned();
             let scheduler = scheduler_with(&fixture, vec![record]).await;
 
             let preview = scheduler.preview_task_deletion("symlink").await.unwrap();
             assert!(!preview.can_delete_files, "符号链接逃逸必须拒绝删除");
 
-            scheduler.remove_task("symlink", true).await.unwrap_err();
+            let error = scheduler.remove_task("symlink", true).await.unwrap_err();
+            assert!(matches!(error, TaskOperationError::PathEscape(_)));
             assert_eq!(
                 std::fs::read(outside_dir.join("victim.bin")).unwrap(),
                 b"victim",
                 "符号链接背后的外部文件不得被删除"
             );
             assert!(scheduler.get_task("symlink").await.is_some());
+            drop(error);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5987,11 +6053,15 @@ mod tests {
             let preview = scheduler.preview_task_deletion("inside").await.unwrap();
             assert!(preview.can_delete_files);
             assert_eq!(preview.task_id, "inside");
+            // 期望值必须用与 fixture（`http_record`）相同的 join 链构造：
+            // 预览返回的是记录里的 save_path 原文，而 `Path::join` 在 Windows 上
+            // 产出 `downloads\inside.bin`。写死任一种分隔符都会在另一个平台误报。
             assert_eq!(
                 preview.paths,
                 vec![fixture
                     .0
-                    .join("downloads/inside.bin")
+                    .join("downloads")
+                    .join("inside.bin")
                     .to_string_lossy()
                     .into_owned()]
             );
@@ -6211,7 +6281,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(task.save_path, "media/movie.bin");
+        // `Task::new` 用 `Path::join` 拼接保存目录与文件名（见 `task.rs`），
+        // 所以期望值必须同样走 join：Windows 上是 `media\movie.bin`。
+        // 断言的语义是"文件名被拼到规则的保存目录之下"，与分隔符无关。
+        assert_eq!(
+            task.save_path,
+            std::path::Path::new("media")
+                .join("movie.bin")
+                .to_string_lossy()
+        );
     }
 
     #[tokio::test]
