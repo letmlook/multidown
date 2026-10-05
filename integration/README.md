@@ -3,7 +3,7 @@
 本目录包含浏览器扩展和 Native Messaging Host 两个组件：
 
 - `extension/`：Chromium/Firefox 共用的扩展源码、固定 manifest key、图标和 Host 清单模板。
-- `native-host/`：浏览器启动的 Rust 原生消息进程，负责把扩展消息转发给运行中的 Multidown。
+- `native-host/`：浏览器启动的 Rust 原生消息进程，负责把扩展消息转发给运行中的 Multidown；应用未运行时，它还可以通过已注册的 `multidown://open` 深链把应用拉起来并等待握手成功（`open_app`）。
 
 浏览器不会直接连接 Tauri 前端。扩展通过标准输入/输出与 Native Host 通信，Host 再读取应用数据目录中的端口信息，通过本机回环连接把 URL 交给主程序。
 
