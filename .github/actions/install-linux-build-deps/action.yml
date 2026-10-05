@@ -1,0 +1,22 @@
+name: Install Linux build dependencies
+description: >-
+  apt packages tauri-build needs before any cargo command can configure src-tauri
+  on Ubuntu. Shared by the Ubuntu leg of the test matrix and by the MSRV job so the
+  two lists cannot drift apart silently.
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get update
+      shell: bash
+      run: sudo apt-get update
+
+    - name: apt-get install tauri build dependencies
+      shell: bash
+      run: >-
+        sudo apt-get install -y
+        libgtk-3-dev
+        libwebkit2gtk-4.1-dev
+        libappindicator3-dev
+        librsvg2-dev
+        patchelf
