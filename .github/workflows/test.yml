@@ -49,12 +49,10 @@ jobs:
           node-version: 20
           cache: npm
 
-      # Same prerequisites as the Ubuntu leg of `test-tauri`; `tauri-build` needs them
-      # before any cargo command can even configure the crate.
+      # Same prerequisites as the Ubuntu leg of `test-tauri`, from the same shared
+      # action so the two lists cannot drift apart silently.
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        uses: ./.github/actions/install-linux-build-deps
 
       - name: Install dependencies
         run: npm ci
@@ -102,9 +100,7 @@ jobs:
 
       - name: Install dependencies (Ubuntu only)
         if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        uses: ./.github/actions/install-linux-build-deps
 
       - name: Install dependencies
         run: npm ci
@@ -152,9 +148,34 @@ jobs:
         working-directory: integration/native-host
         run: cargo build --release
 
+      # GAP 1 的失败模式会从后门回来：`--features integration-tests` 只是一个裸
+      # flag，谁以后把它删掉，三个平台都会全绿而集成覆盖为零——而 required-features
+      # 的语义是"静默跳过并报告成功"，不会留下任何失败痕迹。
+      #
+      # 所以在真正跑测试**之前**先证明这两个目标确实被编译并登记了。
+      # 注意 `cargo test -- --list` 打印的是**测试名**、不带 target 标签，所以用两个
+      # 目标各自独有的测试名来判定；`--list` 只枚举不执行。
+      - name: Guard that the integration targets must actually run
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          listed="$(cargo test --features integration-tests -- --list)"
+          echo "$listed"
+          for test_name in \
+            interrupted_range_transfer_resumes_to_the_exact_bytes_without_duplicate_ranges \
+            active_restart_reattaches_the_session_with_the_persisted_file_selection; do
+            if ! grep -qF "$test_name" <<<"$listed"; then
+              echo "::error::$test_name 不在 --list 输出中：--features integration-tests 可能已被删除，集成覆盖为 0"
+              exit 1
+            fi
+          done
+          echo "集成目标已确认在测试清单中"
+
       # `--features integration-tests` is mandatory, not optional: both `[[test]]`
       # targets in src-tauri/Cargo.toml declare `required-features`, so a plain
-      # `cargo test` silently SKIPS them and still reports success.
+      # `cargo test` silently SKIPS them and still reports success. The step above is
+      # the enforcement; the flag below is the thing being enforced.
       #
       # On Windows this step only runs because src-tauri/build.rs now links a Common
       # Controls v6 manifest into every unit of the package. tauri-build links the same
