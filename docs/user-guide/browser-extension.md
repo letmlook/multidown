@@ -12,7 +12,18 @@
 
 ## Chromium（Chrome / Edge）
 
-稳定安装包会携带扩展资源和 Native Host。可在 Multidown 中选择“安装浏览器扩展”，按窗口提示打开 `chrome://extensions/` 或 `edge://extensions/`，启用开发者模式后加载应用提供的扩展目录。
+扩展以**已解压目录**的形式提供，不是 `.crx` 安装包。目录里包含 `icons/` 等子目录，请整体使用，不要只拷贝顶层文件。
+
+在 Multidown 中选择“安装浏览器扩展”，应用会：
+
+1. 注册 Native Host（`com.multidown.app`）；
+2. 打开你的浏览器的扩展管理页（`chrome://extensions/` 或 `edge://extensions/`）。
+
+之后按窗口提示启用“开发者模式”，点击“加载已解压的扩展程序”，选择应用显示的扩展文件夹路径（通常在应用数据目录的 `extension/` 下，弹窗里有“打开扩展文件夹”和“复制路径”两个按钮）。
+
+首次启动时应用也会自动尝试一次同样的注册与引导；浏览器是否真的接受加载仍由你在扩展管理页完成。
+
+需要把扩展交给别人时，使用弹窗里的**导出扩展 ZIP**：ZIP 的目录结构与已解压目录一致，对方解压后按上面的步骤加载即可。浏览器不能直接加载 ZIP。
 
 从源码构建时：
 
@@ -21,7 +32,9 @@ npm run build:extension
 npm run test:extension
 ```
 
-然后在浏览器中加载 `dist-extension/unpacked`。请勿安装来源不明的 CRX；开发模式下“加载已解压的扩展程序”更容易检查实际内容。
+然后在浏览器中加载 `dist-extension/unpacked`。
+
+`package.json` 里的 `npm run sign:crx` **不会**签名或生成任何文件，它只打印 Chrome 手工“打包扩展程序”的步骤，供需要 CRX 的场景自行操作。开发与验证请直接使用 unpacked 目录；不要提交 Chrome 生成的私钥。
 
 ## Firefox
 
@@ -37,7 +50,20 @@ npm run test:extension
 cargo build --release --manifest-path integration/native-host/Cargo.toml
 ```
 
-随后将 Host 清单安装到浏览器规定的位置，并把清单的 `path` 指向上述可执行文件的绝对路径。具体系统位置见[平台路径参考](../README.md#我负责发布维护)；当前低层协议说明保留在 [`integration/README.md`](../../integration/README.md)。
+随后将 Host 清单安装到浏览器规定的位置，并把清单的 `path` 指向上述可执行文件的绝对路径。具体系统位置见[平台路径参考](../reference/platform-paths.md)；低层协议说明见 [`integration/README.md`](../../integration/README.md)。
+
+**Host 二进制是单独安装的**，只有应用的“安装浏览器扩展”动作会把它复制到浏览器的 Native Messaging 目录。因此**只升级应用不会升级浏览器里的 Host**。升级应用后如果出现连接异常，先重新执行一次“安装浏览器扩展”刷新 Host。
+
+## 连接是怎么判定的
+
+扩展与桌面端之间有两条固定动作：
+
+- `test_connection`：发一次请求并要求桌面端回一个带 `multidown` 握手标记的应答，才算“已连接”；
+- `open_app`：应用没运行时，请求操作系统打开 `multidown://open` 深链把它拉起来，然后在 3 秒预算内等待一次新鲜的握手成功（最坏约 5.4 秒，仍低于扩展 8 秒的等待上限）。
+
+因为必须完成真正的握手，**残留的旧端口文件不会被误判为“应用已运行”**：即便那个端口上有别的进程在监听，没有标记也算失败。端口文件缺失或内容不是合法端口时，扩展会明确告诉你应用未运行，而不是伪装成功。
+
+不支持的协议版本和未知动作会返回明确的错误信息，不会一直转圈或挂起。
 
 ## 捕获规则与使用
 
@@ -49,3 +75,11 @@ cargo build --release --manifest-path integration/native-host/Cargo.toml
 若 Native Messaging 不可用，可使用已注册的 `multidown://add?url=...` 深链作为有限兜底。深链不替代扩展的完整捕获和消息响应能力。
 
 连接失败时按[故障排查](./troubleshooting.md#浏览器提示无法连接或-native-host-不可用)逐项检查。
+
+## 隐私提醒
+
+扩展会把完整下载地址与 cookie 存在浏览器的 `chrome.storage.local` 里（用于重发与恢复），并且扩展的“导出日志”功能会**把这些内容写进一个文本文件**。这是当前的已知问题，尚未修复；导出日志前请自行确认文件不会外流。详见[已知限制](../reference/known-limitations.md#安全与可靠性边界)。
+
+## 验证状态
+
+扩展打包与 Native Messaging 协议有自动化测试覆盖（含用真实 Host 二进制对回环桌面端桩做分帧 I/O 的往返测试），但**在真实浏览器中的安装、加载、授权与握手均未在真实机器上验证过**。发布前请按[功能验收清单](../development/functionality-release-checklist.md)逐项记录证据。

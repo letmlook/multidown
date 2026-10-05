@@ -12,17 +12,19 @@ Multidown 是一款面向桌面端的跨平台多协议下载工具，使用 Tau
 
 ## 核心能力
 
-- HTTP/HTTPS 多连接与动态分段下载，支持断点续传、重试和全局限速。
-- 磁力链接和 `.torrent` 文件下载，支持文件选择、做种策略及 BT 专用 SOCKS5 代理。
+- HTTP/HTTPS 多连接与动态分段下载，支持断点续传、重试和全局限速；重启后自动从持久化区间续传。
+- 磁力链接和 `.torrent` 文件下载，支持文件选择、做种策略及 BT 专用 SOCKS5 代理；种子会话与做种状态跨重启恢复。
 - 队列、批次、分类规则、计划任务，以及任务导入和导出。
-- Chromium 与 Firefox 浏览器扩展，通过 Native Messaging 将下载发送到桌面应用。
+- Chromium 与 Firefox 浏览器扩展，通过 Native Messaging 将下载发送到桌面应用；连接必须完成带标记的握手，残留的旧端口文件不会被误判为"已连接"。
 - Windows、macOS 和 Linux 桌面集成，包括托盘、通知、单实例和 `multidown://` 深链。
 
 ## 平台与限制
 
 项目面向 Windows、macOS 和 Linux。实际可用安装包以 [v0.3.0 发布页](https://github.com/letmlook/multidown/releases/tag/v0.3.0) 为准。
 
-当前 BitTorrent 不支持 web seed、MSE/PE 连接加密或顺序下载；浏览器扩展需要安装桌面应用及对应 Native Messaging Host。完整边界见[已知限制](./docs/reference/known-limitations.md)。
+当前 BitTorrent 不支持 web seed、MSE/PE 连接加密或顺序下载；浏览器扩展需要安装桌面应用及对应 Native Messaging Host。扩展以**已解压目录**形式加载（另可导出 ZIP 分发），不需要 CRX。任务、队列、批次、分类规则、定时规则与代理配置保存在系统应用数据目录，采用带备份的原子写入。
+
+**本页不声称任何平台行为已经过验收。** 当前哪些结论在真实机器上验证过、哪些只有测试覆盖、哪些尚未验证，见[已知限制](./docs/reference/known-limitations.md#验证状态)与[功能验收清单](./docs/development/functionality-release-checklist.md)。已知的真实缺陷（包括 Windows 上尚未定位的偶发状态写入失败）同样在该页记录。
 
 ## 快速开始
 
