@@ -42,7 +42,7 @@ Native Host 与桌面端**解析同一个端口文件**：文件名取自共享�
 - macOS：`~/Library/Application Support/com.multidown.app/native_host_port.txt` 与 `native_host.log`。
 - Linux：`$XDG_DATA_HOME/com.multidown.app/`（未设置时为 `~/.local/share/com.multidown.app/`）。
 
-**Linux 上两端在规则层面是一致的**：桌面端的 Tauri `app_data_dir` 与 Native Host 都按 XDG **数据**目录加应用标识目录推导，Host 不再使用 XDG 配置目录（`$XDG_CONFIG_HOME`）。这不再是**规则层面**的差异，共享协议 crate 里有覆盖 Windows/macOS/Linux（含设置与未设置 `XDG_DATA_HOME`）的逐平台测试，应用的单元测试还把 `app_data_dir` 的拼接结果与共享 crate 的解析结果逐字比对——但这些测试的 unix 分支在本机只做过类型检查，从未执行过。
+**Linux 上两端在规则层面是一致的**：桌面端的 Tauri `app_data_dir` 与 Native Host 都按 XDG **数据**目录加应用标识目录推导，Host 不再使用 XDG 配置目录（`$XDG_CONFIG_HOME`）。这不再是**规则层面**的差异，共享协议 crate 里有覆盖 Windows/macOS/Linux（含设置与未设置 `XDG_DATA_HOME`）的逐平台测试，应用的单元测试还把 `app_data_dir` 的拼接结果与共享 crate 的解析结果逐字比对。这些测试接收**显式的 `Platform` 参数**、本身没有任何平台条件编译，因此**在 Windows 上真实执行过**（它们属于本机已验证的范围），不需要等到 macOS/Linux 才有结果。
 
 不过“规则一致”不等于“真实环境已验证”：真实发行版安装（尤其是 `XDG_DATA_HOME` 被改写、AppImage/snap/flatpak 等形态）下的实际路径仍需按[功能验收清单](../development/functionality-release-checklist.md)在真机上确认。如果扩展提示“应用未运行或未就绪”，先确认两端读的是同一个 `native_host_port.txt`。
 
