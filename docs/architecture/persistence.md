@@ -27,7 +27,7 @@ Multidown 将应用状态放在 Tauri 返回的应用数据目录，而下载内
 
 ## 版本化存储与迁移
 
-除 librqbit 会话目录外，本仓库自己的 JSON 状态都写成带信封的形式：
+除 librqbit 会话目录外，本仓库自己的 JSON 状态基本都写成带信封的形式（**例外见下**）：
 
 ```json
 { "schema_version": 1, "written_at": "<RFC3339>", "data": { } }
@@ -51,6 +51,8 @@ Multidown 将应用状态放在 Tauri 返回的应用数据目录，而下载内
 **平台差异**：原子替换在 Windows 上是 `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`，在 unix 上是 `rename`。父目录同步在 unix 上是真正的 `fsync`，**在 Windows 上是显式的空操作**——Win32 没有可移植的目录 fsync 等价物，所以 Windows 上不声称父目录掉电持久性。
 
 `schema_version < 1` 的写入在创建文件、轮换备份之前就被拒绝，不会污染已有备份。
+
+**例外：`proxies.json` 不走这条路径。** 六个状态文件（`multidown_settings.json`、`multidown_tasks.json`、`queues.json`、`batches.json`、`category_rules.json`、`schedule_rules.json`）都经由 `save_store`（迁移时的重写是同一函数的第 7 个调用点）；代理配置是唯一的例外，它在 `settings/proxy.rs` 里用 `tokio::fs::write` 直接覆盖目标文件——没有信封、没有临时文件、没有 `.bak`、没有原子替换，读取时用 `serde_json::from_str(..).unwrap_or_default()`。后果是：一旦该文件被截断（例如写入过程中进程被杀或断电），下一次读取会**静默退化成空存储**，而下一次保存会把文件改写成只剩新加的那一条，全部命名代理与域名分流规则连同其中的 base64 密码永久丢失，没有隔离文件也没有备份可回退。用户影响见[已知限制](../reference/known-limitations.md#代理配置文件损坏会静默丢失全部配置)。
 
 ## 启动顺序
 
