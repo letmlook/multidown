@@ -475,7 +475,11 @@ pub enum Platform {
 ///
 /// `data_home` 对应 `XDG_DATA_HOME`；Tauri 的 Linux 数据目录遵循同一规则，
 /// 桌面端与 Native Host 必须解析到同一个文件。
-pub fn port_file_path(platform: Platform, home: &std::path::Path, data_home: Option<&std::path::Path>) -> std::path::PathBuf {
+pub fn port_file_path(
+    platform: Platform,
+    home: &std::path::Path,
+    data_home: Option<&std::path::Path>,
+) -> std::path::PathBuf {
     let base = match platform {
         Platform::Windows => home.to_path_buf(),
         Platform::MacOS => home.join("Library/Application Support"),
@@ -644,14 +648,12 @@ pub fn connect_and_handshake(
 
     let mut reader = BufReader::new(stream);
     let mut reply = String::new();
-    reader
-        .read_line(&mut reply)
-        .map_err(|error| {
-            NativeError::new(
-                NativeErrorCode::DesktopUnavailable,
-                format!("handshake read failed: {error}"),
-            )
-        })?;
+    reader.read_line(&mut reply).map_err(|error| {
+        NativeError::new(
+            NativeErrorCode::DesktopUnavailable,
+            format!("handshake read failed: {error}"),
+        )
+    })?;
     validate_handshake_reply(reply.as_bytes())
 }
 
@@ -1125,7 +1127,7 @@ mod tests {
 
     mod discovery {
         use super::*;
-        use std::io::{BufReader, BufRead, Write};
+        use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
         use std::time::Duration;
 
@@ -1191,7 +1193,8 @@ mod tests {
 
         #[test]
         fn read_port_file_rejects_missing_malformed_and_zero_ports() {
-            let dir = std::env::temp_dir().join(format!("native-proto-port-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("native-proto-port-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("port.txt");
@@ -1216,7 +1219,8 @@ mod tests {
 
         #[test]
         fn handshake_accepts_the_documented_desktop_reply() {
-            let port = listener_thread_once("{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n");
+            let port =
+                listener_thread_once("{\"ok\":true,\"handshake\":\"multidown\",\"protocol\":1}\n");
             connect_and_handshake(port, "req-hs", Duration::from_secs(2)).unwrap();
         }
 
@@ -1229,7 +1233,8 @@ mod tests {
                 "not json\n",
             ] {
                 let port = listener_thread_once(reply);
-                let error = connect_and_handshake(port, "req-hs", Duration::from_secs(2)).unwrap_err();
+                let error =
+                    connect_and_handshake(port, "req-hs", Duration::from_secs(2)).unwrap_err();
                 assert_eq!(error.code, NativeErrorCode::DesktopError, "{reply}");
             }
         }
@@ -1240,13 +1245,15 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let dead_port = listener.local_addr().unwrap().port();
             drop(listener);
-            let error = connect_and_handshake(dead_port, "req-x", Duration::from_secs(1)).unwrap_err();
+            let error =
+                connect_and_handshake(dead_port, "req-x", Duration::from_secs(1)).unwrap_err();
             assert_eq!(error.code, NativeErrorCode::DesktopUnavailable);
         }
 
         #[test]
         fn ensure_desktop_connection_launches_once_and_uses_the_fresh_port() {
-            let dir = std::env::temp_dir().join(format!("native-proto-ensure-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("native-proto-ensure-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let port_file = dir.join("port.txt");
@@ -1297,7 +1304,8 @@ mod tests {
 
         #[test]
         fn ensure_desktop_connection_times_out_when_nothing_listens() {
-            let dir = std::env::temp_dir().join(format!("native-proto-timeout-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("native-proto-timeout-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let port_file = dir.join("port.txt");
@@ -1326,5 +1334,4 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-
 }
