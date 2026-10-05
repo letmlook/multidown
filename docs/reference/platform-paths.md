@@ -16,7 +16,7 @@
 - `multidown_tasks.json`
 - `queues.json`
 - `batches.json`
-- `rules.json`
+- `category_rules.json`
 - `schedule_rules.json`
 - `proxies.json`
 - `torrent-session/`
@@ -30,7 +30,7 @@
 - `<文件名>.bak`、`<文件名>.bak.1` …：轮换备份链。每次保存把上一代顺延为 `.bak.1`、`.bak.2`…，**旧代不会被自动删除**，长期使用会累积；清理它们需要你自己操作。
 - `<存储名>.recovery-<UTC 时间戳>.json`：恢复时**隔离**出来的原始记录或损坏文件副本。界面上的“启动恢复警告”会给出具体路径。
 
-分类规则的文件名是 **`rules.json`**。旧文档中的 `category_rules.json` 对应的常量在代码中已不再被引用，按旧名找不到文件。
+分类规则的文件名是 `category_rules.json`：启动加载与运行时增删改共用这个名字。源码里出现的字面量 `rules.json` 只是单元测试的临时文件名，应用数据目录里不会有它。
 
 不是所有文件都会在首次启动时立即出现；对应功能第一次保存后才会创建。字段含义、迁移与备份注意事项见[持久化架构](../architecture/persistence.md)。
 

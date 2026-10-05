@@ -78,7 +78,7 @@ cargo build --release --manifest-path integration/native-host/Cargo.toml
 
 ## 隐私提醒
 
-扩展会把完整下载地址与 cookie 存在浏览器的 `chrome.storage.local` 里（用于重发与恢复），并且扩展的“导出日志”功能会**把这些内容写进一个文本文件**。这是当前的已知问题，尚未修复；导出日志前请自行确认文件不会外流。详见[已知限制](../reference/known-limitations.md#安全与可靠性边界)。
+扩展的“导出日志”会把**完整下载地址与文件名**从浏览器本地的日志缓冲写成一个文本文件（`multidown-extension-logs.txt`）。扩展不读取也不保存 cookie——它没有申请 cookie 权限，发送下载时也不携带 cookie。但下载地址本身可能包含签名参数，所以导出文件仍要按敏感数据处理。这是当前的已知问题，尚未修复；导出前请自行确认文件不会外流。详见[已知限制](../reference/known-limitations.md#安全与可靠性边界)。
 
 ## 验证状态
 

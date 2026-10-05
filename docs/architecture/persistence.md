@@ -12,7 +12,7 @@ Multidown 将应用状态放在 Tauri 返回的应用数据目录，而下载内
 | `multidown_tasks.json` | HTTP/BT 任务、剩余区间、校验元数据、协议特有状态 | 启动第二步 |
 | `queues.json` | 队列定义与任务归属 | 启动第二步 |
 | `batches.json` | 批次编排（URL 列表、命名模板、统计） | 启动第二步 |
-| `rules.json` | 分类匹配规则 | 启动第二步 |
+| `category_rules.json` | 分类匹配规则 | 启动第二步 |
 | `schedule_rules.json` | 定时调度规则与总开关 | 启动第二步 |
 | `proxies.json` | 命名代理与域名分流规则 | 按需 |
 | `torrent-session/` | librqbit fastresume 与会话状态 | 首次需要 BT 时 |
@@ -21,7 +21,7 @@ Multidown 将应用状态放在 Tauri 返回的应用数据目录，而下载内
 | `extension/` | 已部署的已解压扩展与导出的 ZIP | 浏览器集成 |
 | `multidown.log` | 应用诊断日志 | 随时 |
 
-分类规则的实际文件名是 `rules.json`。历史文档里的 `category_rules.json` 对应的常量在代码中已不再被引用（`rules_persistence.rs` 中标记为 `dead_code`），按旧名到应用数据目录里找文件会找不到。
+分类规则的运行时读写都用 `category_rules.json`：启动加载走 `rules_persistence::rules_path`（`RULES_FILENAME`），增删改走 `Scheduler::rules_save_path`，两者一致。仓库源码里出现的字面量 `rules.json` 只是单元测试用的临时文件名，不是应用数据目录里的实际文件名。
 
 批次主要是运行时编排信息，不应假定所有瞬时 UI 状态都会跨重启恢复。
 
