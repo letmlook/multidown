@@ -22,11 +22,11 @@ cargo build --release --manifest-path integration/native-host/Cargo.toml
 
 - `dist-extension/unpacked/`：Chromium 开发模式目录。
 - `dist-extension/firefox-unpacked/`：带 Firefox manifest 变体的目录。
-- `dist-extension/multidown-extension.zip`：Chromium ZIP；只有系统可调用 `python3` 时生成，缺失时构建会保留 unpacked 目录并跳过 ZIP。
+- `dist-extension/multidown-extension.zip`：Chromium ZIP；由 `npm run build:extension` 用 Node 内置 zlib 生成，不依赖系统是否安装 `python3`，条目相对路径与已解压目录一致。
 
 Native Host 输出位于 `integration/native-host/target/release/`，Windows 文件带 `.exe`。应用平台配置会从该位置捆绑 Host。
 
-`npm run build:all` 会构建前端与扩展，然后打印 Chrome 手工打包 CRX 的操作指南；脚本本身不会签名或生成 CRX。它也不会构建 Native Host，因此打包桌面应用前必须先完成上面的 Cargo 构建。
+`npm run build:all` 构建前端与扩展（`build` + `build:extension`），**不再串联任何 CRX 步骤**；它也不构建 Native Host，打包桌面前必须先完成上面的 Cargo 构建。需要 CRX 时手动执行 `npm run sign:crx`——该脚本只打印 Chrome 手工步骤，不生成任何文件。
 
 ## 开发运行
 
