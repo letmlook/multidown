@@ -4,6 +4,23 @@ import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+/**
+ * 统一换行符后再做匹配。
+ *
+ * `core.autocrlf=true` 的 Windows 工作区里检出的是 CRLF，而这个检查器
+ * 之前把 `# 标题\n` 之类的**字面量**当断言：同一份仓库在 CRLF 与 LF 检出下
+ * 结论相反，一条纯文档的差异会把三平台 CI 矩阵全部变红。仓库没有
+ * `.gitattributes` 固定换行，因此换行符必须在检查器内部归一，而不是靠
+ * 调用方的检出方式。
+ */
+function normalizeLineEndings(markdown) {
+  return markdown.replace(/\r\n?/gu, '\n');
+}
+
+async function readMarkdown(filePath) {
+  return normalizeLineEndings(await readFile(filePath, 'utf8'));
+}
+
 function withoutFencedCode(markdown) {
   let fence = null;
   return markdown
@@ -147,7 +164,7 @@ export async function validateDocumentation({ rootDir, markdownFiles, packageJso
 
   for (const relativePath of markdownFiles) {
     const absolutePath = path.resolve(rootDir, relativePath);
-    const markdown = await readFile(absolutePath, 'utf8');
+    const markdown = await readMarkdown(absolutePath);
 
     errors.push(...explicitFactErrors(relativePath, markdown, canonicalFacts));
 
@@ -174,7 +191,7 @@ export async function validateDocumentation({ rootDir, markdownFiles, packageJso
       }
 
       if (rawAnchor && path.extname(targetPath).toLowerCase() === '.md') {
-        const targetMarkdown = await readFile(targetPath, 'utf8');
+        const targetMarkdown = await readMarkdown(targetPath);
         const anchor = safeDecode(rawAnchor).toLowerCase();
         if (!collectAnchors(targetMarkdown).has(anchor)) {
           errors.push(`${relativePath}: anchor does not exist in ${displayTarget}: #${safeDecode(rawAnchor)}`);

@@ -131,6 +131,18 @@ describe('validateDocumentation', () => {
     );
   });
 
+  test('accepts CRLF checkouts for the leading-heading and anchor rules', async () => {
+    // `core.autocrlf=true` 的 Windows 工作区是 CRLF 检出。首标题规则此前按
+    // 字面量 `\n` 断言，CRLF 检出下会把纯文档差异报成门禁失败。
+    const input = await fixture({
+      'README.md': ['# Multidown', '', '阅读[指南](docs/指南.md#快速开始)。', '', '运行 `npm run build`。', ''].join('\r\n'),
+      'docs/README.md': ['# Multidown 文档中心', '', '命名约定：仓库和项目使用 `Multidown`；应用窗口、发布标题和安装包使用 `MultiDown`。', ''].join('\r\n'),
+      'docs/指南.md': ['# 指南', '', '## 快速开始', '', '版本 v9.8.7。', ''].join('\r\n'),
+    });
+
+    await expect(validateDocumentation(input)).resolves.toEqual([]);
+  });
+
   test('rejects stale versions anywhere in current-state documentation', async () => {
     const input = await fixture({
       'README.md': '# Multidown\n',
