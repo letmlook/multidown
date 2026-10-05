@@ -22,7 +22,7 @@ Multidown 是一款面向桌面端的跨平台多协议下载工具，使用 Tau
 
 项目面向 Windows、macOS 和 Linux。实际可用安装包以 [v0.3.0 发布页](https://github.com/letmlook/multidown/releases/tag/v0.3.0) 为准。
 
-当前 BitTorrent 不支持 web seed、MSE/PE 连接加密或顺序下载；浏览器扩展需要安装桌面应用及对应 Native Messaging Host。扩展以**已解压目录**形式加载（另可导出 ZIP 分发），不需要 CRX。任务、队列、批次、分类规则、定时规则与代理配置保存在系统应用数据目录，采用带备份的原子写入。
+当前 BitTorrent 不支持 web seed、MSE/PE 连接加密或顺序下载；浏览器扩展需要安装桌面应用及对应 Native Messaging Host。扩展以**已解压目录**形式加载（另可导出 ZIP 分发），不需要 CRX。任务、设置、队列、批次、分类规则与定时规则保存在系统应用数据目录，采用带备份的原子写入；**代理配置是唯一的例外**，直接覆盖写入且损坏后无法恢复，详见[已知限制](./docs/reference/known-limitations.md#代理配置文件损坏会静默丢失全部配置)。
 
 **本页不声称任何平台行为已经过验收。** 当前哪些结论在真实机器上验证过、哪些只有测试覆盖、哪些尚未验证，见[已知限制](./docs/reference/known-limitations.md#验证状态)与[功能验收清单](./docs/development/functionality-release-checklist.md)。已知的真实缺陷（包括 Windows 上尚未定位的偶发状态写入失败）同样在该页记录。
 
