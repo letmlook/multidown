@@ -8,6 +8,73 @@ on:
   workflow_dispatch:
 
 jobs:
+  rust-format:
+    name: Rust formatting
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # No workflow ran `cargo fmt` before, so drift accumulated unnoticed:
+      # `integration/native-protocol` carried ~109 lines of it. That crate was
+      # reformatted (mechanical, no behaviour change) in the same commit that added
+      # this gate — the check could not be added before the reformat.
+      - name: Check shared protocol formatting
+        working-directory: integration/native-protocol
+        run: cargo fmt --all --check
+
+      - name: Check native messaging host formatting
+        working-directory: integration/native-host
+        run: cargo fmt --all --check
+
+      - name: Check application formatting
+        working-directory: src-tauri
+        run: cargo fmt --all --check
+
+  msrv:
+    name: Declared MSRV (Rust 1.88)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Same prerequisites as the Ubuntu leg of `test-tauri`; `tauri-build` needs them
+      # before any cargo command can even configure the crate.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install dependencies
+        run: npm ci
+
+      # `tauri-build` declares rerun-if-changed on the frontend bundles and reads
+      # `frontendDist`, so they must exist before cargo is invoked.
+      - name: Build frontend and extension
+        run: npm run build:all
+
+      - name: Install the declared MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      # `rust-version` in src-tauri/Cargo.toml is the floor this project promises, and
+      # nothing enforced it: the matrix job installs `stable`, so a 1.88-breaking change
+      # (ours or a dependency's) stayed green. `--locked` keeps the committed
+      # Cargo.lock, so this fails on a new requirement rather than on a fresh resolve.
+      - name: Check application against the declared MSRV
+        working-directory: src-tauri
+        run: cargo +1.88.0 check --locked --all-targets --features integration-tests
+
   test-tauri:
     strategy:
       fail-fast: false
@@ -60,7 +127,24 @@ jobs:
       - name: Verify browser extension identity
         run: npm run test:extension
 
-      - name: Check native messaging host
+      # `integration/native-protocol` is the shared wire definition for the extension,
+      # the Native Host and the desktop app. It is not a workspace member (the repo has
+      # no root Cargo.toml), so it needs its own explicit step or its tests never run.
+      - name: Run shared protocol tests
+        working-directory: integration/native-protocol
+        run: cargo test
+
+      - name: Check strict shared protocol Clippy
+        working-directory: integration/native-protocol
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Previously only Clippy ran here: the host's 10 unit tests and the 10 framed
+      # round-trip integration tests were never executed by CI.
+      - name: Run native messaging host tests
+        working-directory: integration/native-host
+        run: cargo test
+
+      - name: Check strict native messaging host Clippy
         working-directory: integration/native-host
         run: cargo clippy --all-targets -- -D warnings
 
@@ -68,13 +152,32 @@ jobs:
         working-directory: integration/native-host
         run: cargo build --release
 
-      - name: Run unit tests
+      # `--features integration-tests` is mandatory, not optional: both `[[test]]`
+      # targets in src-tauri/Cargo.toml declare `required-features`, so a plain
+      # `cargo test` silently SKIPS them and still reports success.
+      #
+      # On Windows this step only runs because src-tauri/build.rs now links a Common
+      # Controls v6 manifest into every unit of the package. tauri-build links the same
+      # manifest, but with `cargo:rustc-link-arg-bins`, which Cargo applies to bin and
+      # `tests/*.rs` targets only — the `cargo test --lib` binary got none, bound
+      # `comctl32` to the legacy v5, and died before `main` with
+      # 0xC0000139 (STATUS_ENTRYPOINT_NOT_FOUND) on `TaskDialogIndirect`.
+      #
+      # `--no-fail-fast` so one failing target does not hide the others: without it the
+      # known Windows path-assertion failures below stop the run before the two
+      # integration targets are ever executed.
+      #
+      # Known failure on windows-latest only: 4 pre-existing assertions in
+      # `engine::scheduler::tests` (POSIX path separators, symlink escape, read-only
+      # directory) whose expectations do not hold on Windows. Not a regression; fixing
+      # them is a separate task that has to edit src-tauri/src/**.
+      - name: Run application unit and integration tests
         working-directory: src-tauri
-        run: cargo test --lib
+        run: cargo test --no-fail-fast --features integration-tests
 
-      - name: Run strict app Clippy
+      - name: Check strict app Clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --features integration-tests -- -D warnings
 
       - name: Build Tauri
         run: npm run tauri -- build
