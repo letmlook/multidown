@@ -1,0 +1,15 @@
+// RT_MANIFEST (24) resource id 1 — the same id the Windows loader reads.
+// Content mirrors tauri-build's default manifest; see build.rs for why it is also
+// linked with the unscoped `cargo:rustc-link-arg` (the `cargo test --lib` binary).
+#pragma code_page(65001)
+1 24
+{
+"<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>"
+"<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">"
+"  <dependency>"
+"    <dependentAssembly>"
+"      <assemblyIdentity type=""win32"" name=""Microsoft.Windows.Common-Controls"" version=""6.0.0.0"" processorArchitecture=""*"" publicKeyToken=""6595b64144ccf1df"" language=""*"" />"
+"    </dependentAssembly>"
+"  </dependency>"
+"</assembly>"
+}

@@ -3228,6 +3228,7 @@ dependencies = [
  "chrono",
  "core-foundation 0.10.1",
  "dirs 5.0.1",
+ "embed-resource",
  "futures-util",
  "librqbit",
  "native-protocol",
