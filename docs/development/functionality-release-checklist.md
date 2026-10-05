@@ -115,25 +115,40 @@
 
 ## 已知问题（不计入本清单，但影响发布判断）
 
-这些是**已知的、未修复的**问题。列出来是为了避免它们被上面的 `pass` 掩盖。
+列出来是为了避免它们被上面的 `pass` 掩盖。**每一项都必须由人填出 `是否阻断发布`**；
+留空视为"尚未判定"，而"尚未判定"的已知问题不允许放行。严重度是工程事实，可以预填；
+阻断与否是发布决策，只能由测试人与发布负责人填。
 
-- **Windows 单元测试有 4 个先前就存在的失败**（非回归）：
-  `category_rules_receive_normalized_mime_from_successful_probe`、
-  `deletion::preview_reports_paths_inside_save_root_and_missing_task_errors`、
-  `deletion::preview_and_removal_reject_symlink_escape`、
-  `deletion::remove_task_retains_task_when_file_deletion_fails`。
-  它们断言 POSIX 风格路径分隔符、符号链接逃逸和只读目录，在 Windows 上期望值不成立。
-  修复需要改 `src-tauri/src/**`，属于独立任务。详见[测试指南](testing.md#已知失败windows-路径断言4-项)。
-- **Windows 上 `storage::save_store` 间歇性报错**（`os error 5` 拒绝访问 / `os error 32` 被占用）。
-  这是真实存在、**尚未定位**的缺陷：Task 1 加的持久化互斥锁关闭了一个真实的序列化缺口，但**没有**
-  修掉它——最强的证据表明进程内并发解释不通（并发最高的那个测试从不失败）。疑似外部句柄
-  （例如扫描程序以不带 `FILE_SHARE_DELETE` 的方式持有刚写好的 store 文件）导致原子替换失败，
-  这是环境与生产环境 `%APPDATA%` 的属性，不是锁能解决的。
-  人工验收时请在 R1 / R2 项记录是否观察到 `[persistence-error]`，并附上日志。
-- **扩展的 `chrome.storage.local` 会存 URL 和 cookie**，`export_logs` 也会导出它们。这是真实的
-  敏感数据问题，属于产品修复，不在本次 CI/文档任务范围内。
-- **公网磁力烟雾测试**（`resolves_real_magnet`）依赖 UDP/DHT 与外网，默认 `--ignored`，
-  只在允许联网的隔离环境手工运行，不在 CI 内。
+| # | 已知问题 | 严重度 | 是否阻断发布 | 判定依据 / 证据 |
+| --- | --- | --- | --- | --- |
+| K1 | Windows 上 `storage::save_store` 间歇性报错（`os error 5` 拒绝访问 / `os error 32` 被占用）。真实存在、**尚未定位**：持久化互斥锁关闭了一个真实的序列化缺口但没有修掉它，最强的证据表明进程内并发解释不通（并发最高的测试从不失败）。疑似外部句柄（例如扫描程序以不带 `FILE_SHARE_DELETE` 的方式持有刚写好的 store 文件）导致原子替换失败。 | 待定（未定位） | 待判定 | 人工验收 R1 / R2 时观察是否出现 `[persistence-error]`，并把日志路径填在这里 |
+| K2 | 扩展把 URL 和 cookie 存进 `chrome.storage.local`，`export_logs` 也会导出它们。真实敏感数据问题，属产品修复，不在 CI/文档范围。 | 高 | 待判定 | 需要发布负责人给出结论；若判定为高且未修复，按本计划"不得存在失败的 HIGH 场景"即不得放行 |
+| K3 | 公网磁力烟雾测试 `resolves_real_magnet` 依赖 UDP/DHT 与外网，默认 `#[ignore]`，只在允许联网的隔离环境手工运行，不在 CI 内。 | 低 | 待判定 | 是否要求发布前在联网环境跑一次，由发布负责人决定 |
+| K4 | Windows 上 4 个单元测试断言按 POSIX 写死（路径分隔符、符号链接逃逸、只读目录）。**已在 fix round 1 修复**：改为平台感知断言 + 真实 Windows 符号链接 + 可移植的句柄式删除失败注入；产品逻辑未改。 | 中（已消除） | 否 | 证据见[测试指南](testing.md)的 Windows 基线行；macOS/Linux 分支未在本机验证，需 CI 确认 |
+
+## 放行结论（必须由人填写，不得留空即视为通过）
+
+| 字段 | 值 |
+| --- | --- |
+| 版本 | v0.3.0 |
+| 构建 SHA（`git rev-parse HEAD`） | |
+| 三平台 CI run 链接 | |
+| 验收覆盖的三平台 | ☐ Windows ☐ macOS ☐ Linux |
+| 已知问题中"是否阻断发布 = 是"的条目 | （列出编号；确实没有也要写"无"） |
+| 全部 HIGH 场景通过？ | ☐ 是 ☐ 否（否则不得放行） |
+| **结论** | ☐ 放行发布　☐ 不放行（**二选一，必须显式勾选**） |
+| 结论说明（尤其是 not-run 项如何被接受） | |
+| 测试人 | |
+| 复核人（发布负责人） | |
+| 日期 | |
+
+规则：
+
+- 本表未填写，或"结论"两栏都未勾选，视为**未通过验收**，不得发布。
+- 任何 HIGH 场景未通过，或"已知问题"里存在 `是否阻断发布 = 是` 的条目，一律不得放行。
+- `not-run` 可以接受，但必须在"结论说明"里逐条说明为什么这一次可以接受；空着的 `not-run`
+  等同于未验收。
+- 本清单不能替代 CI 结论，也不能用 CI 通过来抵扣本表任何一项。
 
 ## 本次 CI/文档变更已在本机（Windows）实际验证的范围
 
@@ -142,9 +157,9 @@
 
 | 结论 | 内容 |
 | --- | --- |
-| 本机已验证 | `cargo test --manifest-path src-tauri/Cargo.toml --features integration-tests` 可以**启动**（此前因缺 Common Controls v6 清单而在进入 `main` 前以 `0xC0000139` 退出），lib 套件 208 passed / 4 failed / 1 ignored，两个集成目标 2 + 5 全过 |
+| 本机已验证 | `cargo test --manifest-path src-tauri/Cargo.toml --features integration-tests` 可以**启动**（此前因缺 Common Controls v6 清单而在进入 `main` 前以 `0xC0000139` 退出），lib 套件 212 passed / 0 failed / 1 ignored，两个集成目标 2 + 5 全过 |
 | 本机已验证 | `integration/native-protocol` 26 个测试、`integration/native-host` 10 个单元 + 10 个 `round_trip` 全部通过；三处 `cargo clippy --all-targets -- -D warnings` 无输出；三个 crate 的 `cargo fmt --all --check` 干净 |
 | 本机已验证 | 根因修复的机制：应用二进制与 `cargo test --lib` 二进制都带上了清单（`mt.exe -inputresource:…;#1` 可读出 `Microsoft.Windows.Common-Controls`），且不产生 `CVT1100 duplicate resource` |
-| 本机无法验证 | macOS / Linux 的编译、测试与打包（三平台 CI） |
+| 本机无法验证 | macOS / Linux 的编译、测试与打包（三平台 CI）。本轮改动的 unix 分支只做过 `x86_64-unknown-linux-gnu` 的类型检查，未在本机执行过 unix 测试 |
 | 本机无法验证 | `rust-version = "1.88"` 的下限（需要固定 1.88 工具链的独立 job） |
 | 本机无法验证 | 上表所有真实平台交互项（B1–F2、N1–N3、D1–D2、R3） |
